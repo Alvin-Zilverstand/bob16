@@ -1,4 +1,11 @@
 # bob16
+To boot a kernel written in C **inside bob16**, see [C kernel and bootloader](C_OS.md).
+To run immediately, start the supplied `bob.exe` and enter `kernel.basm` at its
+assembly-file prompt. No build is needed. The documentation explains how to
+regenerate BASM after editing the C kernel, or build the binary boot workflow.
+The OS has a shell, RAM files, allocation, program loading, and a resident C
+compiler. Its tools are written in C; no Python is required.
+
 extremely simple custom 16 bit cpu emulator and assembler as seen on youtube: https://youtu.be/tlIqosU75CQ?is=ZAVWsYRDMPrUKOej \
 use at your own risk! code is thoroughly untested so if you find any bugs let me know asap so i can fix them asap
 
@@ -32,10 +39,10 @@ ex. and r0 r1
 *AND (in place immediate): 	r[dst] &= imm[7]\
 ex. and r0 4
 
-*NOT (normal): 		 	r[dst] = !r[src]\
+*NOT (normal): 		 	r[dst] = ~r[src]\
 ex. not r0 r1
 
-*NOT (immediate): 	!r[dst]\
+*NOT (in place): 	r[dst] = ~r[dst]\
 ex. not r1
 
 *LD:  r[dst] <= memory[pc + imm[9]]\
@@ -69,8 +76,8 @@ ex. jsr 50
 JSRR: r[7] = pc, pc  = r[src]\
 ex. jsrr r0
 
-*LEA: r[src] = pc\
-ex. lea r0
+*LEA: r[dst] = pc + signed imm[9]\
+ex. lea r0 0
 
 RET: pc = r[7]\
 ex. ret
@@ -83,7 +90,7 @@ TRAP (vector 3): r[7] = pc, pc = r[0], gets user inputted string with max length
 ex. trap 0
 
 **** NOTES ****
-any immediate values in assembly will clamp to be within bounds, e.g. for ADD normal immediate, if you put 60 as the immediate value it will clamp to 15\
+any immediate values in assembly will clamp to be within bounds, e.g. for ADD normal immediate, if you put 60 as the immediate value it will clamp to 7\
 any unused bits in a machine code instruction will be set to 0\
 strings are NOT packed!!!\
 pc is *always* incremented at the start of execution, so instructions that change or use pc such as jmp will use the incremented pc as the base\

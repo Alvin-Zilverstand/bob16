@@ -1,0 +1,14 @@
+; Reference source for the ROM installed by bootImage() in main.c.
+; The emulator fills the three metadata words from the validated B16K header.
+ld r0 7
+ld r1 7
+ld r2 7
+trap 4
+ld r3 6
+jmp r3
+trap 0
+.fill 0
+.fill 0300
+.fill 0
+.fill 0
+.fill 0300

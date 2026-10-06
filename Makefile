@@ -1,3 +1,13 @@
+CC ?= gcc
+CFLAGS ?= -std=gnu11 -O2 -Wall -Wextra -Werror
+.PHONY: all c-os test
+
 all:
-	gcc main.c -o main.exe
-	./main.exe
+	$(CC) $(CFLAGS) tools/build.c -o build-tool
+	./build-tool
+
+c-os: all
+	./bob --boot build/kernel.b16
+
+test: all
+	./build-tool --test
