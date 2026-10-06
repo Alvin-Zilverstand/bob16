@@ -36,6 +36,10 @@ int main(int argc,char **argv) {
     if(argc==2&&!strcmp(argv[1],"--test")) {
         run("gcc -std=c11 -O2 -Wall -Wextra -Werror tests/test_os.c -o build/test_os" EXE);
         run(BUILD_DIR "test_os" EXE);
+#ifdef _WIN32
+        run("gcc -std=c11 -O2 -Wall -Wextra -Werror tests/test_console.c -o build/test_console.exe");
+        run("build\\test_console.exe");
+#endif
     } else if(argc==2) run(BOB_COMMAND " --boot build/kernel.b16");
     return 0;
 }

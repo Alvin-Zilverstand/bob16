@@ -28,11 +28,12 @@
 char *cc_source;
 int cc_token;
 int cc_value;
-char cc_text[64];
+#define cc_text ((char *)0xe380)
 int cc_error;
 int cc_position;
-int cc_code[511];
-char cc_names[384];
+/* Editor and compiler run separately, so they share reserved scratch RAM. */
+#define cc_code ((int *)0xe000)
+#define cc_names ((char *)0xe200)
 int cc_variables;
 int cc_error_offset;
 int cc_depth;
@@ -171,8 +172,8 @@ int cc_shift_left(int a, int b) { return a << b; }
 int cc_shift_right(int a, int b) { return a >> b; }
 int cc_truth(int a) { return !!a; }
 int cc_loop_depth;
-int cc_break_chain[16];
-int cc_continue_chain[16];
+#define cc_break_chain ((int *)0xe3c0)
+#define cc_continue_chain ((int *)0xe3d0)
 
 int cc_precedence(int op) {
     if (op == TOKEN_OR) return 1;

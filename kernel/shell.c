@@ -1,12 +1,12 @@
-char command_line[128];
-char edit_line[128];
-char edit_buffer[512];
-char edit_undo[512];
+#define command_line ((char *)0x100)
+#define edit_line ((char *)0x180)
+#define edit_buffer ((char *)0xe000)
+#define edit_undo ((char *)0xe200)
 int editor_length;
 int editor_undo_length;
 int editor_has_undo;
 char *arguments;
-int program_length;
+void nano_edit(char *name);
 
 char *next_arg(void) {
     char *start;
@@ -33,6 +33,9 @@ int parse_number(char *text) {
         if (base == 16) {
             if (digits == 4) return 0;
             number = number * 16 + digit;
+        } else if (!negative) {
+            if (number < 0 || number > 6553 || (number == 6553 && digit > 5)) return 0;
+            number = number * 10 + digit;
         } else {
             limit = 7; if (negative) limit = 8;
             if (number < -3276 || (number == -3276 && digit > limit)) return 0;
@@ -44,7 +47,7 @@ int parse_number(char *text) {
     number_ok = 1;
     if (base == 16) { if (negative) return -number; return number; }
     if (negative) return number;
-    return -number;
+    return number;
 }
 int editor_line(int line) {
     int i; int current;
@@ -119,6 +122,7 @@ void edit_file(char *name) {
         memcpy(edit_buffer, file_content(slot), editor_length);
     }
     edit_buffer[editor_length] = 0;
+    if (bob_terminal()) { nano_edit(name); return; }
     println("Editor: text appends; :p lists; :i N TEXT inserts; :r N TEXT replaces.");
     println(":d N deletes; :u undo/redo; :w saves; :q quits; :q! discards; . saves/quits.");
     println(":p N shows one line. :q protects unsaved edits; :wq also saves/quits.");
@@ -198,7 +202,6 @@ void run_file(char *name) {
     program = (int *)PROGRAM_BASE;
     memset(program, 0, PROGRAM_WORDS);
     memcpy(program, file_content(slot), file_lengths[slot]);
-    program_length = file_lengths[slot];
     status = bob_run(PROGRAM_BASE);
     if (status == -2) println("Program fault; shell restored.");
     else if (status == -3) println("Program timed out; shell restored.");
@@ -208,16 +211,19 @@ void memory_status(void) {
     print("Heap "); print_hex(HEAP_BASE); print(".."); print_hex(0xdfff);
     print("; free "); print_dec(HEAP_WORDS - heap_used); println(" words");
     print("Programs "); print_hex(PROGRAM_BASE); print(".."); print_hex(0xbfff); println("");
-    println("Files: 8 slots, 511 words each; stack above 0xE000.");
+    println("Files: 8 slots, 511 words each; stack above 0xE600.");
 }
 void command_help(char *name) {
-    if (strcmp(name, "edit") == 0) println("edit NAME: open text; ordinary lines append. :p or :p N views; :i N TEXT inserts; :r N TEXT replaces; :d N deletes; :u undo/redo; :w saves; :q quits safely; :q! discards; . saves/quits.");
+    if (strcmp(name, "save") == 0 || strcmp(name, "restore") == 0) {
+        println("save: snapshot all files to bob-files.b16 in the working directory (or BOB16_STORAGE). restore yes: replace RAM files with that snapshot. Save current work first. Changed kernels restore text only; recompile programs."); return;
+    }
+    if (strcmp(name, "edit") == 0) println("edit NAME: type/arrows; Ctrl+O saves, Ctrl+X exits, Ctrl+Z undo/redo. Unsaved exit asks Y/N. Redirected input uses the line editor; see C_OS.md.");
     else if (strcmp(name, "cc") == 0 || strcmp(name, "go") == 0)
         println("cc SOURCE [OUTPUT]: compile C; output defaults to app. go SOURCE [OUTPUT] also runs on success. Example: go bob.c. One int main(void); no includes. Use edit SOURCE to fix errors.");
     else if (strcmp(name, "write") == 0) println("write NAME TEXT: create/replace a text file. Example: write note bob! Names: 1..23 characters without spaces; 8 file slots, 511 words each. Use edit for multiple lines.");
     else if (strcmp(name, "read") == 0) println("read NAME: print text. Example: read bob.c. Use ls to see names; run executes program files.");
     else if (strcmp(name, "ls") == 0 || strcmp(name, "dir") == 0 || strcmp(name, "list") == 0)
-        println("ls / dir / list: show names, lengths and text/program kinds. Files are in RAM and lost on exit.");
+        println("ls / dir / list: show names, lengths and text/program kinds. Files are in RAM; save keeps them between sessions.");
     else if (strcmp(name, "copy") == 0 || strcmp(name, "rename") == 0 || strcmp(name, "delete") == 0)
         println("copy OLD NEW | rename OLD NEW | delete NAME. Example: copy bob.c backup.c. Destinations must be new. Copy needs a free slot; rename does not. Delete is permanent.");
     else if (strcmp(name, "run") == 0) println("run NAME: execute a compiled/loaded program. Example: cc bob.c bob, then run bob. Exit shows return value; faults/timeouts restore the shell.");
@@ -228,7 +234,7 @@ void command_help(char *name) {
         println("alloc WORDS: allocate/zero 1..8192 heap words, print start address; no free. Example: alloc 16. mem shows remaining heap and memory regions.");
     else if (strcmp(name, "echo") == 0) println("echo TEXT: print text. Example: echo bob!");
     else if (strcmp(name, "clear") == 0) println("clear: clear an ANSI-capable terminal; does not remove files.");
-    else if (strcmp(name, "halt") == 0) println("halt: stop emulator. RAM files and allocations are lost; read important files before quitting.");
+    else if (strcmp(name, "halt") == 0) println("halt: stop emulator. Unsaved RAM files and allocations are lost; use save before quitting.");
     else if (strcmp(name, "help") == 0) println("help: list commands. help COMMAND: show usage and an example. Try help edit or help go.");
     else println("No help for that command. Type help for available names.");
 }
@@ -247,6 +253,14 @@ void shell_command(char *line) {
         println("cc/go default output: app. Try go bob.c to compile and print bob!");
         println("Use hex addresses. poke is limited to heap RAM.");
         println("Type help COMMAND for usage/examples. Try help edit or help go.");
+        println("save | restore yes (replaces RAM files); help save for storage details.");
+        println("Shell keys: Up/Down history; Tab completion; Ctrl+U clears (Windows console).");
+    } else if (strcmp(command, "save") == 0) {
+        if (*next_arg()) println("Usage: save (all RAM files)");
+        else file_snapshot(0);
+    } else if (strcmp(command, "restore") == 0) {
+        if (strcmp(next_arg(), "yes") || *next_arg()) println("restore yes replaces all RAM files. Use save first to keep current work.");
+        else file_snapshot(1);
     } else if (strcmp(command, "echo") == 0) println(remaining_args());
     else if (strcmp(command, "clear") == 0) print("\033[2J\033[H");
     else if (strcmp(command, "mem") == 0) memory_status();
@@ -265,7 +279,7 @@ void shell_command(char *line) {
         else println(file_content(value));
     } else if (strcmp(command, "write") == 0) {
         name = next_arg(); text = remaining_args();
-        if (file_write(name, text, strlen(text), 0) < 0) println("Cannot write file.");
+        if (file_write(name, text, strlen(text), 0) < 0) println("Cannot write file. Names: 1..23 printable characters; 8 slots. Use ls or help write.");
         else println("Saved.");
     } else if (strcmp(command, "edit") == 0) edit_file(next_arg());
     else if (strcmp(command, "load") == 0) { name = next_arg(); load_words(name); }
@@ -278,17 +292,17 @@ void shell_command(char *line) {
         if (value && strcmp(command, "go") == 0) run_file(text);
     } else if (strcmp(command, "alloc") == 0) {
         value = parse_number(next_arg());
-        if (!number_ok) { println("Invalid allocation size."); return; }
+        if (!number_ok) { println("Invalid allocation size. Use 1..8192 words; mem shows available space."); return; }
         pointer = alloc(value);
-        if (!pointer) println("Allocation failed.");
+        if (!pointer) println("Allocation failed. Use a positive size within free space; see mem. No free command.");
         else { print_hex((int)pointer); bob_putc('\n'); }
     } else if (strcmp(command, "peek") == 0 || strcmp(command, "poke") == 0) {
         address = parse_number(next_arg());
-        if (!number_ok) { println("Invalid address."); return; }
+        if (!number_ok) { println("Invalid address. Use hex 0x0000..0xFFFF or decimal 0..65535."); return; }
         pointer = (int *)address;
         if (strcmp(command, "poke") == 0) {
             value = parse_number(next_arg());
-            if (!number_ok) { println("Invalid value."); return; }
+            if (!number_ok) { println("Invalid value. Use -32768..65535 or 0x0000..0xFFFF."); return; }
             if (address >= 0 || address < -16384 || address >= -8192) {
                 println("poke is limited to 0xC000..0xDFFF."); return;
             }

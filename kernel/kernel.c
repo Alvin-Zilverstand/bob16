@@ -3,6 +3,8 @@
 #include "files.c"
 #include "compiler.c"
 #include "shell.c"
+#include "input.c"
+#include "nano.c"
 
 int main(void) {
     int length; char *sample;
@@ -13,7 +15,7 @@ int main(void) {
     file_write("bob.c", sample, strlen(sample), 0);
     while (1) {
         print("bob> ");
-        length = read_line(command_line, 128);
+        length = shell_read_line();
         if (length == -2) { bob_putc('\n'); return 0; }
         if (length < 0) println("Command too long.");
         else shell_command(command_line);

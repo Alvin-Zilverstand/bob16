@@ -64,7 +64,7 @@ static void allocator_and_files(void) {
     contains(output,"Saved.");contains(output,"bob!\n\n");contains(output,"note  5 chars (text)");free(output);
     output=shell("poke 0xc000 33\nalloc 4\npeek 0xc000\nalloc 4\nmem\nhalt\n");
     contains(output,"0xC000: 0x0000 (0)");contains(output,"bob> 0xC004\n");contains(output,"free 8184 words");free(output);
-    output=shell("write abcdefghijklmnopqrstuvwx bob!\nalloc 32768\npoke 0xdfff 0xffff\npeek 0xdfff\nhalt\n");
+    output=shell("write abcdefghijklmnopqrstuvwx bob!\nalloc 65536\npoke 0xdfff 0xffff\npeek 0xdfff\nhalt\n");
     contains(output,"Cannot write file.");contains(output,"Invalid allocation size.");contains(output,"0xDFFF: 0xFFFF (-1)");free(output);
     char large[800];strcpy(large,"write note bob!\nedit note\n");
     size_t n=strlen(large);
@@ -135,6 +135,139 @@ static void program_loading_and_recovery(void) {
     contains(output,"Program fault; shell restored.");contains(output,"bob> bob!\n");free(output);
 }
 static void host_compiler_and_runtime(void) {
+    guest("#include \"bob.h\"\nint matrix[2][3]={{1,2,3},{4,5,6}}; "
+          "int (*rows)[3]=matrix;int (*whole)[2][3]=&matrix;int (*incomplete)[]=(int (*)[])matrix; "
+          "int (*selected[2])[3]={&matrix[1],matrix}; "
+          "int sum(int (*p)[3]);int sum(int p[][3]){return (*p)[0]+p[1][2];} "
+          "int main(void){int (scalar)=7;int (*local)[3]=rows;int * (pointers[2])={&scalar,&matrix[1][1]}; "
+          "if(sizeof(int[2][3])!=6 || sizeof(int (*)[3])!=1 || sizeof(int *[2])!=2 || sizeof(incomplete)!=1)return 1; "
+          "if(sizeof(*whole)!=6 || sizeof(*rows)!=3 || (*whole)[1][2]!=6)return 2; "
+          "if(sum(local)!=7 || (*selected[0])[1]!=5 || *pointers[0]!=7 || *pointers[1]!=5)return 3; "
+          "local++;if((*local)[0]!=4 || local-rows!=1)return 4; "
+          "if(((int (*)[3])matrix)[1][1]!=5)return 5;bob_puts(\"bob!\");return 0;}");
+    guest("#include \"bob.h\"\nint values[3]={1,2,3}; "
+          "int *selected[][2]={[1][1]=&values[2],[0]={values,&values[1]},[1][1]=values}; "
+          "char *messages[]={[2]=\"bob!\",[0]=\"other\"}; "
+          "int main(void){int *local[3]={[2]=&values[1],[0]=values}; "
+          "if(sizeof(selected)!=4 || selected[1][0]!=0 || *selected[1][1]!=1 || *selected[0][1]!=2)return 1; "
+          "if(local[1]!=0 || *local[2]!=2 || messages[1]!=0)return 2;bob_puts(messages[2]);return 0;}");
+    guest("#include \"bob.h\"\nint sparse[]={[5]=6,[1]=2,3,[5]=7}; "
+          "int matrix[][3]={[2][1]=8,9,[0]={1,2},[1][2]=6}; "
+          "char words[3][5]={[2]=\"bob!\",[0]={\"bob!\"}}; "
+          "int main(void){int local[5]={[3]=4,[1]=2,3,[3]=8}; "
+          "int rows[2][3]={[1]={4,5,6},[1][1]=9,[0][2]=3}; "
+          "if(sizeof(sparse)!=6 || sparse[0]!=0 || sparse[1]!=2 || sparse[2]!=3 || sparse[5]!=7)return 1; "
+          "if(sizeof(matrix)!=9 || matrix[0][2]!=0 || matrix[1][2]!=6 || matrix[2][2]!=9)return 2; "
+          "if(local[0]!=0 || local[2]!=3 || local[3]!=8 || local[4]!=0)return 3; "
+          "if(rows[0][2]!=3 || rows[1][0]!=4 || rows[1][1]!=9 || rows[1][2]!=6)return 4; "
+          "if(words[1][0]!=0 || words[0][3]!='!')return 5;bob_puts(words[2]);return 0;}");
+    guest("#include \"bob.h\"\nint numbers[2][2]={{1,2},{3,4}}; "
+          "int *pointers[][2]={{&numbers[0][0],numbers[1]},{&numbers[1][1]}}; "
+          "char *messages[]={\"bob!\",\"no\"}; "
+          "int main(void){if(*pointers[0][0]!=1 || pointers[0][1][1]!=4 || *pointers[1][0]!=4 || pointers[1][1]!=0)return 1; "
+          "bob_puts(messages[0]);return 0;}");
+    guest("#include \"bob.h\"\nint cube[2][2][3]={{{1,2,3},{4,5,6}},{{7,8,9},{10,11,12}}}; "
+          "int *nested=&cube[1][1][2],*row=cube[1][0],*reversed=&2[1[cube][1]]; "
+          "int *indirect=&*(&cube[0][1][1]),*offset=cube[1][1]+1; "
+          "int main(void){if(*nested!=12 || row[2]!=9 || *reversed!=12 || *indirect!=5 || *offset!=11)return 1; "
+          "*nested=42;if(cube[1][1][2]!=42)return 2;bob_puts(\"bob!\");return 0;}");
+    guest("#include \"bob.h\"\nint matrix[][3]={{1},{2,3},{4,5,6}}; "
+          "int cube[2][2][2]={{{1},{2,3}},{{4,5},{6}}}; "
+          "char words[][5]={\"bob!\",{\"bob!\"}};char exact[4]={\"bob!\"}; "
+          "int main(void){int local[][2]={{7},{8,9}};int mixed[2][2]={1,2,{3}}; "
+          "int scalar={42};char inferred[]={\"bob!\"}; "
+          "if(sizeof(matrix)!=9 || matrix[0][1]!=0 || matrix[1][1]!=3 || matrix[2][2]!=6)return 1; "
+          "if(cube[0][0][1]!=0 || cube[0][1][1]!=3 || cube[1][1][1]!=0)return 2; "
+          "if(local[0][1]!=0 || local[1][1]!=9 || mixed[1][1]!=0 || scalar!=42)return 3; "
+          "if(sizeof(words)!=10 || words[0][4]!=0 || words[1][3]!='!' || exact[3]!='!')return 4; "
+          "if(sizeof(inferred)!=5)return 5;bob_puts(inferred);return 0;}");
+    guest("#include \"bob.h\"\nint matrix[2][3]={1,2,3,4,5,6};int inferred[][2]={7,8,9}; "
+          "int sum(int rows[][3]);int sum(int rows[9][3]){int s=0; "
+          "if(sizeof(rows)!=1 || sizeof(*rows)!=3)return 100; "
+          "for(int i=0;i<2;i++)for(int j=0;j<3;j++)s+=rows[i][j];return s;} "
+          "int walk(int rows[][3]){int *first=*rows++;if(first[2]!=3 || (*rows)[0]!=4)return 100; "
+          "rows-=1;rows+=1;return (*--rows)[1];} "
+          "int main(void){int local[2][2];local[1][1]=8; "
+          "if(sizeof(matrix)!=6 || sizeof(matrix[0])!=3 || sizeof(inferred)!=4 || inferred[1][1]!=0)return 1; "
+          "if(sum(matrix)!=21 || walk(matrix)!=2 || local[1][1]!=8)return 2; "
+          "if((&matrix[1]-&matrix[0])!=1 || (&matrix[0]-&matrix[1])!=-1)return 3; "
+          "if(((&matrix+1)-&matrix)!=1 || *(*(matrix+1)+2)!=6)return 4; "
+          "bob_puts(\"bob!\");return 0;}");
+    guest("#include \"bob.h\"\nint main(void){int a[4];int *p[2];int x=0; "
+          "if(sizeof(*&a)!=4 || sizeof((*&a)[2])!=1 || sizeof(1[a])!=1)return 1; "
+          "if(sizeof(p)!=2 || sizeof(*p)!=1 || sizeof(**p)!=1)return 2; "
+          "if(sizeof((x++,a))!=1 || sizeof(1?a:a)!=1 || x!=0)return 3; "
+          "bob_puts(\"bob!\");return 0;}");
+    guest("#include \"bob.h\"\nint read(int **);char *same(char *);int *object(int *); "
+          "int read(int **p){return **p;}char *same(char a[]){return a;} "
+          "int *object(int *a){return a;} "
+          "int x=7;int *p=&x;int **q=&p; "
+          "int main(void){char word[]=\"bob!\"; "
+          "if(read(q)!=7 || *object(p)!=7 || sizeof(int**)!=1)return 1; "
+          "bob_puts(same(word));return 0;}");
+    guest("#include \"bob.h\"\nint sum(int [],int); int sum(int *values,int count); "
+          "int old();int unused(int);char *text(char []); "
+          "int main(void){int a[]={2,3,4};char word[]=\"bob!\"; "
+          "if(sum(a,3)!=9 || old(7)!=7)return 1;bob_puts(text(word));return 0;} "
+          "int sum(int values[10],int count){int result=0; "
+          "if(sizeof(values)!=1)return 100;for(int i=0;i<count;i++)result+=values[i];return result;} "
+          "int old(int x){return x;}char *text(char word[]){return word;}");
+    guest("#include \"bob.h\"\nint x=7;int *p=&x;int data[]={3,4,5}; "
+          "int *middle=&data[1],*last=data+2,*also=1+data;char *message=\"bob!\"; "
+          "char *part=\"a\\0x\"+2; "
+          "int main(void){if(*p!=7 || *middle!=4 || *last!=5 || *also!=4 || *part!='x')return 1; "
+          "*p=9;if(x!=9)return 2;bob_puts(message);return 0;}");
+    guest("#include \"bob.h\"\nint global=5, other=6, *pointer; char word[]=\"bob!\", pad[7]=\"bob!\"; "
+          "int main(void){int x=2,*p=&x,y=x+3,a[]={7,8};char text[]=\"bob!\",*s=text; "
+          "int total=0;pointer=&global;*pointer=9; "
+          "for(int i=0,j=3;i<3;i++,j--){total+=i+j;} "
+          "{int x=4,y=x+1; if(y!=5)return 1;} "
+          "if(x!=2 || *p!=2 || y!=5 || a[1]!=8 || total!=9 || global!=9 || other!=6)return 2; "
+          "if(s[3]!='!' || pad[6]!=0)return 3;bob_puts(word);return 0;}");
+    guest("#include \"bob.h\"\nchar global[]=\"bob!\"; int values[]={3,4,5}; "
+          "int main(void){char text[]=\"bo\\0b!\" \"x\";char padded[8]=\"bob!\"; "
+          "char exact[4]=\"bob!\";char *a=\"a\\0x\";char *b=\"a\\0y\"; "
+          "int local[]={8,9}; "
+          "if(sizeof(global)!=5 || sizeof(values)!=3 || values[2]!=5)return 1; "
+          "if(sizeof(text)!=7 || text[2]!=0 || text[3]!='b' || text[5]!='x' || text[6]!=0)return 2; "
+          "if(sizeof(\"a\\0x\" \"b\")!=5 || a[2]!='x' || b[2]!='y')return 3; "
+          "if(sizeof(exact)!=4 || exact[3]!='!' || padded[7]!=0 || local[1]!=9)return 4; "
+          "bob_puts(global);return 0;}");
+    guest("#include \"bob.h\"\nint table[2+2]={1+2,8/2,1<<3}; "
+          "int main(void){int x=0;int sum=0;switch(++x){default:sum=99;break; "
+          "case 1:sum=2;case 2:sum+=3;break;}if(sum!=5 || x!=1)return 1; "
+          "switch(9){case 0:sum=0;break;default:sum=7;}if(sum!=7)return 2; "
+          "for(x=0;x<4;x++){switch(x){case 1:continue;case 2:break; "
+          "default:switch(x){case 3:sum+=10;break;default:sum++;} }sum++;} "
+          "if(sum!=21 || table[0]!=3 || table[1]!=4 || table[2]!=8 || table[3]!=0)return 3; "
+          "switch(4){case 1+3:sum++;break;default:return 4;} "
+          "switch(99){} if(sum!=22)return 5; bob_puts(\"bob!\");return 0;}");
+    guest("#include \"bob.h\"\nint f(void){goto done;return 8;done:return 3;} "
+          "int main(void){int x=0;again:x++;if(x<3)goto again;goto done;return 1; "
+          "done:if(x!=3 || f()!=3)return 2;{int y=4;goto inside;return 3; "
+          "inside:if(y!=4)return 4;} bob_puts(\"bob!\");return 0;}");
+    guest("#include \"bob.h\"\nint x=11; int f(int x){int total=x; "
+          "{int x=7; total+=x;} {int x=8;total+=x;} return total+x;} "
+          "int main(void){int x=2;int total=0; {int x=3; {int x=4; total+=x;} total+=x;} "
+          "if(x!=2 || total!=7 || f(5)!=25) return 1; "
+          "for(int x=0;x<3;x++){int total=x; if(total!=x)return 2;} "
+          "if(x!=2 || total!=7)return 3; bob_puts(\"bob!\");return 0;}");
+    guest("#include \"bob.h\"\nint pair(int a,int b){return a*10+b;} "
+          "int main(void){int x=0;int y=0;int a[4]={1}; "
+          "int n=1?7:++x; if(n!=7 || x) return 1; "
+          "n=0?++x:1?8:9; if(n!=8 || x) return 2; "
+          "n=0||1?3:4; if(n!=3) return 3; "
+          "n=(x=2,++x,x+4); if(n!=7 || x!=3) return 4; "
+          "if(pair((x=1,x+1),3)!=23 || x!=1) return 5; "
+          "for(x=0,y=0;x<3;x++,y+=2){} if(y!=6) return 6; "
+          "if(sizeof(int)!=1 || sizeof(char)!=1 || sizeof(int*)!=1 || sizeof(a)!=4) return 7; "
+          "if(sizeof(\"bob!\")!=5 || sizeof(++x)!=1 || x!=3) return 8; "
+          "n=1?(x=5,x+1):0; if(n!=6 || x!=5) return 9; "
+          "bob_puts(\"bob!\");return 0;}");
+    guest("#include \"bob.h\"\nint main(void) { int i=0; int calls=0; int a[4]={7,8}; "
+          "do { i++; if(i==2) continue; calls++; if(i==4) break; } while(i<10); "
+          "if(i!=4 || calls!=3 || a[0]!=7 || a[1]!=8 || a[2]!=0 || a[3]!=0) return 1; "
+          "do { calls++; } while(0); if(calls!=4) return 2; bob_puts(\"bob!\"); return 0; }");
     guest("#include \"runtime.h\"\n#include \"runtime.c\"\n"
           "int sum(int n) { if (n == 0) return 0; return n + sum(n - 1); }\n"
           "int main(void) { int data[4]; int other[4]; int *p; int i; "
@@ -201,6 +334,158 @@ static void usability(void) {
     output=read_text("build/check.out");contains(output,"bob16 OS:");contains(output,"bob!\nExit 0");
     not_contains(output,"Enter filename");free(output);
 }
+static void storage_path(const char *path) {
+#ifdef _WIN32
+    check(_putenv_s("BOB16_STORAGE",path)==0,"set snapshot fixture path");
+#else
+    check(setenv("BOB16_STORAGE",path,1)==0,"set snapshot fixture path");
+#endif
+}
+static void snapshot_mutate(int offset, int rehash) {
+    FILE *file=fopen("build/snapshot.b16","rb");if(!file)fail("snapshot missing");
+    unsigned char bytes[8640];size_t count=fread(bytes,1,sizeof(bytes),file);fclose(file);
+    check(count==8640,"snapshot exact size");bytes[offset]^=(offset==401?2:1);
+    if(rehash) {
+        uint32_t hash=2166136261u;
+        for(size_t i=16;i<count;i++)hash=(hash^bytes[i])*16777619u;
+        for(unsigned i=0;i<4;i++)bytes[12+i]=(unsigned char)(hash>>(8*i));
+    }
+    file=fopen("build/snapshot.b16","wb");if(!file)fail("snapshot mutate");
+    check(fwrite(bytes,1,count,file)==count,"snapshot fixture write");fclose(file);
+}
+static void persistence(void) {
+    storage_path("build/snapshot.b16");remove("build/snapshot.b16");
+    char *output=shell("write note bob!\ncc bob.c saved\nsave\nwrite note changed\nrestore\nread note\nrestore yes\nread note\nrun saved\nhalt\n");
+    contains(output,"Files saved to");contains(output,"restore yes replaces all RAM files.");
+    contains(output,"bob> changed\n");contains(output,"Files restored;");contains(output,"bob> bob!\nExit 0");free(output);
+    output=shell("restore yes\nread note\nrun saved\nhalt\n");
+    contains(output,"Files restored;");contains(output,"bob> bob!\nExit 0");free(output);
+    write_text("build/check.in","kernel.basm\nrestore yes\nrun saved\nhalt\n");
+    check(system(BOB " < build/check.in > build/check.out 2> build/check.err")==0,"snapshot BASM restart");
+    output=read_text("build/check.out");contains(output,"bob> bob!\nExit 0");not_contains(output,"Kernel changed:");free(output);
+    /* A checksum failure, valid-checksum metadata failure and truncation must
+       leave an unrelated current file available in the same shell. */
+    snapshot_mutate(448,0);
+    output=shell("write current bob!\nrestore yes\nread current\nhalt\n");
+    contains(output,"Invalid saved files; RAM files unchanged.");contains(output,"bob> bob!\n");free(output);
+    output=shell("save\nhalt\n");free(output);
+    snapshot_mutate(401,1); /* length[0] high byte -> out of range */
+    output=shell("write current bob!\nrestore yes\nread current\nhalt\n");
+    contains(output,"Invalid saved files; RAM files unchanged.");contains(output,"bob> bob!\n");free(output);
+    write_text("build/snapshot.b16","B16S");
+    output=shell("write current bob!\nrestore yes\nread current\nhalt\n");
+    contains(output,"Invalid saved files; RAM files unchanged.");contains(output,"bob> bob!\n");free(output);
+    output=shell("write note bob!\ncc bob.c saved\nsave\nhalt\n");free(output);
+    snapshot_mutate(8,0); /* kernel identity is separate from payload checksum */
+    output=shell("restore yes\nread note\nrun saved\ngo bob.c\nhalt\n");
+    contains(output,"Kernel changed: old programs omitted.");contains(output,"Program not found.");contains(output,"bob!\nExit 0");free(output);
+    storage_path("build/no-such-directory/snapshot.b16");
+    output=shell("write note bob!\nsave\nrestore yes\nread note\nhalt\n");
+    contains(output,"Storage unavailable.");contains(output,"bob> bob!\n");free(output);
+    storage_path("build/snapshot.b16");
+    output=shell("load blocked 0xf700 0xe000\nrun blocked\necho bob!\nhalt\n");
+    contains(output,"Program fault; shell restored.");contains(output,"bob> bob!\n");free(output);
+    storage_path("");
+}
+static void shell_editing(void) {
+    char *output=shell("echo bob!\n\033[A\n\033[A\033[Becho bob!\ncle\t\nrea\t bo\t\nwrite backup bob!\nread ba\t\nread b\t\necho bb!\033[D\033[Do\nxxecho bob!\033[H\033[3~\033[3~\nwrong\025echo bob!\nabc\001\033[3~\033[3~\033[3~echo bob!\005\nhalt\n");
+    contains(output,"\033[2J\033[H");
+    contains(output,"int main(void) { println(\"bob!\"); return 0; }");
+    contains(output,"File not found."); /* read b is ambiguous: no completion */
+    int markers=0;for(char *p=output;(p=strstr(p,"bob> bob!\n"))!=NULL;p+=10)markers++;
+    check(markers==8,"history, insertion, delete, home/end and clear line");free(output);
+    /* History keeps four commands and does not mutate recalled entries. */
+    output=shell("echo 1\necho 2\necho 3\necho 4\necho bob!\n\033[A\033[A\033[A\033[A\033[A\n\033[A\033[F\b\b\b\b\b\b\025echo bob!\nhalt\n");
+    contains(output,"bob> 2\n");contains(output,"bob> bob!\n");free(output);
+    char long_command[512];memset(long_command,'x',128);strcpy(long_command+128,"\t\033[A\necho bob!\nhalt\n");
+    output=shell(long_command);contains(output,"Command too long.");contains(output,"bob> bob!\n");free(output);
+    output=shell("poke 49152 65535\npeek 49152\npeek 65535\npeek 65536\npoke 49152 -32769\nalloc 32768\nls\nhalt\n");
+    contains(output,"0xC000: 0xFFFF (-1)");contains(output,"0xFFFF:");
+    contains(output,"Invalid address. Use hex");contains(output,"Invalid value. Use");
+    contains(output,"Allocation failed. Use a positive size");contains(output,"Used 1/8 slots");free(output);
+}
+static void host_language_rejections(void) {
+    const char *sources[]={
+        "void a[2];int main(void){return 0;}",
+        "int a[2][];int main(void){return 0;}",
+        "int main(void){return sizeof(int[]);}",
+        "int main(void){int (*p)[];return sizeof(*p);}",
+        "int main(void){int (*p)[];p++;return 0;}",
+        "int main(void){return sizeof(int[3][]);}",
+        "int main(void){return (int[2])1;}",
+        "int f(int (*)[2]);int f(int (*p)[3]){return 0;}int main(void){return 0;}",
+        "int (*a)[3];int (*a)[2];int main(void){return 0;}",
+        "int a[2]={[2]=1};int main(void){return 0;}",
+        "int a[2]={[-1]=1};int main(void){return 0;}",
+        "int a[2][3]={[0][3]=1};int main(void){return 0;}",
+        "int a[2]={[0][0]=1};int main(void){return 0;}",
+        "int a={[0]=1};int main(void){return 0;}",
+        "int a[]={[4096]=1};int main(void){return 0;}",
+        "int main(void){int n=1;int a[2]={[n]=1};return 0;}",
+        "int a[2]={[1] 1};int main(void){return 0;}",
+        "int a[2][2]={{1,2,3},{4}};int main(void){return 0;}",
+        "int a[1][2]={{1},{2}};int main(void){return 0;}",
+        "int main(void){int a[2][2]={{1},{2,3,4}};return 0;}",
+        "char a[4]={\"bob!\",1};int main(void){return 0;}",
+        "char a[1][3]={\"bob!\"};int main(void){return 0;}",
+        "int main(void){int a[1]={1,2};return 0;}",
+        "int main(void){return sizeof(void);}",
+        "void f(void){} int main(void){return sizeof(f());}",
+        "int main(void){return 1 ? 2;}",
+        "int main(void){return sizeof((void)0);}",
+        "int main(void){goto missing;return 0;}",
+        "int main(void){same:;same:return 0;}",
+        "int main(void){int x=1;int x=2;return x;}",
+        "int f(int x){int x=2;return x;} int main(void){return f(1);}",
+        "int main(void){{int x=1;}return x;}",
+        "int main(void){return x;int x=1;}",
+        "int main(void){for(int x=0;x<1;x++){}return x;}",
+        "int f(int x,int x){return x;}int main(void){return f(1,2);}",
+        "int main(void){switch(1){case 1:;case 1:return 0;}}",
+        "int main(void){switch(1){default:;default:return 0;}}",
+        "int main(void){case 1:return 0;}",
+        "int main(void){switch(1){default:continue;}return 0;}",
+        "int a[1/0];int main(void){return 0;}",
+        "int a[1<<16];int main(void){return 0;}",
+        "int main(void){char text[3]=\"bob!\";return 0;}",
+        "int main(void){int text[]=\"bob!\";return 0;}",
+        "int main(void){char text[];return 0;}",
+        "int main(void){int x=1,x=2;return x;}",
+        "int x=1,x=2;int main(void){return x;}",
+        "int x;int *p=&x[1];int main(void){return 0;}",
+        "int x;int *p=&x;int *q=p;int main(void){return 0;}",
+        "int f(int);char f(int x){return x;}int main(void){return 0;}",
+        "int f(int,int);int f(int x){return x;}int main(void){return 0;}",
+        "int f(char);int f(int x){return x;}int main(void){return 0;}",
+        "int f(int);int f(int,int);int main(void){return 0;}",
+        "int f(int x=1){return x;}int main(void){return 0;}",
+        "int f;int f(void){return 0;}int main(void){return 0;}",
+        "int f(int*);int f(char *p){return 0;}int main(void){return 0;}",
+        "int f(int**);int f(int *p){return 0;}int main(void){return 0;}",
+        "char *f(void);int *f(void){return 0;}int main(void){return 0;}",
+        "int f(char []);int f(int *p){return 0;}int main(void){return 0;}",
+        "int main(void){void *p;return sizeof(*p);}",
+        "int main(void){int x;return sizeof(*x);}",
+        "int main(void){int x;return sizeof(x[0]);}",
+        "int main(void){int a[2][];return 0;}",
+        "int main(void){int a[4096][2];return 0;}",
+        "int main(void){int a[2],b[2];return (int)(a+b);}",
+        "int main(void){int a[2];a=0;return 0;}",
+        "int main(void){int a[2];a++;return 0;}",
+        "int main(void){int a[4096][4096];return 0;}",
+        "int main(void){int a[2],b[2];return sizeof(a+b);}",
+        "int main(void){void *p;return sizeof(p+1);}",
+        "int main(void){int a[2];return sizeof(a[a]);}"
+    };
+    for(unsigned i=0;i<sizeof(sources)/sizeof(sources[0]);i++) {
+        write_text("build/check.c",sources[i]);
+        write_text("build/check.basm","bob!\n");write_text("build/check.b16","bob!\n");
+        check(system("gcc -E -P -nostdinc -undef -I kernel build/check.c -o build/check.i > build/compiler.log 2>&1")==0,"language rejection preprocessing");
+        check(system(COMPILER " build/check.i build/check.basm build/check.b16 > build/compiler.log 2>&1")!=0,"invalid C must fail compilation");
+        char *prior=read_text("build/check.basm");check(!strcmp(prior,"bob!\n"),"failed compile preserves BASM output");free(prior);
+        prior=read_text("build/check.b16");check(!strcmp(prior,"bob!\n"),"failed compile preserves binary output");free(prior);
+    }
+}
 static void image_validation(void) {
     FILE *in=fopen("build/kernel.b16","rb");if(!in)fail("kernel image missing");
     FILE *out=fopen("build/bad.b16","wb");if(!out)fail("bad image fixture");int ch;long count=0;
@@ -219,6 +504,6 @@ static void basm_route(void) {
 int main(void) {
     console_and_commands();input_bounds();allocator_and_files();resident_compiler();
     compiler_extensions();editor_and_aliases();
-    program_loading_and_recovery();host_compiler_and_runtime();file_management();compile_workflow();usability();image_validation();basm_route();
+    program_loading_and_recovery();host_compiler_and_runtime();host_language_rejections();file_management();compile_workflow();usability();persistence();shell_editing();image_validation();basm_route();
     printf("bob!\n%d checks passed.\n",checks);return 0;
 }

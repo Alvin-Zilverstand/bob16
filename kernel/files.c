@@ -3,6 +3,20 @@ int file_lengths[8];
 int file_kinds[8];
 int file_used[8];
 
+void file_snapshot(int operation) {
+    int descriptor[4]; int result;
+    descriptor[0] = (int)file_names; descriptor[1] = (int)file_lengths;
+    descriptor[2] = (int)file_kinds; descriptor[3] = (int)file_used;
+    result = bob_snapshot(descriptor, operation);
+    if (result == -1) println("Storage unavailable. Check bob-files.b16 location/permissions (or BOB16_STORAGE).");
+    else if (result < 0) println("Invalid saved files; RAM files unchanged.");
+    else if (operation == 0) println("Files saved to bob-files.b16 (or BOB16_STORAGE).");
+    else {
+        println("Files restored; previous RAM files replaced.");
+        if (result == 1) println("Kernel changed: old programs omitted. Compile restored C sources again.");
+    }
+}
+
 char *file_name(int slot) { return file_names + slot * NAME_WORDS; }
 /* The upper 4096 words are reserved for file contents, above the kernel stack.
    Supervised programs cannot write this region. */
@@ -14,9 +28,10 @@ int file_find(char *name) {
     return -1;
 }
 int file_slot(char *name) {
-    int slot; int length;
+    int slot; int length; int i;
     length = strlen(name);
     if (length == 0 || length >= NAME_WORDS) return -1;
+    for (i = 0; i < length; i++) if (name[i] < 33 || name[i] > 126) return -1;
     slot = file_find(name);
     if (slot >= 0) return slot;
     for (slot = 0; slot < FILE_COUNT; slot++) {
@@ -52,6 +67,7 @@ void file_list(void) {
         }
     }
     if (!count) println("No files.");
+    print("Used "); print_dec(count); println("/8 slots; limit 511 words per file. delete frees a slot.");
 }
 void file_manage(char *operation, char *name, char *destination) {
     int slot; int target;

@@ -33,24 +33,48 @@ the supplied image directly. The welcome message points to `help` and `go bob.c`
 | `delete name` | Permanently remove a RAM file and free its slot |
 | `read name` | Print a text file |
 | `write name bob!` | Create or replace a one-line text file |
-| `edit name` | Open an existing text file or create one in the line editor |
+| `edit name` | Open/create text in the full-screen editor (Windows console) |
 | `cc bob.c bob` | Compile a C source file inside the emulator |
 | `cc bob.c` | Compile to the default program file `app` |
 | `go bob.c` | Compile to `app` and run only if compilation succeeds |
 | `go bob.c bob` | Compile and run with an explicit output name |
+| `save` | Save all files to a host snapshot |
+| `restore yes` | Validate/load that snapshot, replacing the RAM files |
 | `load name 0x4001 ...` | Store raw bob16 machine words as a program file |
 | `run name` | Load a binary program into reserved RAM, execute, return |
 | `halt` | Stop the emulator |
 
 Command lines hold up to 127 characters. Longer lines are completely consumed
 and rejected so their tail cannot become another command. Input is terminated
-and handles CRLF, backspace and EOF. Decimal values are signed 16-bit; hex values
-cover all 16-bit bit patterns. Addresses are word addresses.
+and handles CRLF, backspace and EOF. Decimal input accepts -32768..65535;
+positive values above 32767 represent their 16-bit bit pattern. Hex accepts
+0x0000..0xFFFF. Addresses are word addresses; allocation sizes must be positive.
+
+## Shell keys
+
+In a native Windows console, the shell supplies editing and redraw itself:
+
+| Key | Action |
+| --- | --- |
+| Up / Down | Browse the four most recent nonempty commands; Down restores the draft |
+| Left / Right | Move within the command |
+| Home / End or Ctrl+A / Ctrl+E | Move to the start/end |
+| Backspace / Delete | Remove before/at the cursor |
+| Ctrl+U | Clear the line |
+| Tab | Complete a unique command or filename; list ambiguous matches |
+| Ctrl+D / Ctrl+Z | End input |
+
+Completion operates on the word at the end of the line. Type more characters
+when matches are ambiguous. History is session-only, includes failed commands,
+and skips consecutive duplicates. `edit` opens its own full-screen view in a
+Windows console. Redirected input emits no
+redraw or candidate lists. Other terminals use ordinary input; full interactive
+key handling currently targets the native Windows console.
 
 The RAM filesystem has eight slots, names up to 23 characters and content up
 to 511 words per file. A character occupies one word. `bob.c` occupies one slot
-initially. Files and allocations are lost on exit; disk persistence is not
-implemented. Allocation is a zeroing bump allocator with no freeing. `poke` is
+initially. Unsaved files and allocations are lost on exit. Use `save` to retain
+files between sessions. Allocation is a zeroing bump allocator with no freeing. `poke` is
 restricted to heap RAM so it cannot corrupt the shell.
 
 Copy and rename refuse to overwrite an existing destination. Choose a new
@@ -64,7 +88,66 @@ leaves an existing output intact and `go` does not run that old program.
 Diagnostics report the first detected error's character offset, line and
 column (one based); the location can be just after the token that caused it.
 
+## Keep files between sessions
+
+Run from the repository directory, then enter:
+
+```text
+write note bob!
+go bob.c
+save
+halt
+```
+
+Start the emulator again, enter `kernel.basm` (or use `--os`), and enter
+`restore yes`, then `read note` or `run app`. Restore is explicit; startup does
+not automatically replace the supplied `bob.c` or other RAM files.
+
+The default snapshot is `bob-files.b16` in the emulator's working directory.
+`save` replaces the previous snapshot, first writing `bob-files.b16.tmp` and
+then replacing the destination. Keep a copy of the snapshot for older versions.
+Set the host environment variable `BOB16_STORAGE` to choose another file path;
+the parent directory must already exist. Messages mention this override.
+Restoring replaces **all** RAM files; use `save` first if current files matter.
+An invalid, truncated, corrupt or unreadable snapshot leaves RAM unchanged.
+The snapshot includes text and program files, not heap allocations or history.
+
+Native programs contain kernel helper addresses. If the kernel image differs
+from the one used to save, restore keeps text and omits binary programs.
+Run `go SOURCE` to compile them again. BASM and binary boots of the same kernel
+share the same identity. Guest programs cannot invoke the storage service.
+
 ## Edit existing files
+
+In a native Windows console, `edit name` opens a nano-like, non-modal view:
+type directly into the file and use the arrow keys to move. The title shows the
+filename and `*` when modified; the bottom row lists shortcuts. The view scrolls
+vertically and horizontally to keep the cursor visible.
+
+| Key | Effect |
+| --- | --- |
+| Ctrl+O | Save to the RAM filesystem and continue editing |
+| Ctrl+X | Exit; if modified, ask whether to save |
+| Y / N at the exit prompt | Save and exit / discard and exit |
+| Ctrl+C at the exit prompt | Cancel and continue editing |
+| Ctrl+Z | Toggle undo/redo of the last insertion or deletion |
+| Arrows | Move through characters and lines |
+| Home / End or Ctrl+A / Ctrl+E | Move to the start/end of the current line |
+| Backspace / Delete | Delete before/at the cursor |
+| Enter | Insert a newline |
+| Tab | Insert a space |
+
+For example, enter `edit bob.c`, move to the text you want to change, type,
+then press Ctrl+O and Ctrl+X. Enter `go bob.c` at the shell to compile/run it.
+There are no insert/command modes or colon commands in this view. A failed
+save keeps changes in the editor. The file limit remains 511 characters;
+additional input is rejected without truncating existing text. Ctrl+D follows
+the same safe exit path as Ctrl+X. Saves are to RAM; use shell `save` for disk.
+
+### Scripted/other-terminal fallback
+
+For redirected input or terminals without native Windows console support,
+the original line interface remains available for scripts:
 
 `edit name` loads the current text, displays numbered lines and opens `edit>`.
 Typing ordinary text appends a line; existing content is retained. The editor
@@ -89,7 +172,8 @@ then `:wq` changes the existing source rather than recreating it from scratch.
 Each edit line has the same 127-character input limit as the shell. Oversize
 changes and invalid line numbers are rejected while the editor remains open.
 EOF discards unsaved changes. Binary program files cannot be opened as text.
-The editor is a line editor, not a full-screen terminal application.
+This fallback is a line editor. Interactive Windows sessions use the full-screen
+view described above.
 
 ## Compile C inside bob16
 
@@ -169,10 +253,13 @@ what fits in a single command line; use the resident compiler for larger program
 | Word addresses | Use |
 | --- | --- |
 | `0x0000..0x00FF` | Boot ROM and reserved return sentinel |
-| `0x0300..0x8FFF` | Kernel code, globals, strings and editor/compiler buffers |
+| `0x0100..0x01FF` | Shell and fallback editor input buffers |
+| `0x0300..0x8FFF` | Kernel code, globals and strings |
 | `0x9000..0xBFFF` | Loaded program, variables and downward program stack |
 | `0xC000..0xDFFF` | 8,192-word heap |
-| `0xE000..0xEFFF` | Kernel stack, growing down from `0xF000` |
+| `0xE000..0xE3FF` | Shared editor/compiler scratch (never used concurrently) |
+| `0xE400..0xE5FF` | Four-command shell history |
+| `0xE600..0xEFFF` | Kernel stack, growing down from `0xF000` |
 | `0xF000..0xFFFF` | Eight file-content buffers; protected from program writes |
 
 There are no interrupts, multitasking or hardware memory protection. The write
@@ -207,9 +294,51 @@ the bob16 code generation. The host compiler supports a broader subset:
 signed ints/chars, word pointers and casts, fixed arrays, constant global
 initialization, functions and recursion, assignments/compound assignments,
 arithmetic/bitwise/shift operators, short-circuit logic, comparisons,
-increment/decrement, if, while, for, break, continue and returns.
-Shadowing, structs, typedefs, unsigned types, floating point, function pointers,
-sizeof, variadics, local array initialization and standard headers are unsupported.
+increment/decrement, if, while, do/while, for, break, continue, function-scoped
+labels/goto and returns. Blocks permit shadowing; for-loop declarations have
+loop scope. Duplicate declarations in the same scope are rejected.
+Switch/case/default support fall-through, nesting and break; continue targets
+the surrounding loop. Integer constant expressions support arithmetic, bitwise,
+comparison, logical and conditional operators in bounds/initializers/case labels.
+Invalid constant division and shifts are rejected.
+Comma-separated declarations work at file/block scope and in for initializers;
+each declarator has its own pointer stars and array bounds. Global pointer
+initializers can reference strings, global objects and array elements, with
+constant offsets scaled to their pointee size. Nested element addresses and
+arrays of pointers use relocations as well.
+File-scope function prototypes are retained and checked against definitions for
+the current scalar/character/pointer kinds and parameter counts. Array parameters
+adjust to pointers to their element or row type; the outer bound may be omitted.
+Unused prototypes need no definition. Pointer descriptors distinguish current
+pointee kinds and indirection depth in prototype checks. Qualifier compatibility,
+complete expression checking and linking external definitions remain incomplete.
+Multidimensional arrays support indexing, row pointers, scaled pointer arithmetic,
+increments and pointer differences. Objects are limited to 4096 words and 16
+dimensions. Global/local initializer lists accept nested braces and brace
+elision, with omitted elements zero-filled. Excess initializers are rejected.
+Array designators such as `[3] = 7` and `[1][2] = 9` select elements; subsequent
+entries continue after the selected subobject. Later initializers replace earlier
+values for the same elements. Designators also support pointer arrays and inferred
+outer bounds. Indices must be constant and within the array bounds. Initializer
+braces are limited to 64 nested levels.
+Initialized arrays may omit their outer bound. Character arrays accept string
+initializers, with inferred bounds or zero-filled padding. A bound equal to the
+text length omits the terminator; character-array rows may initialize from
+strings, with or without braces. String literals and concatenation preserve
+embedded zero characters, including their contribution to sizeof.
+Conditional `?:` and comma expressions preserve branch/sequence behavior.
+`sizeof` handles the current word-sized scalar/pointer types, declared arrays
+and string literals without evaluating its operand; void operands are rejected.
+Structs, typedefs, unsigned types, floating point, function pointers,
+Variadics and standard headers are unsupported. `sizeof` tracks array/pointer
+expression types, including *&array and array decay in comma/conditional
+expressions. Recursive object declarators support grouped names, pointers to
+arrays such as `int (*rows)[3]`, and arrays of those pointers. Abstract declarators
+in casts and sizeof support these forms too; sizeof array type names uses the
+complete storage size. Pointers to incomplete arrays can be declared, but their
+pointee has no size for sizeof or arithmetic. Declarators have limits of 32
+parenthesis levels and 64 derived types. Function pointer declarators, functions
+returning pointers to arrays, and complete C type checking remain unsupported.
 Host tools themselves use ordinary host C types.
 
 To compile another standalone guest source from the repository root:

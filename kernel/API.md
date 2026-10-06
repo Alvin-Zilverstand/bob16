@@ -23,7 +23,30 @@ the next read reports EOF. The host terminal supplies line editing and echo.
 The low-level `bob_putc(int)` sends the low eight bits to stdout. `bob_getc()`
 returns 0..255 or -1 at EOF. `bob_puts()` adds a newline; use print for prompts.
 
+`bob_key()` (trap 8) reads a key: -1 EOF, byte character, or 256/257 up/down,
+258/259 left/right, 260/261 home/end, 262 delete. Windows console input uses
+unbuffered keys, converts Enter to newline, and treats Ctrl+D as EOF.
+Ctrl+Z is an ordinary control character: shell EOF, full-screen editor undo.
+Redirected input uses getchar. `bob_terminal()` (trap 9) returns 1 only when
+both input/output are native Windows console handles; otherwise 0. Shell
+history, completion and editing are guest code in `kernel/input.c`. ANSI key
+sequences in redirected regression fixtures exercise the same guest actions.
+`bob_columns()` (trap 10) reports the console buffer width, or 80 as fallback.
+The shell scrolls a long input line horizontally to keep redraw within it.
+
 ## Strings, memory and allocation
+
+The kernel-only `bob_snapshot(int *descriptor, int operation)` is trap 7.
+Operation 0 saves; 1 restores. The four-word descriptor contains pointers to
+the 192-word names table, then eight-word length, kind and used tables. File
+contents occupy the fixed `0xF000..0xFFFF` region. Descriptors can be on the
+kernel stack; tables must be disjoint and below `0x9000`. The host validates
+metadata, payload checksum and complete file length before committing a restore.
+Returns 0 on success, 1 when restored binaries were omitted because the kernel
+changed, -1 for storage errors, -2 for invalid data and -3 for invalid arguments.
+Invocation by a supervised program faults and restores the shell. The default
+host path is `bob-files.b16`; `BOB16_STORAGE` overrides it. See `C_OS.md` for the
+user-facing save/restore workflow.
 
 | Function | Contract |
 | --- | --- |
@@ -50,10 +73,19 @@ are 0..7. These routines are internal kernel APIs; callers must check slots.
 
 Failed size/name validation does not overwrite an existing file. Edits start
 with the existing file contents in a scratch buffer and commit on :w, :wq or a
-single dot line. :q or EOF discards changes since the most recent save. Oversize
+single dot line. :q protects unsaved changes; :q! or EOF discards them. Oversize
 changes are rejected without modifying the current buffer.
 Resident compilation similarly commits output only after successful parsing and
-code generation. Storage is volatile and disappears when bob.exe stops.
+code generation. RAM contents disappear when bob.exe stops; save snapshots files for explicit restore in another session.
+
+Interactive `edit` uses native `kernel/nano.c`: direct insertion, cursor motion,
+Ctrl+O save, Ctrl+X safe exit with Y/N/Cancel, and Ctrl+Z one-change undo/redo.
+The legacy colon-command interface is only a redirected/unsupported-terminal
+fallback. Both share `0xE000..0xE1FF` text and `0xE200..0xE3FF` undo scratch.
+Resident compilation reuses these regions for code/names/tokens/loop chains;
+it must not run concurrently with editing. History uses `0xE400..0xE5FF`, with
+kernel stack reserved at `0xE600..0xEFFF`. Input buffers are `0x0100..0x01FF`.
+`bob_rows()` (trap 11) reports visible console height, with a 25-row fallback.
 
 ## Program execution
 

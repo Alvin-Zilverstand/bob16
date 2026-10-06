@@ -118,6 +118,7 @@
 /* Kernel disk exposed to the guest boot ROM through trap 4. */
 static uint16_t bootDisk[0x10000];
 static uint16_t bootWords;
+static uint16_t bootOrigin;
 static bool bootMode;
 static bool programMode;
 static bool programDone;
@@ -138,6 +139,49 @@ static unsigned readWord(FILE *file) {
 }
 
 static void bootImage(const char *path);
+#ifdef _WIN32
+static DWORD originalInputMode;
+static bool rawInputStarted;
+static void restoreInputMode(void) {
+    if(rawInputStarted)SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE),originalInputMode);
+}
+#endif
+static int terminalAvailable(void) {
+#ifdef _WIN32
+    DWORD inputMode,outputMode;
+    return GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE),&inputMode) &&
+           GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE),&outputMode);
+#else
+    return 0;
+#endif
+}
+static int terminalKey(void) {
+    fflush(stdout);
+#ifdef _WIN32
+    if(terminalAvailable()) {
+        HANDLE input=GetStdHandle(STD_INPUT_HANDLE);DWORD mode,count;INPUT_RECORD record;
+        GetConsoleMode(input,&mode);
+        if(!rawInputStarted){originalInputMode=mode;rawInputStarted=true;atexit(restoreInputMode);}
+        SetConsoleMode(input,mode&~ENABLE_PROCESSED_INPUT);
+        int key=0;
+        while(ReadConsoleInputA(input,&record,1,&count) && count) {
+            if(record.EventType!=KEY_EVENT || !record.Event.KeyEvent.bKeyDown)continue;
+            key=(unsigned char)record.Event.KeyEvent.uChar.AsciiChar;
+            if(!key) switch(record.Event.KeyEvent.wVirtualKeyCode) {
+                case VK_UP:key=256;break;case VK_DOWN:key=257;break;
+                case VK_LEFT:key=258;break;case VK_RIGHT:key=259;break;
+                case VK_HOME:key=260;break;case VK_END:key=261;break;
+                case VK_DELETE:key=262;break;default:break;
+            }
+            if(key)break;
+        }
+        if(key==13)return '\n';
+        if(key==4)return -1;
+        return key;
+    }
+#endif
+    return getchar();
+}
 
 typedef uint16_t ureg_t;
 typedef int16_t reg_t;
@@ -191,6 +235,7 @@ struct ram_t {
 	ureg_t mar;
 	reg_t mdr;
 } ram;
+#include "storage.c"
 
 void cpuCycle(void);
 
@@ -449,6 +494,26 @@ void execute() {
 					break;
 				case 6:
 					cpu.regFile[0] = (int16_t)runProgram((uint16_t)cpu.regFile[0]);
+					break;
+				case 7:
+					if(programMode)machineFault();
+					cpu.regFile[0]=(int16_t)snapshotService((uint16_t)cpu.regFile[0],cpu.regFile[1]);
+					break;
+				case 8:
+					cpu.regFile[0]=(int16_t)terminalKey();
+					break;
+				case 9:
+					cpu.regFile[0]=(int16_t)terminalAvailable();
+					break;
+				case 10:
+				case 11:
+					cpu.regFile[0]=((cpu.ir>>8)&15)==10?80:25;
+#ifdef _WIN32
+					{
+						CONSOLE_SCREEN_BUFFER_INFO info;
+						if(GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE),&info))cpu.regFile[0]=((cpu.ir>>8)&15)==10?info.dwSize.X:info.srWindow.Bottom-info.srWindow.Top+1;
+					}
+#endif
 					break;
 				default:
 					machineFault();
@@ -1053,6 +1118,7 @@ static void bootImage(const char *path) {
     }
     fclose(file);
     bootWords = (uint16_t)words;
+    bootOrigin = (uint16_t)origin;
     bootMode = true;
     memset(&cpu, 0, sizeof(cpu));
     memset(&ram, 0, sizeof(ram));
@@ -1085,6 +1151,12 @@ int main(int argc, char** argv) {
 	}
 	}
 
+	uint16_t identityWords[0x8d00];
+	for(unsigned i=0;i<0x8d00;i++) {
+		unsigned address=0x300+i;
+		identityWords[i]=bootMode?(address>=bootOrigin && address<bootOrigin+bootWords?bootDisk[address-bootOrigin]:0):(uint16_t)ram.memory[address];
+	}
+	kernelIdentity=snapshotHash(identityWords,0x8d00);
 	unsigned long cycles = 0;
 	while (true) {
 		if (maxCycles && cycles++ >= maxCycles) { fprintf(stderr, "CPU cycle limit reached\n"); return 2; }
