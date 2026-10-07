@@ -98,7 +98,7 @@ static void native_string_library(void) {
     write_text("build/argv-app.c",
         "#include \"bob.h\"\n#include \"bob_string.h\"\n"
         "int main(int argc,char **argv){if(argc!=5)return argc;"
-        "if(bob_strcmp(argv[1],\"Bob OS\")||bob_strcmp(argv[2],\"escaped token\")||bob_strcmp(argv[3],\"\"))return 2;"
+        "if(bob_strcmp(argv[0],\"argvapp\")||bob_strcmp(argv[1],\"Bob OS\")||bob_strcmp(argv[2],\"escaped token\")||bob_strcmp(argv[3],\"\"))return 2;"
         "bob_puts(\"bob!\");return 0;}\n");
     check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/argv-app.c -o build/argv-app.i > build/compiler.log 2>&1")==0,"bob32 argv app preprocessing");
     check(system(COMPILER " build/argv-app.i build/argv-app.basm build/argv-app.b32 --wide-app > build/compiler.log 2>&1")==0,"bob32 argv app compilation");

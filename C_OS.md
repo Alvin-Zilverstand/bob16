@@ -41,6 +41,12 @@ image in the guest filesystem, use `import32 build/app.b32 myapp`, then launch
 it with `run myapp`. `save` includes imported applications in the B32S snapshot;
 after `restore yes`, run them again without re-importing. `run32` remains
 available for direct host-path launches.
+Native applications may define either `int main(void)` or the conventional
+`int main(int argc, char **argv)`. For the latter, `argv[0]` is the guest app
+name and `argc` includes it. Pass arguments with `run myapp first "two words"`;
+quotes group spaces and backslash escapes the next character. Empty quoted
+arguments are preserved. This applies to imported guest files; direct host-path
+`run32` launches currently start without command-line arguments.
 Set `BOB16_TRACE_FAULT=1` before launching the emulator to log the address and
 instruction when a supervised application faults.
 The updated emulator also accepts `bob.exe --os` from that directory to boot
@@ -87,7 +93,7 @@ token, 0 at end, or -1 for an unclosed quote.
 | `save` | Save all files to a host snapshot |
 | `restore yes` | Validate/load that snapshot, replacing the RAM files |
 | `load name 0x4001 ...` | Store raw bob16 machine words as a program file |
-| `run name` | Load a binary program into reserved RAM, execute, return |
+| `run name` | Load a program into reserved RAM and run it; native apps accept arguments |
 | `run32 path` | Load and run a native B32K v2 image from a host path or guest filename |
 | `import32 path name` | Import a host B32K v2 image into bob32 RAM files |
 | `halt` | Stop the emulator |

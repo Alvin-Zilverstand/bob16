@@ -3,3 +3,5 @@ __pycache__/
 
 bob-files.b16
 bob-files.b16.tmp
+
+*.exe

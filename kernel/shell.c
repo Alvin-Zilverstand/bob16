@@ -298,7 +298,7 @@ void command_help(char *name) {
         println("ls / dir / list: show names, lengths and text/program kinds. Files are in RAM; save keeps them between sessions.");
     else if (strcmp(name, "copy") == 0 || strcmp(name, "rename") == 0 || strcmp(name, "delete") == 0)
         println("copy OLD NEW | rename OLD NEW | delete NAME. Example: copy bob.c backup.c. Destinations must be new. Copy needs a free slot; rename does not. Delete is permanent.");
-    else if (strcmp(name, "run") == 0) println("run NAME: execute a compiled/loaded program. Example: cc bob.c bob, then run bob. Exit shows return value; faults/timeouts restore the shell.");
+    else if (strcmp(name, "run") == 0) println("run NAME [ARG ...]: run a guest program. Native bob32 apps accept quoted arguments; Exit shows return value.");
 #ifdef BOBC_WIDE
     else if (strcmp(name, "run32") == 0) println("run32 PATH: load and run a B32K v2 application image in the bob32 OS. Example: run32 build/wide-app.b32. Compile with bobcc --wide-app.");
     else if (strcmp(name, "import32") == 0) println("import32 HOST_PATH GUEST_NAME: import a B32K v2 image into RAM files; then run GUEST_NAME and save to keep it in B32S.");
@@ -330,7 +330,7 @@ void SHELL_COMMAND_BODY(char *line) {
         println("peek ADDRESS | poke ADDRESS VALUE | alloc WORDS");
         println("list / ls / dir | read NAME | write NAME TEXT | edit NAME");
         println("copy OLD NEW | rename OLD NEW | delete NAME (permanent in RAM)");
-        println("load NAME 0xWORD ... | run NAME | cc SOURCE [OUTPUT] | go SOURCE [OUTPUT]");
+        println("load NAME 0xWORD ... | run NAME [ARG ...] | cc SOURCE [OUTPUT] | go SOURCE [OUTPUT]");
 #ifdef BOBC_WIDE
         println("run32 PATH: run a native bob32 B32K v2 application image.");
         println("import32 HOST_PATH GUEST_NAME: import once, then run the guest filename.");

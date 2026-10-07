@@ -140,3 +140,7 @@ Native C applications can include `bob_string.h` for small app-side string
 and parsing helpers. It provides bounded integer formatting, status-returning
 decimal/hex parsing, and in-place quoted tokenization without depending on the
 kernel's private runtime functions.
+Native apps may define `main(int argc, char **argv)`; when launched by guest
+filename, `argv[0]` is that filename and `argc` includes it. `run app first
+"two words"` groups quoted words; backslash escapes the following character
+and `""` supplies an empty argument.
