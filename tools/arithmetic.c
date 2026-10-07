@@ -5,13 +5,17 @@ int __cmp_ge(int a, int b) { return a >= b; }
 int __cmp_eq(int a, int b) { return a == b; }
 int __cmp_ne(int a, int b) { return a != b; }
 int __mul(int a, int b) {
-    int result; result = 0;
-    if (b > 0) b = -b;
-    else a = -a;
-    while (b < 0) { result = result + a; b++; }
+    int result; int bit; result = 0; bit = 1;
+    /* The guest uses wrapping 16-bit words. Each bit contributes its shifted
+       multiplicand; the mask wraps to zero after exactly sixteen steps. */
+    while (bit) {
+        if (b & bit) result = result + a;
+        a = a + a; bit = bit + bit;
+    }
     return result;
 }
 int __divneg(int a, int b) {
+    if(b == -1)return -a;
     int q; q = 0;
     while (a <= b) { a = a - b; q++; }
     return q;
@@ -19,7 +23,7 @@ int __divneg(int a, int b) {
 int __div(int a, int b) {
     int negative; int q;
     if (b == 0) return 0;
-    negative = (a < 0) != (b < 0);
+    negative = (a ^ b) < 0;
     if (a > 0) a = -a;
     if (b > 0) b = -b;
     q = __divneg(a, b);

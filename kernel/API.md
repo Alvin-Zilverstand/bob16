@@ -40,7 +40,9 @@ The kernel-only `bob_snapshot(int *descriptor, int operation)` is trap 7.
 Operation 0 saves; 1 restores. The four-word descriptor contains pointers to
 the 192-word names table, then eight-word length, kind and used tables. File
 contents occupy the fixed `0xF000..0xFFFF` region. Descriptors can be on the
-kernel stack; tables must be disjoint and below `0x9000`. The host validates
+kernel stack; tables must be disjoint and below `0xA000` in bob16 mode. In
+bob32 mode they may be in low kernel RAM or in the loaded kernel image, which
+now resides above `0x10000`. The host validates
 metadata, payload checksum and complete file length before committing a restore.
 Returns 0 on success, 1 when restored binaries were omitted because the kernel
 changed, -1 for storage errors, -2 for invalid data and -3 for invalid arguments.
@@ -52,14 +54,16 @@ user-facing save/restore workflow.
 | --- | --- |
 | `int strlen(char *text)` | Count words before the zero terminator |
 | `int strcmp(char *a, char *b)` | Negative, zero or positive according to the first differing ASCII character |
-| `void memcpy(int *dst, int *src, int count)` | Copy count words forward; source and destination must not overlap |
-| `void memset(int *dst, int value, int count)` | Fill count words with a 16-bit value |
+| `void memcpy(void *dst, void *src, int count)` | Copy count words forward; source and destination must not overlap |
+| `void memset(void *dst, int value, int count)` | Fill count words with a 16-bit value |
 | `int *alloc(int words)` | Return a zeroed heap block, or null for an invalid size or exhaustion |
 
 String routines require terminated strings. Memory routines require valid
 regions; they do not perform bounds checks for kernel callers. Counts are words,
-not host bytes. Allocation reserves from 0xC000 upward, with 8,192 total words.
-The heap is shared with loaded programs. There is no free or reset operation.
+not host bytes. The bob16 heap reserves 8,192 words from 0xC000; bob32 reserves
+4,096 words from 0xD000 so the enlarged kernel and compatibility-program stack
+fit below it. The heap is shared with loaded programs. There is no free or reset
+operation.
 
 ## RAM filesystem
 
@@ -67,9 +71,13 @@ The heap is shared with loaded programs. There is no free or reset operation.
 `file_content(slot)` return addresses into the filesystem buffers.
 `file_write(name, data, length, kind)` copies data and creates/replaces a file,
 returning its slot or -1 for a bad name, length or a full table. Kind 0 is text;
-kind 1 is machine code. Its copy appends a zero word, which is not part of length.
-Names hold at most 23 characters and data at most 511 words. Valid slot indices
-are 0..7. These routines are internal kernel APIs; callers must check slots.
+kind 1 is machine code, kind 2 is resident bob32 C code, and kind 3 is a packed
+native B32K v2 image. Its copy appends a zero word, which is not part of length.
+Names hold at most 23 characters. bob16 retains eight fixed 511-word slots;
+bob32 packs files into a shared 4,096-word content region. Text files remain
+limited to 511 words; resident programs and native images can use the remaining
+shared capacity (up to 4,095 words per file). Valid slot indices are 0..7.
+These are internal kernel APIs.
 
 Failed size/name validation does not overwrite an existing file. Edits start
 with the existing file contents in a scratch buffer and commit on :w, :wq or a
@@ -89,27 +97,46 @@ kernel stack reserved at `0xE600..0xEFFF`. Input buffers are `0x0100..0x01FF`.
 
 ## Program execution
 
-`bob_run(entry)` invokes emulator trap 6. Valid entries are 0x9000..0xBDFF.
-The shell's run_file copies a binary RAM file to 0x9000 after clearing the
-12,288-word program region. Entry 0x9000 executes with r6=0xC000, r5=0, and
-r7 pointing to the reserved return sentinel. The shell CPU state is restored
-on completion. RET or TRAP 0 ends the program.
+`bob_run(entry)` invokes emulator trap 6. In bob16 mode valid entries are
+0xA000..0xBDFF. In bob32 mode kind-1 legacy entries are 0xC200..0xCFFF and
+kind-2 native entries are 0x20000..0xEFFFF when the caller explicitly supplies
+a wide entry. The shell places legacy programs at 0xC200 in bob32 mode to avoid
+overwriting the bob32 kernel image, and native bob32 files at 0x20000. The entry executes
+with r6 at the top of its protected stack region, r5=0, and r7 pointing to the
+reserved return sentinel. In bob32 mode kind-1 apps use `0xC200..0xCFFF` because
+the expanded kernel occupies the old bob16 program window. Compatibility apps
+retain access to the shared `0xD000..0xDFFF` heap. The shell CPU state is
+restored on completion. RET or TRAP 0 ends the program.
 
 Return values -1, -2 and -3 are reserved for invalid entry/nested execution,
 program fault, and timeout. Otherwise r0 is the program's exit status. A program
 returning one of those reserved values is indistinguishable from that service
 status. Five million cycles is the per-run limit. Programs may write only
-0x9000..0xDFFF; kernel code, RAM files and the shell stack are protected from
-their stores. Program and heap contents themselves are not private or restored.
+their application and stack regions; bob16 and compatibility applications may
+also write the shared heap. Kernel code, RAM files and the shell stack
+are protected from their stores. Program and heap contents themselves are not
+private or restored.
 
-The resident compiler uses variable words at 0x9800..0x980F and inline string
-data in its program image. Its files can contain at most 511 code/data words,
-so these variable words do not overlap its code. Its console/helper calls use
-the separate program stack. Compiled resident programs depend on addresses in
-the current kernel and should not be reused with a different kernel build.
+The resident compiler uses variable words at 0x9800..0x980F in bob16 mode and
+0xF0000..0xF000F in bob32 mode; string data is inline in the program image.
+In bob16 its files can contain at most 511 code/data words; bob32 compiler output
+uses the available packed filesystem capacity. Console and arithmetic calls
+use the separate program stack. Compiled resident programs depend on addresses
+in the current kernel and should not be reused with a different kernel build.
 
 `bob_address(function_name)` is a host-compiler intrinsic that inserts a kernel
 function address. `bob_call(entry)` is an unchecked direct call for trusted
 kernel code; ordinary shell programs use bob_run for recovery and write checks.
 
 See [the OS guide](../C_OS.md) for commands, examples and C subset limits.
+
+In bob32 mode, `import32 HOST_PATH NAME` validates and packs a B32K v2 image
+into a guest RAM file; `run NAME` loads and executes it. B32S version 2
+snapshots preserve packed files; version 1 fixed-slot snapshots remain readable
+and are converted to the packed layout on restore. `run32 HOST_PATH` remains
+available for direct host-path launches.
+
+Native C applications can include `bob_string.h` for small app-side string
+and parsing helpers. It provides bounded integer formatting, status-returning
+decimal/hex parsing, and in-place quoted tokenization without depending on the
+kernel's private runtime functions.

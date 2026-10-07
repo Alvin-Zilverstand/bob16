@@ -44,7 +44,11 @@ void input_complete(void) {
     count = input_cursor - start; matches = 0;
     if (input_cursor != input_length) return;
     if (!start) {
+#ifdef BOBC_WIDE
+        words = "help echo clear mem halt list ls dir read write edit load run run32 cc go copy rename delete alloc peek poke save restore";
+#else
         words = "help echo clear mem halt list ls dir read write edit load run cc go copy rename delete alloc peek poke save restore";
+#endif
         while (*words) {
             length = 0;
             while (*words && *words != ' ') candidate[length++] = *words++;

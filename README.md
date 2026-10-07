@@ -100,3 +100,12 @@ condition codes are set after instructions with *, so if the result of an instru
 negative 	-> n bit is set\
 zero 		-> z bit is set\
 positive	-> p bit is set
+# bob32 migration status
+
+`bob32.exe` supports 32-bit words and addresses, including high-origin B32K v2
+images. `build.exe --run32` builds and boots the B32 kernel, with its shell,
+editor, filesystem, B32S snapshots, and compatibility for supervised bob16
+applications. Native B32K apps can be imported into guest RAM files with
+`import32`, launched by guest filename, and preserved in B32S snapshots. The
+resident C compiler and full C conformance remain in progress. See [BOB32_MIGRATION.md](BOB32_MIGRATION.md) for image
+details, verified behavior and remaining migration requirements.

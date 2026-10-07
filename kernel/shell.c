@@ -80,13 +80,13 @@ int editor_changed(char *name) {
     int slot;
     slot = file_find(name);
     if (slot < 0) return editor_length != 0;
-    return strcmp(edit_buffer, file_content(slot)) != 0;
+    return strcmp(edit_buffer, (char *)file_content(slot)) != 0;
 }
 int editor_replace(int start, int end, char *text, int newline) {
     int added; int delta; int i;
     added = strlen(text) + newline;
     delta = added - (end - start);
-    if (editor_length + delta >= FILE_WORDS) { println("File too large; change rejected."); return 0; }
+    if (editor_length + delta >= TEXT_WORDS) { println("File too large; change rejected."); return 0; }
     memcpy(edit_undo, edit_buffer, editor_length + 1);
     editor_undo_length = editor_length; editor_has_undo = 1;
     if (delta > 0) {
@@ -195,10 +195,36 @@ void load_words(char *name) {
     if (slot < 0) println("Cannot create program file.");
     else println("Loaded.");
 }
-void run_file(char *name) {
+void run_file(char *name, char *app_arguments) {
     int slot; int status; int *program;
     slot = file_find(name);
-    if (slot < 0 || !file_kinds[slot]) { println("Program not found. Use cc or load first."); return; }
+    if (slot < 0 || !file_kinds[slot]) { println("Program not found. Use cc, load, or import32 first."); return; }
+#ifdef BOBC_WIDE
+    if (file_kinds[slot] == 3) {
+        int descriptor[4];
+        descriptor[0] = (int)file_content(slot); descriptor[1] = file_lengths[slot];
+        descriptor[2] = (int)app_arguments;
+        descriptor[3] = (int)name;
+        status = bob_run_native(descriptor);
+        if (status == -4) println("Invalid or unsupported native bob32 image.");
+        else if (status == -5) println("Not enough emulator memory to load this app.");
+        else if (status == -2) println("Program fault; shell restored.");
+        else if (status == -3) println("Program timed out; shell restored.");
+        else { print("Exit "); print_dec(status); bob_putc('\n'); }
+        return;
+    }
+    if (file_kinds[slot] == 2) {
+        program = (int *)WIDE_PROGRAM_BASE;
+        memset(program, 0, file_lengths[slot] + 1);
+        memcpy(program, file_content(slot), file_lengths[slot]);
+        memset((int *)WIDE_VARIABLE_BASE, 0, 16);
+        status = bob_run(WIDE_PROGRAM_BASE);
+        if (status == -2) println("Program fault; shell restored.");
+        else if (status == -3) println("Program timed out; shell restored.");
+        else { print("Exit "); print_dec(status); bob_putc('\n'); }
+        return;
+    }
+#endif
     program = (int *)PROGRAM_BASE;
     memset(program, 0, PROGRAM_WORDS);
     memcpy(program, file_content(slot), file_lengths[slot]);
@@ -207,19 +233,65 @@ void run_file(char *name) {
     else if (status == -3) println("Program timed out; shell restored.");
     else { print("Exit "); print_dec(status); bob_putc('\n'); }
 }
+void import_wide_image(char *path, char *name) {
+    int slot; int descriptor[3]; int result; int i; int used;
+    slot = file_prepare_native(name);
+    if (slot < 0) { println("Cannot import: invalid name, duplicate file, or all 8 slots are used."); return; }
+    used = 0; for (i = 0; i < FILE_COUNT; i++) if (file_used[i] && i != slot) used += file_lengths[i] + 1;
+    descriptor[0] = (int)path; descriptor[1] = (int)file_content(slot); descriptor[2] = FILE_WORDS - used;
+    result = bob_import_image(descriptor);
+    if (result < 0) {
+        file_used[slot] = 0; file_lengths[slot] = 0; file_kinds[slot] = 0; memset(file_name(slot), 0, NAME_WORDS);
+        if (result == -1) println("Cannot read host app image path.");
+        else if (result == -5) println("Not enough RAM filesystem space for this app image.");
+        else println("Invalid, truncated, corrupt, or unsupported B32K app image.");
+        return;
+    }
+    file_content(slot)[result] = 0; file_lengths[slot] = result; file_kinds[slot] = 3;
+    print("Imported native app as "); print(name); print(". Run it with: run "); println(name);
+}
+#ifdef BOBC_WIDE
+void run_wide_image(char *path) {
+    int status;
+    status = bob_run_image(path);
+    if (status == -5) println("Cannot read B32 app image.");
+    else if (status == -4) println("Invalid B32 app image or unsupported address range.");
+    else if (status == -2) println("Program fault; shell restored.");
+    else if (status == -3) println("Program timed out; shell restored.");
+    else { print("Exit "); print_dec(status); bob_putc('\n'); }
+}
+#endif
 void memory_status(void) {
-    print("Heap "); print_hex(HEAP_BASE); print(".."); print_hex(0xdfff);
+    print("Heap "); print_hex(HEAP_BASE); print(".."); print_hex(HEAP_BASE + HEAP_WORDS - 1);
     print("; free "); print_dec(HEAP_WORDS - heap_used); println(" words");
+#ifdef BOBC_WIDE
+    print("bob16 programs 0x0000A000..0x0000BDFF; bob32 legacy programs "); print_hex(PROGRAM_BASE); print("..0x0000CFFF; native bob32 programs "); print_hex(WIDE_PROGRAM_BASE); print("..0x000EFFFF"); println("");
+#else
     print("Programs "); print_hex(PROGRAM_BASE); print(".."); print_hex(0xbfff); println("");
+#endif
+#ifdef BOBC_WIDE
+    println("Files: 8 slots, 4096 words total; text files up to 511 words; native apps share remaining space.");
+#else
     println("Files: 8 slots, 511 words each; stack above 0xE600.");
+#endif
 }
 void command_help(char *name) {
     if (strcmp(name, "save") == 0 || strcmp(name, "restore") == 0) {
-        println("save: snapshot all files to bob-files.b16 in the working directory (or BOB16_STORAGE). restore yes: replace RAM files with that snapshot. Save current work first. Changed kernels restore text only; recompile programs."); return;
+#ifdef BOBC_WIDE
+        println("save: snapshot all files to bob-files.b32 in the working directory (or BOB16_STORAGE). restore yes: replace RAM files with that snapshot. Save current work first. Changed kernels restore text only; recompile programs.");
+#else
+        println("save: snapshot all files to bob-files.b16 in the working directory (or BOB16_STORAGE). restore yes: replace RAM files with that snapshot. Save current work first. Changed kernels restore text only; recompile programs.");
+#endif
+        return;
     }
     if (strcmp(name, "edit") == 0) println("edit NAME: type/arrows; Ctrl+O saves, Ctrl+X exits, Ctrl+Z undo/redo. Unsaved exit asks Y/N. Redirected input uses the line editor; see C_OS.md.");
-    else if (strcmp(name, "cc") == 0 || strcmp(name, "go") == 0)
+    else if (strcmp(name, "cc") == 0 || strcmp(name, "go") == 0) {
+#ifdef BOBC_WIDE
+        println("cc SOURCE [OUTPUT]: compile a native 32-bit C program; output defaults to app. Code can use available RAM filesystem space. go also runs it. 32-bit int; ?:, do/while, arrays; one main; no includes.");
+#else
         println("cc SOURCE [OUTPUT]: compile C; output defaults to app. go SOURCE [OUTPUT] also runs on success. Example: go bob.c. One int main(void); no includes. Use edit SOURCE to fix errors.");
+#endif
+    }
     else if (strcmp(name, "write") == 0) println("write NAME TEXT: create/replace a text file. Example: write note bob! Names: 1..23 characters without spaces; 8 file slots, 511 words each. Use edit for multiple lines.");
     else if (strcmp(name, "read") == 0) println("read NAME: print text. Example: read bob.c. Use ls to see names; run executes program files.");
     else if (strcmp(name, "ls") == 0 || strcmp(name, "dir") == 0 || strcmp(name, "list") == 0)
@@ -227,18 +299,27 @@ void command_help(char *name) {
     else if (strcmp(name, "copy") == 0 || strcmp(name, "rename") == 0 || strcmp(name, "delete") == 0)
         println("copy OLD NEW | rename OLD NEW | delete NAME. Example: copy bob.c backup.c. Destinations must be new. Copy needs a free slot; rename does not. Delete is permanent.");
     else if (strcmp(name, "run") == 0) println("run NAME: execute a compiled/loaded program. Example: cc bob.c bob, then run bob. Exit shows return value; faults/timeouts restore the shell.");
+#ifdef BOBC_WIDE
+    else if (strcmp(name, "run32") == 0) println("run32 PATH: load and run a B32K v2 application image in the bob32 OS. Example: run32 build/wide-app.b32. Compile with bobcc --wide-app.");
+    else if (strcmp(name, "import32") == 0) println("import32 HOST_PATH GUEST_NAME: import a B32K v2 image into RAM files; then run GUEST_NAME and save to keep it in B32S.");
+#endif
     else if (strcmp(name, "load") == 0) println("load NAME 0xWORD ...: store machine words. Example: load empty 0x2180 0xE000, then run empty. RET 0xE000 returns; use cc for C source.");
     else if (strcmp(name, "peek") == 0 || strcmp(name, "poke") == 0)
-        println("peek ADDRESS | poke ADDRESS VALUE: word addresses, hex 0x0000..0xFFFF or signed decimal. Example: poke 0xC000 98. Writes allowed only at 0xC000..0xDFFF. peek also shows signed value.");
+        println("peek ADDRESS | poke ADDRESS VALUE: word addresses, hex 0x0000..0xFFFF or signed decimal. Example: poke 0xD000 98. Writes allowed only in heap RAM. peek also shows signed value.");
     else if (strcmp(name, "alloc") == 0 || strcmp(name, "mem") == 0)
-        println("alloc WORDS: allocate/zero 1..8192 heap words, print start address; no free. Example: alloc 16. mem shows remaining heap and memory regions.");
+        println("alloc WORDS: allocate/zero heap words, print start address; no free. Example: alloc 16. mem shows remaining heap and memory regions.");
     else if (strcmp(name, "echo") == 0) println("echo TEXT: print text. Example: echo bob!");
     else if (strcmp(name, "clear") == 0) println("clear: clear an ANSI-capable terminal; does not remove files.");
     else if (strcmp(name, "halt") == 0) println("halt: stop emulator. Unsaved RAM files and allocations are lost; use save before quitting.");
     else if (strcmp(name, "help") == 0) println("help: list commands. help COMMAND: show usage and an example. Try help edit or help go.");
     else println("No help for that command. Type help for available names.");
 }
-void shell_command(char *line) {
+#ifdef BOBC_WIDE
+#define SHELL_COMMAND_BODY shell_command_normal
+#else
+#define SHELL_COMMAND_BODY shell_command
+#endif
+void SHELL_COMMAND_BODY(char *line) {
     char *command; char *name; char *text; int value; int address; int *pointer;
     arguments = line; command = next_arg();
     if (!*command) return;
@@ -250,6 +331,10 @@ void shell_command(char *line) {
         println("list / ls / dir | read NAME | write NAME TEXT | edit NAME");
         println("copy OLD NEW | rename OLD NEW | delete NAME (permanent in RAM)");
         println("load NAME 0xWORD ... | run NAME | cc SOURCE [OUTPUT] | go SOURCE [OUTPUT]");
+#ifdef BOBC_WIDE
+        println("run32 PATH: run a native bob32 B32K v2 application image.");
+        println("import32 HOST_PATH GUEST_NAME: import once, then run the guest filename.");
+#endif
         println("cc/go default output: app. Try go bob.c to compile and print bob!");
         println("Use hex addresses. poke is limited to heap RAM.");
         println("Type help COMMAND for usage/examples. Try help edit or help go.");
@@ -276,23 +361,23 @@ void shell_command(char *line) {
         value = file_find(next_arg());
         if (value < 0) println("File not found.");
         else if (file_kinds[value]) println("Binary program; use run.");
-        else println(file_content(value));
+        else println((char *)file_content(value));
     } else if (strcmp(command, "write") == 0) {
         name = next_arg(); text = remaining_args();
         if (file_write(name, text, strlen(text), 0) < 0) println("Cannot write file. Names: 1..23 printable characters; 8 slots. Use ls or help write.");
         else println("Saved.");
     } else if (strcmp(command, "edit") == 0) edit_file(next_arg());
     else if (strcmp(command, "load") == 0) { name = next_arg(); load_words(name); }
-    else if (strcmp(command, "run") == 0) run_file(next_arg());
+    else if (strcmp(command, "run") == 0) { name = next_arg(); run_file(name, remaining_args()); }
     else if (strcmp(command, "cc") == 0 || strcmp(command, "go") == 0) {
         name = next_arg(); text = next_arg();
         if (!*name || *next_arg()) { println("Usage: cc SOURCE [OUTPUT] | go SOURCE [OUTPUT]"); return; }
         if (!*text) text = "app";
         value = compile_command(name, text);
-        if (value && strcmp(command, "go") == 0) run_file(text);
+        if (value && strcmp(command, "go") == 0) run_file(text, "");
     } else if (strcmp(command, "alloc") == 0) {
         value = parse_number(next_arg());
-        if (!number_ok) { println("Invalid allocation size. Use 1..8192 words; mem shows available space."); return; }
+        if (!number_ok) { println("Invalid allocation size. Use a positive word count; mem shows available space."); return; }
         pointer = alloc(value);
         if (!pointer) println("Allocation failed. Use a positive size within free space; see mem. No free command.");
         else { print_hex((int)pointer); bob_putc('\n'); }
@@ -303,11 +388,26 @@ void shell_command(char *line) {
         if (strcmp(command, "poke") == 0) {
             value = parse_number(next_arg());
             if (!number_ok) { println("Invalid value. Use -32768..65535 or 0x0000..0xFFFF."); return; }
-            if (address >= 0 || address < -16384 || address >= -8192) {
-                println("poke is limited to 0xC000..0xDFFF."); return;
-            }
+#ifdef BOBC_WIDE
+            if (address < 0xd000 || address > 0xdfff) { println("poke is limited to heap RAM."); return; }
+#else
+            if (address >= 0 || address < -16384 || address >= -8192) { println("poke is limited to 0xC000..0xDFFF."); return; }
+#endif
             *pointer = value;
         }
         print_hex(address); print(": "); print_hex(*pointer); print(" ("); print_dec(*pointer); println(")");
     } else println("Unknown command. Type help.");
 }
+#ifdef BOBC_WIDE
+void shell_command(char *line) {
+    if(line[0]=='r' && line[1]=='u' && line[2]=='n' && line[3]=='3' && line[4]=='2' && (!line[5] || line[5]==' ')) {
+        arguments=line+5;char *path=next_arg();int slot;
+        if(!*path)println("Usage: run32 PATH [ARG ...]");
+        else {slot=file_find(path);if(slot>=0 && file_kinds[slot]==3)run_file(path,remaining_args());else if(*remaining_args())println("Arguments require an imported native app.");else run_wide_image(path);}
+    } else if(line[0]=='i' && line[1]=='m' && line[2]=='p' && line[3]=='o' && line[4]=='r' && line[5]=='t' && line[6]=='3' && line[7]=='2' && (!line[8] || line[8]==' ')) {
+        arguments=line+8;char *path=next_arg();char *name=next_arg();
+        if(!*path || !*name || *next_arg())println("Usage: import32 HOST_PATH GUEST_NAME");
+        else import_wide_image(path,name);
+    } else shell_command_normal(line);
+}
+#endif
