@@ -14,10 +14,12 @@
 #endif
 #define WIDE_PROGRAM_BASE 0x20000
 #define WIDE_VARIABLE_BASE 0xf0000
+#define WIDE_FILE_BASE 0x1e000
+#define WIDE_FILE_WORDS 8192
 #define FILE_COUNT 8
 #define TEXT_WORDS 512
 #if BOBC_WIDE
-#define FILE_WORDS 4096
+#define FILE_WORDS WIDE_FILE_WORDS
 #else
 #define FILE_WORDS 512
 #endif
@@ -28,6 +30,7 @@ int file_find(char *name);
 int file_prepare_native(char *name);
 char *file_name(int slot);
 int *file_content(int slot);
+void file_service_register(void);
 #if BOBC_WIDE
 void memcpy(void *dst, void *src, int count);
 void memset(void *dst, int value, int count);

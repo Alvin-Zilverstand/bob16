@@ -47,6 +47,85 @@ name and `argc` includes it. Pass arguments with `run myapp first "two words"`;
 quotes group spaces and backslash escapes the next character. Empty quoted
 arguments are preserved. This applies to imported guest files; direct host-path
 `run32` launches currently start without command-line arguments.
+
+Native applications can use `bob_fs.h` for guest RAM files. Its version 1
+service supports listing names/kinds/sizes, direct kind lookup by filename,
+reading and writing text files and
+raw bob16/bob32 program words, and deleting files. Text writes are bounded to
+the text-file limit; binary writes accept only program kinds. Native B32K apps
+must enter storage through validated import. The OS keeps filesystem tables
+private to the kernel. See [the native app examples](apps/README.md)
+for `echo`, `ls`, `cat`, `sysinfo`, and the snapshot-friendly `notes` app.
+`launcher` lists stored native bob32 applications and runs one with arguments;
+native apps can use `bob_process.h` to launch another stored app and receive its
+exit code. The emulator preserves the suspended app's memory while a child runs.
+
+`bob_memory.h` provides a small caller-owned word arena for temporary app data.
+Give it an integer buffer, allocate in target words, inspect used/remaining space,
+and reset it for reuse. Allocation returns null for invalid requests or when the
+buffer is full; it reserves no global OS heap.
+
+Native apps can include `bob_time.h` to read UTC seconds through the versioned
+OS-service boundary. The result is returned as low and high 32-bit words.
+`bob_system.h` reports the system-service version, cell-framebuffer presence
+and size, and whether keyboard and mouse input are available. `sysinfo` displays
+these device capabilities alongside the filesystem and application-memory
+usage.
+For convenience, `bob_native.h` includes the common string, memory, filesystem,
+process, time, system-capability, and input-event APIs. Add `bob_gfx.h` and
+`bob_gui.h` separately when building graphical apps.
+
+`bob_gfx.h` provides the first graphics abstraction: apps draw into an 80x25
+cell framebuffer, then present it through the emulator’s terminal backend.
+The API includes resolution, pixels, rectangles, lines, text, transparent
+bitmap cells with per-cell foreground colors, clear, present and leave.
+`bob_font.h` adds a 5x7 bitmap text renderer for uppercase letters, digits,
+space, and common punctuation.
+`apps/graphics_demo.c` draws a sample
+screen, waits for a key through `bob_event_wait`, and returns to the shell.
+The GUI demo's Window B includes a keyboard- and mouse-driven native app
+launcher; it runs stored apps through `bob_process.h` and shows their exit status.
+Press `?` for a bitmap-font help panel; Escape or its Close button returns to
+the desktop.
+Event version 1 delivers character and special-key down/up events. On Windows
+console input it also delivers mouse movement and button transitions with
+screen-cell coordinates, plus signed mouse-wheel deltas. `bob_event_wait`
+blocks; `bob_event_poll` checks the console queue without blocking. Redirected
+input remains character based and is consumed by the blocking path. This
+cell-based backend establishes the app boundary before adding a true pixel
+surface.
+`bob_event_queue.h` provides a caller-owned FIFO for buffering these events;
+overflow is reported without overwriting queued input.
+`bob_wm.h` provides the reusable bob32 window manager. Applications give it fixed
+arrays for window records and stacking order; it owns allocation, visibility,
+focus, z-order, hit testing, title-bar dragging, event routing, and dirty-window
+tracking. `bob_wm_dispatch` returns the window ID for an event, routes keyboard
+input only to the focused visible window, and rewrites mouse coordinates to be
+relative to the recipient. `bob_wm_begin_draw` and `bob_wm_next_dirty` return
+visible dirty windows in stacking order; moving, hiding, raising, or destroying
+a window requests a safe full redraw, while content invalidation marks the
+affected window and overlaps. `bob_gui.h` adds reusable window, button,
+popup-menu, single-line text-field, and multiline text-area widgets.
+`apps/gui_demo.c` uses the manager for its editor and file-browser windows and
+draws only the dirty windows during normal interaction; modal help, launcher,
+and menu panels use full redraws. It draws a desktop
+with a multiline text editor and file browser. The editor starts with `new.txt`
+and `bob!`, supports mouse caret placement, insertion, deletion, Enter for new
+lines, arrow/Home/End navigation, vertical movement, mouse-wheel scrolling,
+and horizontal scrolling for long lines. Tab cycles through the filename field,
+text area, and file browser; Ctrl+S saves the current text file. Press `e` in
+the file browser to load the selected text file into the editor, then Ctrl+S to
+save changes. The browser immediately lists the saved file and can preview or
+delete text files with confirmation. Clicking a window raises it, dragging its
+title bar moves it, and Escape returns to the
+shell. Dragging is clamped to
+the screen edges. A clickable button in Window A focuses Window B. Window B lists guest filesystem entries and previews selected text files; use
+`n`/`p` or the mouse to change selection and Up/Down or `u`/`d` to scroll the
+preview. Press `x` to show Yes/Cancel controls; click one or press `y`/`n`.
+Window B also has a File popup opened with `m` or by clicking its title area;
+the menu supports keyboard and mouse selection to open or delete the selected
+text file, or close the popup. It follows Window B when dragged and clamps to
+the screen edges.
 Set `BOB16_TRACE_FAULT=1` before launching the emulator to log the address and
 instruction when a supervised application faults.
 The updated emulator also accepts `bob.exe --os` from that directory to boot
@@ -119,14 +198,15 @@ In a native Windows console, the shell supplies editing and redraw itself:
 | Ctrl+D / Ctrl+Z | End input |
 
 Completion operates on the word at the end of the line. Type more characters
-when matches are ambiguous. History is session-only, includes failed commands,
+when matches are ambiguous. The `history` builtin lists the same four recent
+commands. History is session-only, includes failed commands,
 and skips consecutive duplicates. `edit` opens its own full-screen view in a
 Windows console. Redirected input emits no
 redraw or candidate lists. Other terminals use ordinary input; full interactive
 key handling currently targets the native Windows console.
 
 The RAM filesystem has eight slots and names up to 23 characters. bob16 keeps
-eight fixed 511-word slots. bob32 packs files into 4,096 words total; text and
+eight fixed 511-word slots. bob32 packs files into 8,192 words total; text and
 resident programs remain limited to 511 words, while native apps use six
 metadata words plus payload and a terminator, sharing space with other files.
 A character occupies one word. `bob.c` occupies one slot initially. Unsaved
@@ -168,6 +248,8 @@ the parent directory must already exist. Messages mention this override.
 Restoring replaces **all** RAM files; use `save` first if current files matter.
 An invalid, truncated, corrupt or unreadable snapshot leaves RAM unchanged.
 The snapshot includes text and program files, not heap allocations or history.
+Current bob32 snapshots use B32S v3 for the 8,192-word filesystem; B32S v1
+fixed-slot and v2 packed snapshots remain readable and migrate on restore.
 
 Native programs contain kernel helper addresses. If the kernel image differs
 from the one used to save, restore keeps text and omits binary programs.
@@ -330,7 +412,7 @@ console/arithmetic routines and belong to the kernel build that compiled them.
 In bob32 mode the same syntax emits native 32-bit instructions and kind-2 RAM
 program files, which can be run with `run` and retained in B32S snapshots. B32
 resident programs start at `0x20000` and use variables at `0xF0000..0xF000F`;
-their output can use the remaining shared 4,096-word filesystem space. Source
+their output can use the remaining shared 8,192-word filesystem space. Source
 text files remain limited to 511 words. In bob16 mode files remain kind 1 and
 use 16-bit integers and the `0xA000` program region. The bob32 shell also runs
 kind-1 legacy programs at `0xC200`, clear of the expanded kernel image.
@@ -376,8 +458,9 @@ what fits in a single command line; use the resident compiler for larger program
 | `0xA000..0xCFFF` | Loaded bob16 compatibility program at `0xC200..0xCFFF` |
 | `0xD000..0xDFFF` | bob32 heap and compatibility stack region |
 | `0xE000..0xEFFF` | Editor/compiler scratch, history and shell stack |
-| `0xF000..0xFFFF` | Packed bob32 RAM filesystem contents |
-| `0x10000..0x1FFFF` | Native bob32 kernel code, globals and strings |
+| `0xF000..0xFFFF` | bob16 file contents; bob32 scratch space |
+| `0x10000..0x1DFFF` | Native bob32 kernel code, globals and strings |
+| `0x1E000..0x1FFFF` | Protected packed bob32 filesystem contents |
 | `0x20000..0xEFFFF` | Supervised native bob32 program entry/code region |
 | `0xF0000..0xFFFFF` | Native app data and compiler variables; stack starts at `0x100000` |
 

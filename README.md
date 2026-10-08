@@ -6,6 +6,10 @@ regenerate BASM after editing the C kernel, or build the binary boot workflow.
 The OS has a shell, RAM files, allocation, program loading, and a resident C
 compiler. Its tools are written in C; no Python is required.
 
+An experimental x86-64 UEFI target is built separately with `build-tool --bob64`;
+see [the bob64 migration status](BOB64_MIGRATION.md). It does not replace the
+existing custom-CPU bob16/bob32 emulator.
+
 extremely simple custom 16 bit cpu emulator and assembler as seen on youtube: https://youtu.be/tlIqosU75CQ?is=ZAVWsYRDMPrUKOej \
 use at your own risk! code is thoroughly untested so if you find any bugs let me know asap so i can fix them asap
 

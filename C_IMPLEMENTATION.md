@@ -583,3 +583,55 @@ The bob32 resident compiler now accepts one-dimensional array parameters, adjust
 Started the app-side standard library with `kernel/bob_string.h`: basic string operations, whitespace detection, overflow-checked signed decimal/hex parsing, bounded integer formatting and quote-aware in-place tokenization. Runtime tests exercise edge cases in bob32, and a compiled app using the header is imported, launched, snapshotted, restored and run again from the bob32 filesystem. Full suites: CPU 203, OS/compiler 1,840, console 28.
 
 Native bob32 apps can now use `int main(int argc, char **argv)`. The OS shell accepts quoted arguments after an imported app name, preserves empty strings and backslash escapes, and supplies the guest filename as `argv[0]`. A compiled app checks its argument count and values—including a word with spaces and an empty argument—through the real import/run path. Full suites: CPU 203, OS/compiler 1,844, console 28.
+
+Added a version 1 native OS service through `bob_fs.h` for filesystem metadata and text operations, plus basic memory/filesystem system information. Added native `echo`, `ls`, `cat`, `sysinfo`, and `notes` examples. Integration tests exercise the utilities, create a note, save a B32S snapshot, restore it in a new emulator process, then read and delete it. Full suites: CPU 203, OS/compiler 1,874, console 28.
+
+Added a version 1 graphics and input boundary through `bob_gfx.h` and `bob_event.h`. The terminal backend provides an 80x25 double-buffered character-cell surface with colors, pixels, rectangles, lines, text and transparent bitmap-cell blits. Blocking event wait delivers typed characters and special key presses, with release/mouse event types reserved. The graphics demo draws, waits for a test key, leaves graphics mode and returns to the shell. Full suites: CPU 203, OS/compiler 1,880, console 28.
+
+## bob64 user pixel-surface milestone
+
+bob64 syscall ABI v3 adds a display query and a protected full-screen surface present call. Apps submit packed 0x00RRGGBB pixels; the kernel validates the entire range in the isolated user page table, then copies in 1024-pixel chunks and converts channels for GOP RGB/BGR modes without exposing the device pointer. bob64_app_get_display and bob64_app_present wrap the services. The new apps/bob64_display.c demo paints a bounded 1024x768 gradient and writes bob!; build/test parses its B64E image. Tests verify dimensions, both GOP channel layouts, invalid mappings and size mismatches. build-tool --bob64-test and --bob64-handoff-test both pass. Actual display presentation remains unverified until UEFI runtime testing.
+## bob64 app input-event milestone
+
+Syscall ABI v5 defines a fixed 44-byte BOB64_EVENT and blocking app-owned input delivery. The PS/2 set-1 decoder emits key-down/up events, ASCII characters, Shift/Caps/Control/Alt state and extended key identities while preserving shell input. A bounded PS/2 mouse driver decodes movement, button transitions, IntelliMouse wheel packets and extended buttons, clamps coordinates to the framebuffer, and routes events through the same validated app buffer. apps/bob64_display.c stays on screen until Escape. Host tests cover keyboard modifiers, mouse packet signs/clamping/buttons/wheel, syscall delivery and invalid user pointers. Both bob64 host suites pass; UEFI device execution remains unverified.
+
+## bob64 user-space window-manager milestone
+
+Added bob64/window.h as a 64-bit-clean app-owned port of the existing fixed-capacity window manager. It stores 64-bit handles and context pointers, preserves focus/z-order/visibility and dirty-redraw behavior, hit-tests and clamps windows, supports title-bar dragging, and routes keyboard, mouse, and wheel events in local coordinates. Tests exercise overlapping redraws, hidden-window focus, drag/release behavior, wheel routing, stale handles, and synthetic app pointers/handles above 4 GiB. bob64 graphics and handoff test suites both pass and print bob!. The existing desktop application and widget drawing layer still need porting and UEFI runtime verification.
+
+## bob64 native desktop editor milestone
+
+Expanded `apps/bob64_gui.c` from a windowing demo into a small usable desktop app. It launches from the shell as `run desktop.b64e [filename]`, defaults to `notes.txt`, and supports mouse cursor placement, keyboard insertion, Backspace/Delete, arrow-key movement, newline insertion, viewport scrolling, Ctrl+S saves and a two-Escape unsaved-exit prompt through syscall ABI v5. Filenames are validated against the flat filesystem's allowed set. Raised the bounded whole-file console/file syscall buffer to 4 KiB and moved its transfer scratch into kernel static storage to keep the 16 KiB privilege stack clear. Added `bob64/editor.h` for a bounded 4 KiB editing buffer and host regression tests for 4 KiB syscall read/write across page boundaries, user-range validation, insertion, deletion, movement, wrapping and line handling. Files over the current syscall buffer limit cannot be overwritten by this app. The generated app is embedded in the UEFI image and installed as `desktop.b64e`; both `--bob64-test` and `--bob64-handoff-test` pass and print `bob!`. Actual UEFI input/display and the full existing GUI port remain unverified.
+
+The resident bob64 compiler now supports fixed local `int` arrays, `int *`
+locals, array decay, address-of/dereference, indexed loads/stores, and scaled
+pointer addition/subtraction. It rejects pointer multiplication and mismatched
+pointer assignments/initializers. Runtime tests execute generated code for
+array indexing, both pointer-addition operand orders, 4-byte element scaling,
+pointer differences and a stack pointer above 4 GiB; negative tests check
+invalid pointer arithmetic and assignment. Local arrays also accept scalar
+brace initializers with trailing commas and zero-fill for omitted elements;
+excess elements are rejected. Integer and `long long` helper functions may
+appear before or after `main`, with forward and nested calls using up to eight
+parameters. The first four use Microsoft x64 argument registers and later ones
+use the caller's stack area; scalar and `int *`/array parameters are stored in
+function-local stack slots, and array parameters support indexing. Tests cover
+generated-code execution for pre-main definitions, 64-bit helper returns, array
+parameters, nested calls, all four argument registers, stack-passed scalar and
+pointer arguments, argument-count rejection, and the established `bob!` smoke
+path. Function prototypes now contribute signatures during a top-level pass;
+definitions must match their return type and parameter count/types, and calls
+to declarations without definitions are rejected. Tests cover unnamed prototype
+parameters, 64-bit prototype returns, and prototype/definition conflicts. The
+statement parser now emits tested
+`if`/`else` and `while` branches, and signed integer comparisons for `==`, `!=`,
+`<`, `<=`, `>`, and `>=`; braced blocks share one function namespace. Unary
+`!` and short-circuit `&&`/`||` are supported, with regression tests proving
+skipped branches do not execute pointer-mutating calls. Lexical scopes and
+return types other than `int` or `long long` remain unsupported.
+C-style `for` loops now support optional
+initialization/condition clauses and a scalar assignment update. Nested loop
+contexts patch `break` to the nearest exit and `continue` to the while condition
+or for-update block; tests exercise nested targets and reject either statement
+outside a loop. Conditional early returns emit the function epilogue and
+are tested with a signed absolute-value helper.

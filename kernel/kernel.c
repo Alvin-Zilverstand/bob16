@@ -8,6 +8,9 @@
 
 int main(void) {
     int length; char *sample;
+#ifdef BOBC_WIDE
+    file_service_register();
+#endif
     println("bob!");
 #ifdef BOBC_WIDE
     println("bob32 OS: help COMMAND for usage; go bob.c runs the example.");

@@ -1315,12 +1315,13 @@ static void expr(Node *n) {
         else if(!strcmp(n->name,"bob_run_image")){vector=12;expected=1;}
         else if(!strcmp(n->name,"bob_run_native")){vector=13;expected=1;}
         else if(!strcmp(n->name,"bob_import_image")){vector=14;expected=1;}
+        else if(!strcmp(n->name,"bob_os_service") || !strcmp(n->name,"bob_fs_register")){vector=15;expected=1;}
         else if(!strcmp(n->name,"bob_key"))vector=8;
         else if(!strcmp(n->name,"bob_terminal"))vector=9;
         else if(!strcmp(n->name,"bob_columns"))vector=10;
         else if(!strcmp(n->name,"bob_rows"))vector=11;
         if(vector>=0) {if(count!=expected)error("wrong argument count for %s",n->name);
-            int first_type=(vector==2 || vector==12)?pointer_to_const(4):vector==3?pointer_to(4):vector==7 || vector==13 || vector==14?pointer_to(0):0;
+            int first_type=(vector==2 || vector==12)?pointer_to_const(4):vector==3?pointer_to(4):vector==7 || vector==13 || vector==14 || vector==15?pointer_to(0):0;
             if(count)assignment_compatible(first_type,n->a);
             if(expected==2)assignment_compatible(0,n->a->next);
             if(expected==2){expr(n->a->next);push(0);expr(n->a);pop(1);}else if(count)expr(n->a);

@@ -107,6 +107,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <time.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,6 +125,50 @@ static bool application32;
 static uint32_t applicationArgc;
 static uint32_t applicationArgv;
 static bool applicationEntryArguments;
+static bool filesystemRegistered;
+static uint32_t filesystemNames;
+static uint32_t filesystemLengths;
+static uint32_t filesystemKinds;
+static uint32_t filesystemUsed;
+enum { GRAPHICS_WIDTH=80, GRAPHICS_HEIGHT=25, GRAPHICS_CELLS=GRAPHICS_WIDTH*GRAPHICS_HEIGHT };
+enum { SYSTEM_API_VERSION=1, SYSTEM_DEVICE_CELL_FRAMEBUFFER=1, SYSTEM_INPUT_KEYBOARD=1, SYSTEM_INPUT_MOUSE=2 };
+enum { WIDE_FILE_BASE=0x1e000, WIDE_FILE_WORDS=8192 };
+static unsigned char graphicsCharacters[GRAPHICS_CELLS];
+static unsigned char graphicsColors[GRAPHICS_CELLS];
+static bool graphicsActive;
+static int terminalAvailable(void);
+
+static void graphicsReset(void) {
+    for(unsigned i=0;i<GRAPHICS_CELLS;i++){graphicsCharacters[i]=' ';graphicsColors[i]=7;}
+}
+static void graphicsPixel(int x,int y,unsigned char character,unsigned char color) {
+    if(x<0 || y<0 || x>=GRAPHICS_WIDTH || y>=GRAPHICS_HEIGHT)return;
+    unsigned index=(unsigned)y*GRAPHICS_WIDTH+(unsigned)x;
+    graphicsCharacters[index]=character?character:' ';graphicsColors[index]=color&15;
+}
+static void graphicsPresent(void) {
+    int ansi=terminalAvailable(),lastColor=-1;
+    if(ansi)printf("\033[2J\033[H");
+    for(int y=0;y<GRAPHICS_HEIGHT;y++) {
+        for(int x=0;x<GRAPHICS_WIDTH;x++) {
+            unsigned index=(unsigned)y*GRAPHICS_WIDTH+(unsigned)x;
+            int color=graphicsColors[index];
+            if(ansi && color!=lastColor) {
+                int code=(color&8)?90+(color&7):30+(color&7);
+                printf("\033[%dm",code);lastColor=color;
+            }
+            putchar(graphicsCharacters[index]);
+        }
+        if(ansi)printf("\033[0m");
+        putchar('\n');lastColor=-1;
+    }
+    fflush(stdout);
+}
+static void graphicsClose(void) {
+    graphicsActive=false;
+    if(terminalAvailable())printf("\033[0m\033[2J\033[H");
+    fflush(stdout);
+}
 static uint32_t bootWords;
 static uint32_t bootOrigin;
 static bool bootWideHeader;
@@ -136,12 +181,13 @@ static uint32_t assembledWords;
 static uint32_t assembledOrigin;
 static uint32_t currentInstructionAddress;
 static uint16_t currentInstruction;
-static jmp_buf programFault;
+static jmp_buf programFaultStack[8];
+static unsigned programDepth;
 static void machineFault(void) {
     if (programMode) {
         if (getenv("BOB16_TRACE_FAULT"))
             fprintf(stderr,"Program fault at 0x%08X (instruction 0x%04X)\n",currentInstructionAddress,currentInstruction);
-        longjmp(programFault, 1);
+        longjmp(programFaultStack[programDepth-1], 1);
     }
     exit(1);
 }
@@ -201,6 +247,100 @@ static int terminalKey(void) {
     }
 #endif
     return getchar();
+}
+static unsigned terminalMouseButtons;
+enum { OS_EVENT_KEY_DOWN=1,OS_EVENT_CHAR=2,OS_EVENT_KEY_UP=3,OS_EVENT_MOUSE_MOVE=4,OS_EVENT_MOUSE_BUTTON_DOWN=5,OS_EVENT_MOUSE_BUTTON_UP=6,OS_EVENT_MOUSE_WHEEL=7 };
+static int terminalEventDecode(int kind,int isDown,int character,int virtualKey,int x,int y,
+                               unsigned buttons,unsigned *buttonState,
+                               int *type,int *value,int *outX,int *outY) {
+    if(kind==1) {
+        int code=character;
+        if(!code)switch(virtualKey) {
+            case 38:code=256;break;case 40:code=257;break;
+            case 37:code=258;break;case 39:code=259;break;
+            case 36:code=260;break;case 35:code=261;break;
+            case 46:code=262;break;default:code=512+virtualKey;break;
+        }
+        *type=isDown?(code<256?OS_EVENT_CHAR:OS_EVENT_KEY_DOWN):OS_EVENT_KEY_UP;
+        *value=code;*outX=0;*outY=0;return 1;
+    }
+    if(kind==2) {
+        *outX=x;*outY=y;*value=(int)buttons;
+        if(isDown==1)*type=OS_EVENT_MOUSE_MOVE;
+        else if(character==4) {
+            int delta=(int)(int16_t)(buttons>>16);
+            if(!delta)return 0;
+            *type=OS_EVENT_MOUSE_WHEEL;*value=delta;
+        }
+        else if(buttons!=*buttonState) {
+            *type=(buttons&~*buttonState)?OS_EVENT_MOUSE_BUTTON_DOWN:OS_EVENT_MOUSE_BUTTON_UP;
+            *buttonState=buttons;
+        } else return 0;
+        return 1;
+    }
+    return 0;
+}
+static int terminalEvent(int *type,int *value,int *x,int *y) {
+    fflush(stdout);
+#ifdef _WIN32
+    if(terminalAvailable()) {
+        HANDLE input=GetStdHandle(STD_INPUT_HANDLE);DWORD mode,count;INPUT_RECORD record;
+        if(!GetConsoleMode(input,&mode))return 0;
+        DWORD originalMode=mode;
+        mode=(mode&~ENABLE_PROCESSED_INPUT)|ENABLE_MOUSE_INPUT|ENABLE_EXTENDED_FLAGS;
+        if(!SetConsoleMode(input,mode))return 0;
+        if(!rawInputStarted){originalInputMode=originalMode;rawInputStarted=true;atexit(restoreInputMode);}
+        while(ReadConsoleInputA(input,&record,1,&count) && count) {
+            if(record.EventType==KEY_EVENT) {
+                KEY_EVENT_RECORD key=record.Event.KeyEvent;
+                if(terminalEventDecode(1,key.bKeyDown,(unsigned char)key.uChar.AsciiChar,
+                    key.wVirtualKeyCode,0,0,0,&terminalMouseButtons,type,value,x,y))return 1;
+            }
+            if(record.EventType==MOUSE_EVENT) {
+                MOUSE_EVENT_RECORD mouse=record.Event.MouseEvent;
+                unsigned buttons=mouse.dwButtonState;
+                int moving=mouse.dwEventFlags==MOUSE_MOVED;
+                if(terminalEventDecode(2,moving,(int)mouse.dwEventFlags,0,
+                    mouse.dwMousePosition.X,mouse.dwMousePosition.Y,buttons,
+                    &terminalMouseButtons,type,value,x,y))return 1;
+            }
+        }
+        return 0;
+    }
+#endif
+    int key=getchar();if(key==EOF)return 0;if(key=='\r')key='\n';
+    return terminalEventDecode(1,1,key,0,0,0,0,&terminalMouseButtons,type,value,x,y);
+}
+static int terminalEventPoll(int *type,int *value,int *x,int *y) {
+#ifdef _WIN32
+    if(terminalAvailable()) {
+        HANDLE input=GetStdHandle(STD_INPUT_HANDLE);DWORD mode,count;INPUT_RECORD record;
+        if(!GetConsoleMode(input,&mode))return 0;
+        DWORD originalMode=mode;
+        mode=(mode&~ENABLE_PROCESSED_INPUT)|ENABLE_MOUSE_INPUT|ENABLE_EXTENDED_FLAGS;
+        if(!SetConsoleMode(input,mode))return 0;
+        if(!rawInputStarted){originalInputMode=originalMode;rawInputStarted=true;atexit(restoreInputMode);}
+        for(;;) {
+            if(!PeekConsoleInputA(input,&record,1,&count)||!count)return 0;
+            if(!ReadConsoleInputA(input,&record,1,&count)||!count)return 0;
+            if(record.EventType==KEY_EVENT) {
+                KEY_EVENT_RECORD key=record.Event.KeyEvent;
+                if(terminalEventDecode(1,key.bKeyDown,(unsigned char)key.uChar.AsciiChar,
+                    key.wVirtualKeyCode,0,0,0,&terminalMouseButtons,type,value,x,y))return 1;
+            } else if(record.EventType==MOUSE_EVENT) {
+                MOUSE_EVENT_RECORD mouse=record.Event.MouseEvent;
+                unsigned buttons=mouse.dwButtonState;
+                int moving=mouse.dwEventFlags==MOUSE_MOVED;
+                if(terminalEventDecode(2,moving,(int)mouse.dwEventFlags,0,
+                    mouse.dwMousePosition.X,mouse.dwMousePosition.Y,buttons,
+                    &terminalMouseButtons,type,value,x,y))return 1;
+            }
+        }
+    }
+#else
+    (void)type;(void)value;(void)x;(void)y;
+#endif
+    return 0;
 }
 
 typedef uint32_t ureg_t;
@@ -314,14 +454,310 @@ static void memoryReset(void) {
     memset(sparseMemory,0,sizeof(sparseMemory));
 }
 
+typedef struct {uint32_t number;int32_t *words;} SavedSparsePage;
+static SavedSparsePage *sparseMemorySave(unsigned *count) {
+    unsigned used=0,out=0;
+    for(unsigned i=0;i<MEMORY_PAGE_SLOTS;i++)if(sparseMemory[i].used&&sparseMemory[i].number>=0x20&&sparseMemory[i].number<0x100)used++;
+    *count=used;
+    SavedSparsePage *saved=used?calloc(used,sizeof(*saved)):NULL;
+    if(used&&!saved)return NULL;
+    for(unsigned i=0;i<MEMORY_PAGE_SLOTS;i++)if(sparseMemory[i].used&&sparseMemory[i].number>=0x20&&sparseMemory[i].number<0x100) {
+        saved[out].number=sparseMemory[i].number;
+        saved[out].words=malloc(MEMORY_PAGE_WORDS*sizeof(int32_t));
+        if(!saved[out].words) {
+            for(unsigned j=0;j<out;j++)free(saved[j].words);
+            free(saved);return NULL;
+        }
+        memcpy(saved[out].words,sparseMemory[i].words,MEMORY_PAGE_WORDS*sizeof(int32_t));out++;
+    }
+    *count=used;return saved;
+}
+static void sparseMemoryRestore(SavedSparsePage *saved,unsigned count) {
+    for(unsigned i=0;i<MEMORY_PAGE_SLOTS;i++)if(sparseMemory[i].used&&sparseMemory[i].number>=0x20&&sparseMemory[i].number<0x100) {
+        free(sparseMemory[i].words);sparseMemory[i].used=0;sparseMemory[i].words=NULL;
+    }
+    for(unsigned i=0;i<count;i++)memoryPageInstall(saved[i].number,saved[i].words);
+    free(saved);
+}
+
+static int runWidePackedFromGuest(uint32_t descriptor,int *started);
+
+static int filesystemService(uint32_t request) {
+    if(!programMode && (request<0x100 || request>0xf000-4))return -1;
+    if(programMode && (request<0x20000 || request>0xffff9))return -1;
+    uint32_t op=(uint32_t)memoryRead(request);
+    if(!programMode) {
+        if(op!=0 || !cpu32)return -1;
+        filesystemNames=(uint32_t)memoryRead(request+1);
+        filesystemLengths=(uint32_t)memoryRead(request+2);
+        filesystemKinds=(uint32_t)memoryRead(request+3);
+        filesystemUsed=(uint32_t)memoryRead(request+4);
+        uint64_t imageEnd=(uint64_t)bootOrigin+bootWords;
+        if(imageEnd>WIDE_FILE_BASE)return -1;
+        if(filesystemNames<bootOrigin || (uint64_t)filesystemNames+192>imageEnd ||
+           filesystemLengths<bootOrigin || (uint64_t)filesystemLengths+8>imageEnd ||
+           filesystemKinds<bootOrigin || (uint64_t)filesystemKinds+8>imageEnd ||
+           filesystemUsed<bootOrigin || (uint64_t)filesystemUsed+8>imageEnd)return -1;
+        filesystemRegistered=true;return 0;
+    }
+    if(!application32 || !filesystemRegistered)return -1;
+    if((op>>16)!=1)return -4;
+    op&=0xffffu;
+    uint32_t a=(uint32_t)memoryRead(request+1),b=(uint32_t)memoryRead(request+2),c=(uint32_t)memoryRead(request+3),d=(uint32_t)memoryRead(request+4);
+    uint32_t e=(uint32_t)memoryRead(request+5),f=(uint32_t)memoryRead(request+6);
+#define APP_RANGE(p,n) ((p)>=0x20000u && (uint64_t)(p)+(uint64_t)(n)<=0x100000u)
+    char name[24];unsigned nameLength=0;
+    if((op>=2 && op<=4) || op==8 || op==9 || op==10) {
+        if(!APP_RANGE(a,1))return -1;
+        while(nameLength<sizeof(name)-1 && APP_RANGE(a+nameLength,1)) {
+            uint32_t ch=(uint32_t)memoryRead(a+nameLength);
+            if(!ch)break;
+            if(ch<33 || ch>126)return -1;
+            name[nameLength++]=(char)ch;
+        }
+        if(!nameLength || nameLength==sizeof(name)-1 || nameLength>=24 || (uint32_t)memoryRead(a+nameLength)!=0)return -1;
+        name[nameLength]=0;
+    }
+    int slot=-1;
+    if((op>=2 && op<=4) || op==8 || op==9 || op==10)for(int i=0;i<8;i++) {
+        if(!memoryRead(filesystemUsed+i))continue;
+        unsigned j=0;while(j<23 && (uint32_t)memoryRead(filesystemNames+i*24+j)==(unsigned char)name[j] && name[j])j++;
+        if(j==nameLength && !name[j]){slot=i;break;}
+    }
+    if(op==1) {
+        uint32_t index=a,buffer=b,capacity=c,lengthAddress=d;
+        if(index>=8)return 0;
+        if(!APP_RANGE(buffer,capacity) || !capacity || !APP_RANGE(lengthAddress,1))return -1;
+        if(!memoryRead(filesystemUsed+index))return 0;
+        unsigned n=0;while(n<23 && memoryRead(filesystemNames+index*24+n))n++;
+        if(capacity<=n)return -2;
+        for(unsigned i=0;i<n;i++)memoryWrite(buffer+i,memoryRead(filesystemNames+index*24+i));
+        memoryWrite(buffer+n,0);memoryWrite(lengthAddress,memoryRead(filesystemLengths+index));
+        return (int)memoryRead(filesystemKinds+index)+1;
+    }
+    if(op==2) {
+        uint32_t buffer=b,capacity=c;
+        if(slot<0 || memoryRead(filesystemKinds+slot)!=0)return -1;
+        uint32_t length=(uint32_t)memoryRead(filesystemLengths+slot);
+        if(!APP_RANGE(buffer,capacity) || capacity<=length)return -2;
+        uint32_t offset=0;for(int i=0;i<slot;i++)if(memoryRead(filesystemUsed+i))offset+=(uint32_t)memoryRead(filesystemLengths+i)+1;
+        for(uint32_t i=0;i<length;i++)memoryWrite(buffer+i,memoryRead(WIDE_FILE_BASE+offset+i));
+        memoryWrite(buffer+length,0);return (int)length;
+    }
+    if(op==9) {
+        uint32_t buffer=b,capacity=c;
+        if(slot<0 || memoryRead(filesystemKinds+slot)==0)return -1;
+        uint32_t length=(uint32_t)memoryRead(filesystemLengths+slot);
+        if(!APP_RANGE(buffer,capacity) || capacity<length)return -2;
+        uint32_t offset=0;for(int i=0;i<slot;i++)if(memoryRead(filesystemUsed+i))offset+=(uint32_t)memoryRead(filesystemLengths+i)+1;
+        for(uint32_t i=0;i<length;i++)memoryWrite(buffer+i,memoryRead(WIDE_FILE_BASE+offset+i));
+        return (int)length;
+    }
+    if(op==10)return slot<0?-1:(int)memoryRead(filesystemKinds+slot);
+    if(op==3 || op==8) {
+        uint32_t buffer=b,length=c;
+        uint32_t kind=op==3?0:d;
+        if((op==3 && d!=0) || (op==8 && (kind<1 || kind>2)) ||
+           (!kind && length>=512) || !APP_RANGE(buffer,length))return -1;
+        if(slot<0)for(int i=0;i<8;i++)if(!memoryRead(filesystemUsed+i)){slot=i;break;}
+        if(slot<0)return -1;
+        uint32_t total=length+1;
+        for(int i=0;i<8;i++)if(i!=slot && memoryRead(filesystemUsed+i))total+=(uint32_t)memoryRead(filesystemLengths+i)+1;
+        if(total>WIDE_FILE_WORDS)return -1;
+        if(!kind)for(uint32_t i=0;i<length;i++){uint32_t ch=(uint32_t)memoryRead(buffer+i);if(!ch || ch>255)return -1;}
+        int32_t packed[WIDE_FILE_WORDS];uint32_t out=0;int newLengths[8],newKinds[8],newUsed[8];char newNames[8][24];
+        for(int i=0;i<8;i++) {
+            newUsed[i]=i==slot?1:(int)memoryRead(filesystemUsed+i);
+            if(!newUsed[i]){newLengths[i]=0;newKinds[i]=0;memset(newNames[i],0,24);continue;}
+            uint32_t oldName=filesystemNames+i*24;for(int j=0;j<24;j++)newNames[i][j]=(char)memoryRead(oldName+j);
+            if(i==slot){for(int j=0;j<24;j++)newNames[i][j]=j<(int)nameLength?name[j]:0;newLengths[i]=(int)length;newKinds[i]=(int)kind;
+                for(uint32_t j=0;j<length;j++)packed[out++]=(int32_t)memoryRead(buffer+j);
+                packed[out++]=0;
+            } else {
+                newLengths[i]=(int)memoryRead(filesystemLengths+i);newKinds[i]=(int)memoryRead(filesystemKinds+i);
+                uint32_t offset=0;for(int j=0;j<i;j++)if(memoryRead(filesystemUsed+j))offset+=(uint32_t)memoryRead(filesystemLengths+j)+1;
+                for(int j=0;j<=newLengths[i];j++)packed[out++]=(int32_t)memoryRead(WIDE_FILE_BASE+offset+(uint32_t)j);
+            }
+        }
+        for(uint32_t i=0;i<out;i++)memoryWrite(WIDE_FILE_BASE+i,packed[i]);
+        for(int i=0;i<8;i++) {for(int j=0;j<24;j++)memoryWrite(filesystemNames+i*24+j,(unsigned char)newNames[i][j]);memoryWrite(filesystemLengths+i,newLengths[i]);memoryWrite(filesystemKinds+i,newKinds[i]);memoryWrite(filesystemUsed+i,newUsed[i]);}
+        return 0;
+    }
+    if(op==4) {
+        if(slot<0)return -1;
+        int32_t packed[WIDE_FILE_WORDS];uint32_t out=0;
+        for(int i=0;i<8;i++)if(memoryRead(filesystemUsed+i) && i!=slot) {
+            uint32_t offset=0;for(int j=0;j<i;j++)if(memoryRead(filesystemUsed+j))offset+=(uint32_t)memoryRead(filesystemLengths+j)+1;
+            uint32_t length=(uint32_t)memoryRead(filesystemLengths+i);
+            for(uint32_t j=0;j<=length;j++)packed[out++]=(int32_t)memoryRead(WIDE_FILE_BASE+offset+j);
+        }
+        for(uint32_t i=0;i<out;i++)memoryWrite(WIDE_FILE_BASE+i,packed[i]);
+        uint32_t removedName=filesystemNames+(uint32_t)slot*24;
+        for(int j=0;j<24;j++)memoryWrite(removedName+j,0);
+        memoryWrite(filesystemLengths+slot,0);memoryWrite(filesystemKinds+slot,0);memoryWrite(filesystemUsed+slot,0);
+        return 0;
+    }
+    if(op==5) {
+        uint32_t values=a,capacity=b;
+        if(!APP_RANGE(values,capacity) || capacity<6)return -1;
+        uint32_t appPages=0,files=0,fileWords=0;
+        for(uint32_t page=0x20;page<0x100;page++)if(memoryPage(page,0))appPages++;
+        for(int i=0;i<8;i++)if(memoryRead(filesystemUsed+i)) {files++;fileWords+=(uint32_t)memoryRead(filesystemLengths+i)+1;}
+        memoryWrite(values,1);memoryWrite(values+1,0xE0000);memoryWrite(values+2,appPages);
+        memoryWrite(values+3,files);memoryWrite(values+4,fileWords);memoryWrite(values+5,WIDE_FILE_WORDS-fileWords);
+        return 6;
+    }
+    if(op==11) {
+        uint32_t values=a,capacity=b,inputFlags=SYSTEM_INPUT_KEYBOARD;
+        if(!APP_RANGE(values,capacity)||capacity<5)return -1;
+#ifdef _WIN32
+        if(terminalAvailable())inputFlags|=SYSTEM_INPUT_MOUSE;
+#endif
+        memoryWrite(values,SYSTEM_API_VERSION);
+        memoryWrite(values+1,SYSTEM_DEVICE_CELL_FRAMEBUFFER);
+        memoryWrite(values+2,GRAPHICS_WIDTH);memoryWrite(values+3,GRAPHICS_HEIGHT);
+        memoryWrite(values+4,inputFlags);return 5;
+    }
+    if(op==6) {
+        uint32_t nameAddress=a,argumentAddress=b,offset=0;char name[24],arguments[128];
+        unsigned nameLength=0,argumentLength=0;int target=-1,kind,started=0,childStatus;
+        if(!APP_RANGE(c,1))return -1;
+        while(nameLength<sizeof(name)-1&&APP_RANGE(nameAddress+nameLength,1)) {
+            uint32_t ch=(uint32_t)memoryRead(nameAddress+nameLength);
+            if(!ch)break;
+            if(ch<33||ch>126)return -1;
+            name[nameLength++]=(char)ch;
+        }
+        if(!nameLength||nameLength>=sizeof(name)-1||!APP_RANGE(nameAddress+nameLength,1)||memoryRead(nameAddress+nameLength))return -1;
+        name[nameLength]=0;
+        if(argumentAddress) {
+            while(argumentLength<sizeof(arguments)-1&&APP_RANGE(argumentAddress+argumentLength,1)) {
+                uint32_t ch=(uint32_t)memoryRead(argumentAddress+argumentLength);
+                if(ch>255)return -1;
+                arguments[argumentLength++]=(char)ch;
+                if(!ch)break;
+            }
+            if(!argumentLength||arguments[argumentLength-1])return -1;
+        } else arguments[argumentLength++]=0;
+        for(int i=0;i<8;i++)if(memoryRead(filesystemUsed+i)) {
+            unsigned j=0;while(j<23&&(uint32_t)memoryRead(filesystemNames+i*24+j)==(unsigned char)name[j]&&name[j])j++;
+            if(j==nameLength&&!name[j]){target=i;break;}
+        }
+        if(target<0)return -1;
+        kind=(int)memoryRead(filesystemKinds+target);
+        if(kind!=3)return -2;
+        for(int i=0;i<target;i++)if(memoryRead(filesystemUsed+i))offset+=(uint32_t)memoryRead(filesystemLengths+i)+1;
+        memoryWrite(0xe000,WIDE_FILE_BASE+offset);memoryWrite(0xe001,memoryRead(filesystemLengths+target));
+        for(unsigned i=0;i<argumentLength;i++)memoryWrite(0xe100+i,(unsigned char)arguments[i]);
+        for(unsigned i=0;i<=nameLength;i++)memoryWrite(0xe200+i,(unsigned char)name[i]);
+        memoryWrite(0xe002,0xe100);memoryWrite(0xe003,0xe200);
+        childStatus=runWidePackedFromGuest(0xe000,&started);
+        if(!started)return childStatus;
+        memoryWrite(c,childStatus);return 0;
+    }
+    if(op==7) {
+        uint32_t words=a,capacity=b;
+        time_t now=time(NULL);
+        if(!APP_RANGE(words,capacity) || capacity<2 || now<0)return -1;
+        uint64_t seconds=(uint64_t)now;
+        memoryWrite(words,(int32_t)(uint32_t)seconds);
+        memoryWrite(words+1,(int32_t)(uint32_t)(seconds>>32));
+        return 2;
+    }
+    if(op==16) { graphicsReset();graphicsActive=true;return 0; }
+    if(op==17) {
+        if(!graphicsActive || !APP_RANGE(a,b) || b<2)return -1;
+        memoryWrite(a,GRAPHICS_WIDTH);memoryWrite(a+1,GRAPHICS_HEIGHT);return 2;
+    }
+    if(op==18) {
+        if(!graphicsActive || (int32_t)a<0 || (int32_t)b<0 || a>=GRAPHICS_WIDTH || b>=GRAPHICS_HEIGHT || c>255 || d>15)return -1;
+        graphicsPixel((int)a,(int)b,(unsigned char)c,(unsigned char)d);return 0;
+    }
+    if(op==19) {
+        int x=(int32_t)a,y=(int32_t)b,w=(int32_t)c,h=(int32_t)d;
+        if(!graphicsActive || w<=0 || h<=0 || w>GRAPHICS_WIDTH*2 || h>GRAPHICS_HEIGHT*2 || e>255 || f>15)return -1;
+        int64_t endX=(int64_t)x+w,endY=(int64_t)y+h;
+        int startX=x<0?0:x,startY=y<0?0:y;
+        int clippedX=endX>GRAPHICS_WIDTH?GRAPHICS_WIDTH:(int)endX;
+        int clippedY=endY>GRAPHICS_HEIGHT?GRAPHICS_HEIGHT:(int)endY;
+        for(int py=startY;py<clippedY;py++)for(int px=startX;px<clippedX;px++)graphicsPixel(px,py,(unsigned char)e,(unsigned char)f);
+        return 0;
+    }
+    if(op==20) {
+        int x0=(int32_t)a,y0=(int32_t)b,x1=(int32_t)c,y1=(int32_t)d;
+        if(!graphicsActive || x0<0 || x0>=GRAPHICS_WIDTH || x1<0 || x1>=GRAPHICS_WIDTH || y0<0 || y0>=GRAPHICS_HEIGHT || y1<0 || y1>=GRAPHICS_HEIGHT || e>255 || f>15)return -1;
+        int dx=abs(x1-x0),sx=x0<x1?1:-1,dy=-abs(y1-y0),sy=y0<y1?1:-1,error=dx+dy;
+        for(;;){graphicsPixel(x0,y0,(unsigned char)e,(unsigned char)f);if(x0==x1 && y0==y1)break;int twice=2*error;if(twice>=dy){error+=dy;x0+=sx;}if(twice<=dx){error+=dx;y0+=sy;}}
+        return 0;
+    }
+    if(op==21) {
+        int x=(int32_t)a,y=(int32_t)b,startX=x;uint32_t text=c,color=d;
+        if(!graphicsActive || (int32_t)x<0 || x>=GRAPHICS_WIDTH || y<0 || y>=GRAPHICS_HEIGHT || !APP_RANGE(text,1) || color>15)return -1;
+        for(unsigned i=0;i<GRAPHICS_CELLS && APP_RANGE(text+i,1);i++) {
+            uint32_t ch=(uint32_t)memoryRead(text+i);if(!ch)break;
+            if(ch=='\n'){x=startX;y++;if(y>=GRAPHICS_HEIGHT)break;continue;}
+            graphicsPixel(x++,y,(unsigned char)(ch<=255?ch:'?'),(unsigned char)color);
+            if(x>=GRAPHICS_WIDTH)break;
+        }
+        return 0;
+    }
+    if(op==22) {
+        int x=(int32_t)a,y=(int32_t)b,w=(int32_t)c,h=(int32_t)d;uint32_t bitmap=e,color=f;
+        if(!graphicsActive || x<0 || y<0 || x>=GRAPHICS_WIDTH || y>=GRAPHICS_HEIGHT || w<=0 || h<=0 || w>GRAPHICS_WIDTH-x || h>GRAPHICS_HEIGHT-y || (uint64_t)w*h>GRAPHICS_CELLS || !APP_RANGE(bitmap,(uint64_t)w*h) || color>15)return -1;
+        for(int py=0;py<h;py++)for(int px=0;px<w;px++) {
+            uint32_t ch=(uint32_t)memoryRead(bitmap+(uint32_t)py*w+(uint32_t)px);
+            if(ch>255)return -1;
+            if(ch)graphicsPixel(x+px,y+py,(unsigned char)ch,(unsigned char)color);
+        }
+        return 0;
+    }
+    if(op==27) {
+        int x=(int32_t)a,y=(int32_t)b,w=(int32_t)c,h=(int32_t)d;uint32_t bitmap=e;
+        if(!graphicsActive || x<0 || y<0 || x>=GRAPHICS_WIDTH || y>=GRAPHICS_HEIGHT || w<=0 || h<=0 || w>GRAPHICS_WIDTH-x || h>GRAPHICS_HEIGHT-y || (uint64_t)w*h>GRAPHICS_CELLS || !APP_RANGE(bitmap,(uint64_t)w*h))return -1;
+        for(int i=0;i<w*h;i++)if((uint32_t)memoryRead(bitmap+(uint32_t)i)>0xfffu)return -1;
+        for(int py=0;py<h;py++)for(int px=0;px<w;px++) {
+            uint32_t cell=(uint32_t)memoryRead(bitmap+(uint32_t)py*w+(uint32_t)px);
+            uint32_t ch=cell&255u,color=(cell>>8)&15u;
+            if(ch)graphicsPixel(x+px,y+py,(unsigned char)ch,(unsigned char)color);
+        }
+        return 0;
+    }
+    if(op==23) {
+        if(!graphicsActive || a>255 || b>15)return -1;
+        for(unsigned i=0;i<GRAPHICS_CELLS;i++){graphicsCharacters[i]=(unsigned char)(a?a:' ');graphicsColors[i]=(unsigned char)b;}
+        return 0;
+    }
+    if(op==24) {if(!graphicsActive)return -1;graphicsPresent();return 0;}
+    if(op==25) {if(!graphicsActive)return -1;graphicsClose();return 0;}
+    if(op==26) {
+        uint32_t event=a,capacity=b;
+        if(!APP_RANGE(event,capacity) || capacity<4)return -1;
+        int type,value,x,y;
+        if(!terminalEvent(&type,&value,&x,&y))return 0;
+        memoryWrite(event,type);memoryWrite(event+1,value);
+        memoryWrite(event+2,x);memoryWrite(event+3,y);return 1;
+    }
+    if(op==28) {
+        uint32_t event=a,capacity=b;
+        if(!APP_RANGE(event,capacity) || capacity<4)return -1;
+        int type,value,x,y;
+        if(!terminalEventPoll(&type,&value,&x,&y))return 0;
+        memoryWrite(event,type);memoryWrite(event+1,value);
+        memoryWrite(event+2,x);memoryWrite(event+3,y);return 1;
+    }
+#undef APP_RANGE
+    return -1;
+}
+
 void cpuCycle(void);
 
 static int runProgram(uint32_t entry) {
     bool savedCpu32=cpu32;
     bool savedLegacyProgram32=legacyProgram32;
+    bool savedProgramMode=programMode,savedProgramDone=programDone;
     volatile uint32_t legacyBase=savedCpu32?0xc200u:0xa000u;
     volatile uint32_t legacyEnd=savedCpu32?0xd000u:0xbe00u;
-    if (programMode || (application32 ? (entry < 0x20000 || entry >= 0xf0000) : (entry < legacyBase || entry >= legacyEnd))) return -1;
+    if (programDepth>=8 || (application32 ? (entry < 0x20000 || entry >= 0xf0000) : (entry < legacyBase || entry >= legacyEnd))) return -1;
     struct cpu_t saved = cpu;
     ureg_t savedMar = ram.mar;
     reg_t savedMdr = ram.mdr;
@@ -330,7 +766,8 @@ static int runProgram(uint32_t entry) {
     programMode = true;
     programDone = false;
     bool savedApplicationEntryArguments=applicationEntryArguments;
-    if (setjmp(programFault) == 0) {
+    unsigned frame=programDepth++;
+    if (setjmp(programFaultStack[frame]) == 0) {
         if(!application32)cpu32=false;
         cpu.pc = addressValue(entry);
         cpu.regFile[6] = wordValue(application32?0x100000u:(savedCpu32?0xd000u:0xc000u));
@@ -345,7 +782,9 @@ static int runProgram(uint32_t entry) {
         }
         status = cycles == 5000000 ? -3 : (int32_t)(uint32_t)cpu.regFile[0];
     }
-    programMode = false;
+    programDepth--;
+    programMode = savedProgramMode;
+    if(application32 && graphicsActive)graphicsClose();
     if(savedCpu32 && !application32 && bootWideHeader) {
         uint64_t imageEnd=(uint64_t)bootOrigin+bootWords;
         uint32_t restoreStart=bootOrigin>legacyBase?bootOrigin:legacyBase;
@@ -355,13 +794,14 @@ static int runProgram(uint32_t entry) {
     cpu32=savedCpu32;
     legacyProgram32=savedLegacyProgram32;
     applicationEntryArguments=savedApplicationEntryArguments;
+    programDone=savedProgramDone;
     cpu = saved;
     ram.mar = savedMar;
     ram.mdr = savedMdr;
     return status;
 }
 static int runWideImageFromGuest(uint32_t pathAddress);
-static int runWidePackedFromGuest(uint32_t descriptor);
+static int runWidePackedFromGuest(uint32_t descriptor,int *started);
 static int importWideImageFromGuest(uint32_t descriptor);
 
 int sext(int16_t val, uint16_t length) {
@@ -643,12 +1083,16 @@ void execute() {
 					else cpu.regFile[0]=wordValue((uint32_t)runWideImageFromGuest((uint32_t)cpu.regFile[0]));
 					break;
 				case 13:
-					if(programMode || !cpu32)cpu.regFile[0]=-4;
-                    else cpu.regFile[0]=wordValue((uint32_t)runWidePackedFromGuest((uint32_t)cpu.regFile[0]));
+					if(!cpu32)cpu.regFile[0]=-4;
+                    else cpu.regFile[0]=wordValue((uint32_t)runWidePackedFromGuest((uint32_t)cpu.regFile[0],NULL));
 					break;
 				case 14:
 					if(programMode || !cpu32)cpu.regFile[0]=-4;
 					else cpu.regFile[0]=wordValue((uint32_t)importWideImageFromGuest((uint32_t)cpu.regFile[0]));
+					break;
+				case 15:
+					if(!cpu32)cpu.regFile[0]=-4;
+					else cpu.regFile[0]=wordValue((uint32_t)filesystemService((uint32_t)cpu.regFile[0]));
 					break;
 				default:
 					machineFault();
@@ -1312,6 +1756,8 @@ static int assembleSource(FILE *file) {
 }
 
 static void bootImage(const char *path) {
+    filesystemRegistered=false;
+    graphicsActive=false;graphicsReset();
     FILE *file = fopen(path, "rb");
     if (!file) { perror(path); exit(1); }
     char magic[4];
@@ -1393,11 +1839,13 @@ static int prepareApplicationArguments(const char *programName,const char *text)
             storage[write++]=storage[scan++];
         }
         if(quote)return -4;
-        storage[write]=0;scan++;
+        int separated=storage[scan]!=0;
+        storage[write]=0;if(separated)scan++;
     }
     for(unsigned i=0;i<nameLength;i++)memoryWrite(0xF0000u+i,(unsigned char)programName[i]);
     memoryWrite(0xF0000u+nameLength,0);
     for(unsigned i=0;i<length;i++)memoryWrite(0xF0000u+nameLength+1+i,(unsigned char)storage[i]);
+    memoryWrite(0xF0000u+nameLength+1+length,0);
     pointers[0]=0xF0000u;
     uint32_t argv=0xF0000u+nameLength+length+2;
     for(unsigned i=0;i<argc;i++)memoryWrite(argv+i,pointers[i]);
@@ -1466,7 +1914,8 @@ static int runWideImageFromGuest(uint32_t pathAddress) {
     return status;
 }
 
-static int runWidePackedFromGuest(uint32_t descriptor) {
+static int runWidePackedFromGuest(uint32_t descriptor,int *started) {
+    if(started)*started=0;
     if(descriptor<0x300 || descriptor>0xf000-4)return -4;
     uint32_t address=(uint32_t)memoryRead(descriptor),length=(uint32_t)memoryRead(descriptor+1);
     uint32_t argumentAddress=(uint32_t)memoryRead(descriptor+2);
@@ -1497,7 +1946,9 @@ static int runWidePackedFromGuest(uint32_t descriptor) {
         }
         if(!i || programNameBuffer[i-1])return -4;
     } else programNameBuffer[0]=0;
-    if(address<0xf000 || address>=0x10000 || !length || length>4096 || address+length>0x10000)return -4;
+    int oldStorage=address>=0xf000&&address<0x10000&&length<=4096&&address+length<=0x10000;
+    int wideStorage=address>=WIDE_FILE_BASE&&address<WIDE_FILE_BASE+WIDE_FILE_WORDS&&length<=WIDE_FILE_WORDS&&address+length<=WIDE_FILE_BASE+WIDE_FILE_WORDS;
+    if((!oldStorage&&!wideStorage)||!length)return -4;
     if((uint32_t)memoryRead(address)!=0x4233324bu || (uint32_t)memoryRead(address+1)!=0x00180002u)return -4;
     uint32_t origin=(uint32_t)memoryRead(address+2),entry=(uint32_t)memoryRead(address+3);
     uint32_t count=(uint32_t)memoryRead(address+4),checksum=(uint32_t)memoryRead(address+5);
@@ -1519,21 +1970,38 @@ static int runWidePackedFromGuest(uint32_t descriptor) {
         if(!pending[pendingCount].words) {for(unsigned i=0;i<pendingCount;i++)free(pending[i].words);free(pending);return -5;}
         pendingCount++;
     }
+    bool nested=programMode;
+    unsigned savedPageCount=0;
+    SavedSparsePage *savedPages=nested?sparseMemorySave(&savedPageCount):NULL;
+    if(nested&&savedPageCount&&!savedPages) {for(unsigned i=0;i<pendingCount;i++)free(pending[i].words);free(pending);return -5;}
+    bool savedApplication32=application32,savedEntryArguments=applicationEntryArguments,savedGraphicsActive=graphicsActive;
+    uint32_t savedArgc=applicationArgc,savedArgv=applicationArgv;
+    unsigned char savedGraphicsCharacters[GRAPHICS_CELLS],savedGraphicsColors[GRAPHICS_CELLS];
+    if(nested){memcpy(savedGraphicsCharacters,graphicsCharacters,sizeof(graphicsCharacters));memcpy(savedGraphicsColors,graphicsColors,sizeof(graphicsColors));}
     for(unsigned i=0;i<pendingCount;i++)memoryPageInstall(pending[i].number,pending[i].words);
     free(pending);
-    if(needsArgumentPage && !memoryPage(argumentPage,1))return -5;
+    if(needsArgumentPage && !memoryPage(argumentPage,1)) {if(nested)sparseMemoryRestore(savedPages,savedPageCount);return -5;}
     for(uint32_t i=0;i<count;i++)memoryWrite(origin+i,wordValue((uint32_t)memoryRead(address+6+i)));
     application32=true;applicationEntryArguments=programNameAddress!=0;
     int prepared=programNameAddress?prepareApplicationArguments(programNameBuffer,arguments):0;
+    if(!prepared&&started)*started=1;
     int status=prepared?prepared:runProgram(entry);
-    application32=false;applicationEntryArguments=false;applicationArgc=0;applicationArgv=0;return status;
+    if(nested) {
+        sparseMemoryRestore(savedPages,savedPageCount);
+        memcpy(graphicsCharacters,savedGraphicsCharacters,sizeof(graphicsCharacters));
+        memcpy(graphicsColors,savedGraphicsColors,sizeof(graphicsColors));graphicsActive=savedGraphicsActive;
+        application32=savedApplication32;applicationEntryArguments=savedEntryArguments;applicationArgc=savedArgc;applicationArgv=savedArgv;
+    } else {application32=false;applicationEntryArguments=false;applicationArgc=0;applicationArgv=0;}
+    return status;
 }
 
 static int importWideImageFromGuest(uint32_t descriptor) {
     if(descriptor<0x300 || descriptor>0xf000-3)return -4;
     uint32_t pathAddress=(uint32_t)memoryRead(descriptor),destination=(uint32_t)memoryRead(descriptor+1),capacity=(uint32_t)memoryRead(descriptor+2);
     if(pathAddress<0x100 || pathAddress>=0xf000)return -4;
-    if(destination<0xf000 || destination>=0x10000 || capacity>0x10000-destination || capacity<7)return -4;
+    int oldStorage=destination>=0xf000&&destination<0x10000&&capacity<=0x10000-destination;
+    int wideStorage=destination>=WIDE_FILE_BASE&&destination<WIDE_FILE_BASE+WIDE_FILE_WORDS&&capacity<=WIDE_FILE_BASE+WIDE_FILE_WORDS-destination;
+    if((!oldStorage&&!wideStorage)||capacity<7)return -4;
     char path[512];unsigned pathLength=0;
     while(pathLength<sizeof(path)-1 && pathAddress+pathLength<0xf000) {uint32_t c=(uint32_t)memoryRead(pathAddress+pathLength);if(!c)break;if(c>255)return -4;path[pathLength++]=(char)c;}
     if(!pathLength || pathLength==sizeof(path)-1)return -4;

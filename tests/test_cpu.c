@@ -38,6 +38,27 @@ static void bad_image(const char *executable,const unsigned char *bytes,size_t l
     char command[4096];snprintf(command,sizeof(command),"\"%s\" --load-fixture build/cpu-bad.b32 > build/cpu-bad.out 2>&1",executable);
     verify(system(command)!=0,"invalid wide image rejected");
 }
+static void input_event_decoding(void) {
+    unsigned buttons=0;int type=0,value=0,x=0,y=0;
+    verify(terminalEventDecode(1,1,'a',65,0,0,0,&buttons,&type,&value,&x,&y) &&
+           type==OS_EVENT_CHAR&&value=='a',"event decoder returns typed characters");
+    verify(terminalEventDecode(1,0,'a',65,0,0,0,&buttons,&type,&value,&x,&y) &&
+           type==OS_EVENT_KEY_UP&&value=='a',"event decoder returns character key releases");
+    verify(terminalEventDecode(1,1,0,38,0,0,0,&buttons,&type,&value,&x,&y) &&
+           type==OS_EVENT_KEY_DOWN&&value==256,"event decoder normalizes special keys");
+    verify(terminalEventDecode(2,1,0,0,17,9,0,&buttons,&type,&value,&x,&y) &&
+           type==OS_EVENT_MOUSE_MOVE&&x==17&&y==9,"event decoder reports mouse coordinates");
+    verify(terminalEventDecode(2,0,0,0,17,9,1,&buttons,&type,&value,&x,&y) &&
+           type==OS_EVENT_MOUSE_BUTTON_DOWN&&value==1&&buttons==1,"event decoder reports button press");
+    verify(!terminalEventDecode(2,0,0,0,17,9,1,&buttons,&type,&value,&x,&y),
+           "event decoder filters unchanged mouse button state");
+    verify(terminalEventDecode(2,0,0,0,18,9,0,&buttons,&type,&value,&x,&y) &&
+           type==OS_EVENT_MOUSE_BUTTON_UP&&value==0&&buttons==0,"event decoder reports button release");
+    verify(terminalEventDecode(2,0,4,0,18,9,120u<<16,&buttons,&type,&value,&x,&y) &&
+           type==OS_EVENT_MOUSE_WHEEL&&value==120&&x==18&&y==9,"event decoder reports upward mouse-wheel delta");
+    verify(terminalEventDecode(2,0,4,0,18,9,0xff880000u,&buttons,&type,&value,&x,&y) &&
+           type==OS_EVENT_MOUSE_WHEEL&&value==-120,"event decoder reports downward mouse-wheel delta");
+}
 int main(int argc,char **argv) {
     if(argc>1 && !strcmp(argv[1],"--emulator"))return bob_emulator_main(argc-1,argv+1);
     if(argc==3 && !strcmp(argv[1],"--load-fixture")){bootImage(argv[2]);return 0;}
@@ -54,6 +75,7 @@ int main(int argc,char **argv) {
         memoryWrite(0x10003,'b');memoryWrite(0x10004,'!');step(0xf200);
         return cpu.ir==0xf200?0:1;
     }
+    input_event_decoding();
     for(unsigned bits=1;bits<=16;bits++) {
         verify(sext((int16_t)((1u<<bits)-1),bits)==-1,"negative immediate");
         verify(sext((int16_t)((1u<<(bits-1))-1),bits)==(int)((1u<<(bits-1))-1),"positive immediate");
@@ -76,49 +98,63 @@ int main(int argc,char **argv) {
     cpu.regFile[0]=0x1000300;cpu.regFile[1]=0;step(0xf700);
     verify(cpu.regFile[0]==-3,"wide storage trap rejects truncated descriptor address");
     ram.memory[0x400]='b';ram.memory[0x401]='o';ram.memory[0x402]='b';ram.memory[0x403]='!';
-    ram.memory[0x500]=1;ram.memory[0x510]=1;ram.memory[0x520]=1;ram.memory[0xf000]=0x12345678;ram.memory[0xf001]=0;
+    ram.memory[0x500]=1;ram.memory[0x510]=1;ram.memory[0x520]=1;memoryWrite(WIDE_FILE_BASE,0x12345678);memoryWrite(WIDE_FILE_BASE+1,0);
     const char *source_name="bobs.c",*source_text="bob!";
     for(unsigned i=0;source_name[i];i++)ram.memory[0x418+i]=source_name[i];
     ram.memory[0x501]=4;ram.memory[0x521]=1;
-    for(unsigned i=0;source_text[i];i++)ram.memory[0xf002+i]=source_text[i];
-    ram.memory[0xf006]=0;
+    for(unsigned i=0;source_text[i];i++)memoryWrite(WIDE_FILE_BASE+2+i,source_text[i]);
+    memoryWrite(WIDE_FILE_BASE+6,0);
     if(storage_path("build/cpu-snapshot.b32"))return 1;
     verify(snapshotService(0x300,0)==0,"wide snapshot save");
-    ram.memory[0xf000]=0;
-    verify(snapshotService(0x300,1)==0 && ram.memory[0xf000]==0x12345678,"wide snapshot restores all 32 bits");
+    memoryWrite(WIDE_FILE_BASE,0);
+    verify(snapshotService(0x300,1)==0 && memoryRead(WIDE_FILE_BASE)==0x12345678,"wide snapshot restores all 32 bits");
         FILE *saved=fopen("build/cpu-snapshot.b32","r+b");if(!saved)return 1;
     if(fseek(saved,16+216*4+3,SEEK_SET))return 1;
     if(fputc(0x13,saved)==EOF || fclose(saved))return 1;
-    ram.memory[0xf000]=42;
-    verify(snapshotService(0x300,1)==-2 && ram.memory[0xf000]==42,"wide snapshot checksum protects upper byte and RAM");
-    ram.memory[0xf000]=0x12345678;
+    memoryWrite(WIDE_FILE_BASE,42);
+    verify(snapshotService(0x300,1)==-2 && memoryRead(WIDE_FILE_BASE)==42,"wide snapshot checksum protects upper byte and RAM");
+    memoryWrite(WIDE_FILE_BASE,0x12345678);
     verify(snapshotService(0x300,0)==0,"wide snapshot resave");
-    FILE *old_snapshot=fopen("build/cpu-snapshot.b32","r+b");if(!old_snapshot)return 1;
+    FILE *old_snapshot=fopen("build/cpu-snapshot.b32","rb");if(!old_snapshot)return 1;
     uint32_t old_words[SNAP_WORDS];if(fseek(old_snapshot,16,SEEK_SET))return 1;
     for(unsigned i=0;i<SNAP_WORDS;i++){unsigned char b[4];if(fread(b,1,4,old_snapshot)!=4)return 1;old_words[i]=(uint32_t)b[0]|((uint32_t)b[1]<<8)|((uint32_t)b[2]<<16)|((uint32_t)b[3]<<24);}
-    for(unsigned i=0;i<=4;i++)old_words[216+512+i]=old_words[218+i];
-    uint32_t old_hash=snapshotHash(old_words,SNAP_WORDS);if(fseek(old_snapshot,4,SEEK_SET)||fputc(1,old_snapshot)==EOF||fseek(old_snapshot,12,SEEK_SET))return 1;
-    for(unsigned i=0;i<4;i++)if(fputc((old_hash>>(8*i))&255,old_snapshot)==EOF)return 1;
-    if(fseek(old_snapshot,16,SEEK_SET))return 1;
-    for(unsigned i=0;i<SNAP_WORDS;i++)for(unsigned b=0;b<4;b++)if(fputc((old_words[i]>>(8*b))&255,old_snapshot)==EOF)return 1;
     if(fclose(old_snapshot))return 1;
-    ram.memory[0xf000]=0;ram.memory[0xf002]=0;
-    verify(snapshotService(0x300,1)==0 && ram.memory[0xf000]==0x12345678 && ram.memory[0xf002]=='b',"legacy fixed-slot B32S snapshot converts to packed filesystem layout");
+    FILE *old_write=fopen("build/cpu-snapshot.b32","wb");if(!old_write)return 1;
+    uint32_t old_hash=snapshotHash(old_words,SNAP_WORDS);unsigned char old_header[16]={'B','3','2','S',2,0,0,0};
+    for(unsigned i=0;i<4;i++){old_header[8+i]=(unsigned char)(kernelIdentity>>(8*i));old_header[12+i]=(unsigned char)(old_hash>>(8*i));}
+    if(fwrite(old_header,1,16,old_write)!=16)return 1;
+    for(unsigned i=0;i<SNAP_WORDS;i++)for(unsigned b=0;b<4;b++)if(fputc((old_words[i]>>(8*b))&255,old_write)==EOF)return 1;
+    if(fclose(old_write))return 1;
+    memoryWrite(WIDE_FILE_BASE,0);memoryWrite(WIDE_FILE_BASE+2,0);
+    verify(snapshotService(0x300,1)==0 && memoryRead(WIDE_FILE_BASE)==0x12345678 && memoryRead(WIDE_FILE_BASE+2)=='b',"B32S v2 packed snapshot restores into expanded storage");
+    uint32_t fixed_native[2]={old_words[216],old_words[217]},fixed_text[5];
+    for(unsigned i=0;i<5;i++)fixed_text[i]=old_words[218+i];
+    memset(old_words+216,0,SNAP_OLD_FILE_WORDS*sizeof(uint32_t));
+    for(unsigned i=0;i<2;i++)old_words[216+i]=fixed_native[i];
+    for(unsigned i=0;i<5;i++)old_words[216+512+i]=fixed_text[i];
+    old_hash=snapshotHash(old_words,SNAP_WORDS);old_header[4]=1;
+    for(unsigned i=0;i<4;i++)old_header[12+i]=(unsigned char)(old_hash>>(8*i));
+    old_write=fopen("build/cpu-snapshot.b32","wb");if(!old_write)return 1;
+    if(fwrite(old_header,1,16,old_write)!=16)return 1;
+    for(unsigned i=0;i<SNAP_WORDS;i++)for(unsigned b=0;b<4;b++)if(fputc((old_words[i]>>(8*b))&255,old_write)==EOF)return 1;
+    if(fclose(old_write))return 1;
+    memoryWrite(WIDE_FILE_BASE,0);memoryWrite(WIDE_FILE_BASE+2,0);
+    verify(snapshotService(0x300,1)==0 && memoryRead(WIDE_FILE_BASE)==0x12345678 && memoryRead(WIDE_FILE_BASE+2)=='b',"B32S v1 fixed-slot snapshot converts into expanded packed storage");
     cpu32=false;ram.memory[0xf000]=42;
     verify(snapshotService(0x300,1)==-2 && ram.memory[0xf000]==42,"legacy rejects wide snapshot without modifying RAM");
     cpu32=true;kernelIdentity++;
     verify(snapshotService(0x300,1)==1,"wide snapshot reports changed kernel identity");
-    verify(ram.memory[0x520]==0 && ram.memory[0x521]==1 && ram.memory[0xf000]=='b' && ram.memory[0xf003]=='!',"wide kernel change drops binaries and preserves text");
+    verify(ram.memory[0x520]==0 && ram.memory[0x521]==1 && memoryRead(WIDE_FILE_BASE)=='b' && memoryRead(WIDE_FILE_BASE+3)=='!',"wide kernel change drops binaries and preserves text");
     kernelIdentity--;
     if(storage_path(""))return 1;
-    uint32_t snapshot[SNAP_WORDS]={0};
+    uint32_t snapshot[SNAP_WIDE_WORDS]={0};
     verify(snapshotValid(snapshot),"empty snapshot metadata");
     snapshot[0]='b';snapshot[1]='o';snapshot[2]='b';snapshot[3]='!';snapshot[192]=4;snapshot[208]=1;
     snapshot[216]='b';snapshot[217]='o';snapshot[218]='b';snapshot[219]='!';
     verify(snapshotValid(snapshot),"valid text snapshot metadata");
     snapshot[218]=0;verify(!snapshotValid(snapshot),"text snapshot rejects embedded terminator");snapshot[218]='b';
     snapshot[220]=1;verify(!snapshotValid(snapshot),"snapshot rejects missing content terminator");snapshot[220]=0;
-    snapshot[192]=512;verify(!snapshotValid(snapshot),"snapshot rejects excessive length");snapshot[192]=4;
+    snapshot[192]=SNAP_FILE_WORDS;verify(!snapshotValid(snapshot),"snapshot rejects excessive length");snapshot[192]=4;
     snapshot[208]=2;verify(!snapshotValid(snapshot),"snapshot rejects invalid used flag");snapshot[208]=1;
     snapshot[200]=2;verify(snapshotValid(snapshot),"bob32 snapshots accept native program files");
     snapshot[200]=4;verify(!snapshotValid(snapshot),"snapshot rejects invalid kind");snapshot[200]=0;
@@ -342,15 +378,15 @@ int main(int argc,char **argv) {
     reset_cpu(1);ram.memory[0x300]=0xf000;ram.memory[0x301]=7;
     ram.memory[0xf000]=0x4233324b;ram.memory[0xf001]=0x00180002;ram.memory[0xf002]=0x20000;ram.memory[0xf003]=0x20000;
     ram.memory[0xf004]=1;ram.memory[0xf005]=0xe000;ram.memory[0xf006]=0xe000;
-    verify(runWidePackedFromGuest(0x300)==0,"native app loads and executes from packed guest RAM image");
+    verify(runWidePackedFromGuest(0x300,NULL)==0,"native app loads and executes from packed guest RAM image");
     reset_cpu(1);ram.memory[0x300]=0xf000;ram.memory[0x301]=7;
     ram.memory[0xf000]=0x4233324b;ram.memory[0xf001]=0x00180002;ram.memory[0xf002]=0x20000;ram.memory[0xf003]=0x20000;
     ram.memory[0xf004]=1;ram.memory[0xf005]=0xe000;ram.memory[0xf006]=0;
-    verify(runWidePackedFromGuest(0x300)==-4,"native app checksum corruption rejected before execution");
+    verify(runWidePackedFromGuest(0x300,NULL)==-4,"native app checksum corruption rejected before execution");
     reset_cpu(1);ram.memory[0x300]=0xf000;ram.memory[0x301]=7;
     ram.memory[0xf000]=0x4233324b;ram.memory[0xf001]=0x00180002;ram.memory[0xf002]=0x20000;ram.memory[0xf003]=0x20000;
     ram.memory[0xf004]=1;ram.memory[0xf005]=0xe000;ram.memory[0xf006]=0xe000;failNextSparsePageAllocation=1;
-    verify(runWidePackedFromGuest(0x300)==-5 && memoryPage(0x10,0)==NULL,"native app reports insufficient sparse memory without partial load");
+    verify(runWidePackedFromGuest(0x300,NULL)==-5 && memoryPage(0x10,0)==NULL,"native app reports insufficient sparse memory without partial load");
     f=fopen("build/cpu-import.b32","wb");if(!f)return 1;
     fwrite("B32K",1,4,f);put16(f,2);put16(f,24);put32(f,0x20000);put32(f,0x20000);put32(f,1);put32(f,0xe000);put32(f,0xe000);if(fclose(f))return 1;
     reset_cpu(1);const char *import_path="build/cpu-import.b32";
@@ -360,7 +396,7 @@ int main(int argc,char **argv) {
     ram.memory[0x302]=8;
     verify(importWideImageFromGuest(0x300)==7 && ram.memory[0xf006]==0xe000,"native image import validates and packs a B32K v2 image");
     ram.memory[0x310]=0xf000;ram.memory[0x311]=7;
-    verify(runWidePackedFromGuest(0x310)==0,"imported native image executes from packed filesystem storage");
+    verify(runWidePackedFromGuest(0x310,NULL)==0,"imported native image executes from packed filesystem storage");
     bootImage("build/kernel.b16");verify(!cpu32,"legacy image selects compatibility mode");
     f=fopen("build/cpu-input.basm","w");if(!f)return 1;
     fputs("lea r0 2\ntrap 2\ntrap 0\n.stringz bob!\n",f);fclose(f);

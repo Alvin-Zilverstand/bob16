@@ -29,7 +29,8 @@ unbuffered keys, converts Enter to newline, and treats Ctrl+D as EOF.
 Ctrl+Z is an ordinary control character: shell EOF, full-screen editor undo.
 Redirected input uses getchar. `bob_terminal()` (trap 9) returns 1 only when
 both input/output are native Windows console handles; otherwise 0. Shell
-history, completion and editing are guest code in `kernel/input.c`. ANSI key
+history, completion and editing are guest code in `kernel/input.c`; the shell's
+`history` command lists the same four recent entries. ANSI key
 sequences in redirected regression fixtures exercise the same guest actions.
 `bob_columns()` (trap 10) reports the console buffer width, or 80 as fallback.
 The shell scrolls a long input line horizontally to keep redraw within it.
@@ -74,9 +75,10 @@ returning its slot or -1 for a bad name, length or a full table. Kind 0 is text;
 kind 1 is machine code, kind 2 is resident bob32 C code, and kind 3 is a packed
 native B32K v2 image. Its copy appends a zero word, which is not part of length.
 Names hold at most 23 characters. bob16 retains eight fixed 511-word slots;
-bob32 packs files into a shared 4,096-word content region. Text files remain
-limited to 511 words; resident programs and native images can use the remaining
-shared capacity (up to 4,095 words per file). Valid slot indices are 0..7.
+bob32 packs files into a protected 8,192-word content region at `0x1E000`,
+between the kernel and supervised-app regions. Text files remain limited to 511
+words; resident programs and native images can use the remaining shared capacity
+(up to 8,191 words per file). Valid slot indices are 0..7.
 These are internal kernel APIs.
 
 Failed size/name validation does not overwrite an existing file. Edits start
@@ -131,16 +133,87 @@ kernel code; ordinary shell programs use bob_run for recovery and write checks.
 See [the OS guide](../C_OS.md) for commands, examples and C subset limits.
 
 In bob32 mode, `import32 HOST_PATH NAME` validates and packs a B32K v2 image
-into a guest RAM file; `run NAME` loads and executes it. B32S version 2
-snapshots preserve packed files; version 1 fixed-slot snapshots remain readable
-and are converted to the packed layout on restore. `run32 HOST_PATH` remains
+into a guest RAM file; `run NAME` loads and executes it. B32S version 3
+snapshots preserve the expanded filesystem; versions 1 and 2 remain readable
+and are migrated to the current storage layout on restore. `run32 HOST_PATH` remains
 available for direct host-path launches.
 
 Native C applications can include `bob_string.h` for small app-side string
 and parsing helpers. It provides bounded integer formatting, status-returning
 decimal/hex parsing, and in-place quoted tokenization without depending on the
 kernel's private runtime functions.
+`bob_native.h` is an optional convenience include for the common native API
+surface: core `bob.h` calls, strings, app-managed memory, filesystem, process,
+time, and input events. Graphics and GUI remain opt-in via `bob_gfx.h` and
+`bob_gui.h` so text-only apps do not pull in widget code.
+`bob_memory.h` provides a caller-owned word arena. Keep an integer buffer and a
+used-word counter, request word counts with `bob_arena_alloc`, inspect
+used/remaining capacity, and reset the counter when its allocations are no longer
+needed. Exhaustion and invalid sizes return null; no OS-global heap is reserved.
 Native apps may define `main(int argc, char **argv)`; when launched by guest
 filename, `argv[0]` is that filename and `argc` includes it. `run app first
 "two words"` groups quoted words; backslash escapes the following character
 and `""` supplies an empty argument.
+
+`bob_fs.h` exposes the version 1 native-app filesystem service through
+`bob_file_list`, `bob_file_read`, `bob_file_write`, `bob_file_delete`,
+`bob_file_read_words`, `bob_file_write_words`, and `bob_file_kind`. Listing
+returns kind and word-size metadata; `bob_file_kind` queries the kind directly
+by name. Text reads/writes handle up to 511 characters. Word-file
+helpers preserve binary values for bob16 and bob32 program kinds. Native B32K
+images can be read as words, but must use the validated `import32` path to enter
+the filesystem as runnable apps. Applications pass buffers in their own memory,
+while the emulator validates and copies data to keep kernel tables private.
+Files remain in the guest RAM filesystem and follow the normal B32S save/restore
+flow. B32S v3 stores the expanded payload; v1 fixed-slot and v2 packed snapshots
+remain readable.
+`bob_system_info` reports the service version, app address-space size, mapped
+pages, and filesystem slot/word usage through the same versioned boundary.
+
+`bob_process.h` adds `bob_app_run(name, arguments, &exit_code)` through version 1
+service operation 6. It launches a stored kind-3 B32K image with shell-style
+quoted arguments, preserves the suspended caller's sparse application memory,
+and separates launch errors from the child's exit code. Nested launches are
+limited to eight active app frames. The API returns -1 when the app name is
+missing, -2 for a non-native file, -4 for invalid data, and -5 when memory is
+unavailable. The `launcher` app lists stored native images and can run one with
+`run launcher APP [ARG ...]`.
+
+`bob_time.h` exposes version 1 time operation 7. `bob_time_utc_seconds(words)`
+fills two 32-bit words with the low and high halves of UTC seconds since the
+Unix epoch and returns 2. It returns a negative status for an invalid request.
+
+`bob_gfx.h` uses that OS boundary for an 80x25 cell framebuffer: enter/query,
+clear, pixel, filled rectangle, line, text, transparent bitmap blit, present,
+and leave. Each cell carries a 16-color foreground. Draw calls update a back
+buffer; present renders it, and supervised app exit closes an unclosed canvas.
+`bob_gfx_blit_color` accepts transparent row-major cells with an ASCII character
+in bits 0..7 and a foreground color in bits 8..11; invalid cell values reject
+the whole call before drawing.
+`bob_font.h` adds an opt-in 5x7 bitmap font helper. `bob_gfx_bitmap_text`
+rasterizes uppercase letters, digits, space, and common punctuation into the
+canvas via the colored bitmap service; lowercase letters map to uppercase and
+unsupported characters use `?`.
+`bob_event.h` provides `bob_event_wait` and nonblocking `bob_event_poll` with
+four-word events. Poll returns 1 for an event or 0 when the console queue is
+empty; redirected input is left for the blocking wait and is not peeked.
+Version 1 reports typed characters, special-key presses, key releases, mouse
+movement and mouse button transitions when the Windows console provides those
+records. Mouse coordinates are console-cell coordinates; redirected input
+remains character based.
+`bob_event_queue.h` adds an app-owned FIFO for those same four-word events.
+Initialize a two-word `{head,count}` state, allocate four storage words per
+queue slot, then use `bob_event_queue_push`/`pop`; push returns 0 when full
+without overwriting older events, and pop returns 0 when empty. Invalid
+capacity/state returns -1. The queue is optional and requires no OS memory.
+`bob_wm.h` adds a small reusable window manager over caller-provided fixed
+arrays. Initialize it with a window limit and screen size, then use create,
+destroy, focus, raise, move, show/hide, and invalidate operations. Dispatch
+returns a recipient ID, routes keys to the focused visible window, raises the
+topmost clicked window, captures title-bar drags, and supplies window-local
+mouse coordinates. `bob_wm_begin_draw` starts a redraw pass and repeated
+`bob_wm_next_dirty` calls yield visible windows bottom-to-top; geometry and
+stacking changes request a full redraw, while invalidation also marks any
+overlapping windows so they repaint correctly. The manager stores no app-specific
+titles or callbacks; applications keep their own state and draw their own
+contents through `bob_gui.h` and `bob_gfx.h`.

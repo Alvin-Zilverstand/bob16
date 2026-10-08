@@ -7,6 +7,7 @@ int editor_undo_length;
 int editor_has_undo;
 char *arguments;
 void nano_edit(char *name);
+void shell_history_list(void);
 
 char *next_arg(void) {
     char *start;
@@ -270,7 +271,7 @@ void memory_status(void) {
     print("Programs "); print_hex(PROGRAM_BASE); print(".."); print_hex(0xbfff); println("");
 #endif
 #ifdef BOBC_WIDE
-    println("Files: 8 slots, 4096 words total; text files up to 511 words; native apps share remaining space.");
+    println("Files: 8 slots, 8192 words total; text files up to 511 words; native apps share remaining space.");
 #else
     println("Files: 8 slots, 511 words each; stack above 0xE600.");
 #endif
@@ -309,6 +310,7 @@ void command_help(char *name) {
     else if (strcmp(name, "alloc") == 0 || strcmp(name, "mem") == 0)
         println("alloc WORDS: allocate/zero heap words, print start address; no free. Example: alloc 16. mem shows remaining heap and memory regions.");
     else if (strcmp(name, "echo") == 0) println("echo TEXT: print text. Example: echo bob!");
+    else if (strcmp(name, "history") == 0) println("history: list the four most recent nonempty shell commands from this session.");
     else if (strcmp(name, "clear") == 0) println("clear: clear an ANSI-capable terminal; does not remove files.");
     else if (strcmp(name, "halt") == 0) println("halt: stop emulator. Unsaved RAM files and allocations are lost; use save before quitting.");
     else if (strcmp(name, "help") == 0) println("help: list commands. help COMMAND: show usage and an example. Try help edit or help go.");
@@ -326,7 +328,7 @@ void SHELL_COMMAND_BODY(char *line) {
     if (strcmp(command, "help") == 0) {
         name = next_arg();
         if (*name) { command_help(name); return; }
-        println("help | echo TEXT | clear | mem | halt");
+        println("help | echo TEXT | history | clear | mem | halt");
         println("peek ADDRESS | poke ADDRESS VALUE | alloc WORDS");
         println("list / ls / dir | read NAME | write NAME TEXT | edit NAME");
         println("copy OLD NEW | rename OLD NEW | delete NAME (permanent in RAM)");
@@ -396,6 +398,9 @@ void SHELL_COMMAND_BODY(char *line) {
             *pointer = value;
         }
         print_hex(address); print(": "); print_hex(*pointer); print(" ("); print_dec(*pointer); println(")");
+    } else if (strcmp(command, "history") == 0) {
+        if (*next_arg()) println("Usage: history");
+        else shell_history_list();
     } else println("Unknown command. Type help.");
 }
 #ifdef BOBC_WIDE

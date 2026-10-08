@@ -3,6 +3,14 @@ int file_lengths[8];
 int file_kinds[8];
 int file_used[8];
 
+void file_service_register(void) {
+    int descriptor[5];
+    descriptor[0] = 0; descriptor[1] = (int)file_names;
+    descriptor[2] = (int)file_lengths; descriptor[3] = (int)file_kinds;
+    descriptor[4] = (int)file_used;
+    bob_fs_register(descriptor);
+}
+
 void file_snapshot(int operation) {
     int descriptor[4]; int result;
     descriptor[0] = (int)file_names; descriptor[1] = (int)file_lengths;
@@ -26,14 +34,13 @@ void file_snapshot(int operation) {
 }
 
 char *file_name(int slot) { return file_names + slot * NAME_WORDS; }
-/* The upper 4096 words are reserved for file contents, above the kernel stack.
-   Supervised programs cannot write this region. */
+/* Native files occupy protected memory between the kernel and app regions. */
 int *file_content(int slot) {
 #ifdef BOBC_WIDE
     int i; int offset;
     offset = 0;
     for (i = 0; i < slot; i++) if (file_used[i]) offset += file_lengths[i] + 1;
-    return (int *)0xf000 + offset;
+    return (int *)WIDE_FILE_BASE + offset;
 #else
     return (int *)0xf000 + slot * FILE_WORDS;
 #endif
@@ -101,7 +108,7 @@ int file_write(char *name, void *data, int length, int kind) {
     /* Compact first so variable-sized files never leave unusable gaps. */
     for (i = 0; i < FILE_COUNT; i++) if (file_used[i] && i != slot) {
         int *source; int *destination; int j;
-        source = (int *)0xf000; destination = (int *)0xf000;
+        source = (int *)WIDE_FILE_BASE; destination = (int *)WIDE_FILE_BASE;
         for (j = 0; j < i; j++) if (file_used[j] && j != slot) destination += file_lengths[j] + 1;
         for (j = 0; j < i; j++) if (file_used[j]) source += file_lengths[j] + 1;
         if (source != destination && destination < source)
@@ -112,15 +119,15 @@ int file_write(char *name, void *data, int length, int kind) {
     for (i = 0; i < slot; i++) if (file_used[i] && i != slot) targetOffset += file_lengths[i] + 1;
     { int total = 0;
       for (i = 0; i < FILE_COUNT; i++) if (file_used[i] && i != slot) total += file_lengths[i] + 1;
-      for (i = total - 1; i >= targetOffset; i--) ((int *)0xf000)[i + length + 1] = ((int *)0xf000)[i];
+      for (i = total - 1; i >= targetOffset; i--) ((int *)WIDE_FILE_BASE)[i + length + 1] = ((int *)WIDE_FILE_BASE)[i];
       if (sourceSlot >= 0) {
           int sourceOffset = 0;
           for (i = 0; i < sourceSlot; i++) if (file_used[i] && i != slot) sourceOffset += file_lengths[i] + 1;
           if (sourceSlot > slot) sourceOffset += length + 1;
-          data = (int *)0xf000 + sourceOffset;
+          data = (int *)WIDE_FILE_BASE + sourceOffset;
       }
-      memcpy((int *)0xf000 + targetOffset, data, length);
-      ((int *)0xf000)[targetOffset + length] = 0;
+      memcpy((int *)WIDE_FILE_BASE + targetOffset, data, length);
+      ((int *)WIDE_FILE_BASE)[targetOffset + length] = 0;
       file_lengths[slot] = length; file_kinds[slot] = kind;
     }
     return slot;
@@ -150,7 +157,7 @@ void file_list(void) {
     if (!count) println("No files.");
     print("Used "); print_dec(count);
 #ifdef BOBC_WIDE
-    println("/8 slots; shared 4096-word storage. Text/resident files max 511; native apps use remaining space.");
+    println("/8 slots; shared 8192-word storage. Text files max 511; native apps use remaining space.");
 #else
     println("/8 slots; limit 511 words per file. delete frees a slot.");
 #endif
@@ -167,7 +174,7 @@ void file_manage(char *operation, char *name, char *destination) {
         for (i = 0; i < FILE_COUNT; i++) if (file_used[i]) {
             if (i == slot) { sourceOffset += file_lengths[i] + 1; continue; }
             if (sourceOffset != destinationOffset)
-                for (j = 0; j <= file_lengths[i]; j++) ((int *)0xf000)[destinationOffset + j] = ((int *)0xf000)[sourceOffset + j];
+                for (j = 0; j <= file_lengths[i]; j++) ((int *)WIDE_FILE_BASE)[destinationOffset + j] = ((int *)WIDE_FILE_BASE)[sourceOffset + j];
             sourceOffset += file_lengths[i] + 1; destinationOffset += file_lengths[i] + 1;
         }
 #endif

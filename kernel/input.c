@@ -1,9 +1,19 @@
 /* Native shell editing; history is stored before command tokenization. */
 #define shell_history ((char *)0xe400)
+#define SHELL_HISTORY_LIMIT 4
+#define SHELL_HISTORY_ENTRY_SIZE 128
 int history_count;
 int input_length;
 int input_cursor;
 int input_echo;
+
+void shell_history_list(void) {
+    int i;
+    for (i = 0; i < history_count; i++) {
+        print_dec(i + 1); print(" ");
+        println(shell_history + i * SHELL_HISTORY_ENTRY_SIZE);
+    }
+}
 
 void input_redraw(void) {
     int i; int width; int start; int end;
@@ -45,9 +55,9 @@ void input_complete(void) {
     if (input_cursor != input_length) return;
     if (!start) {
 #ifdef BOBC_WIDE
-        words = "help echo clear mem halt list ls dir read write edit load run run32 cc go copy rename delete alloc peek poke save restore";
+        words = "help echo clear mem halt history list ls dir read write edit load run run32 cc go copy rename delete alloc peek poke save restore";
 #else
-        words = "help echo clear mem halt list ls dir read write edit load run cc go copy rename delete alloc peek poke save restore";
+        words = "help echo clear mem halt history list ls dir read write edit load run cc go copy rename delete alloc peek poke save restore";
 #endif
         while (*words) {
             length = 0;
@@ -90,7 +100,8 @@ int shell_read_line(void) {
             if (key == 256 && browsing) browsing--;
             if (key == 257 && browsing < history_count) browsing++;
             if (browsing == history_count) memcpy(command_line, draft, strlen(draft) + 1);
-            else memcpy(command_line, shell_history + browsing * 128, strlen(shell_history + browsing * 128) + 1);
+            else memcpy(command_line, shell_history + browsing * SHELL_HISTORY_ENTRY_SIZE,
+                         strlen(shell_history + browsing * SHELL_HISTORY_ENTRY_SIZE) + 1);
             input_length = strlen(command_line); input_cursor = input_length;
         } else if (key == 258) { if (input_cursor) input_cursor--; }
         else if (key == 259) { if (input_cursor < input_length) input_cursor++; }
@@ -118,11 +129,12 @@ int shell_read_line(void) {
     if (truncated) return -1;
     if (key == -1 && !input_length) return -2;
     if (input_length && (history_count == 0 || strcmp(command_line, shell_history + (history_count - 1) * 128))) {
-        if (history_count == 4) {
-            for (i = 0; i < 384; i++) shell_history[i] = shell_history[i + 128];
-            history_count = 3;
+        if (history_count == SHELL_HISTORY_LIMIT) {
+            for (i = 0; i < (SHELL_HISTORY_LIMIT - 1) * SHELL_HISTORY_ENTRY_SIZE; i++)
+                shell_history[i] = shell_history[i + SHELL_HISTORY_ENTRY_SIZE];
+            history_count = SHELL_HISTORY_LIMIT - 1;
         }
-        memcpy(shell_history + history_count * 128, command_line, input_length + 1); history_count++;
+        memcpy(shell_history + history_count * SHELL_HISTORY_ENTRY_SIZE, command_line, input_length + 1); history_count++;
     }
     return input_length;
 }

@@ -10,6 +10,8 @@ int bob_run(int entry);
 int bob_run_image(const char *path);
 int bob_import_image(int *descriptor);
 int bob_run_native(const int *descriptor);
+int bob_os_service(int *request);
+int bob_fs_register(int *descriptor);
 int bob_snapshot(int *descriptor, int operation);
 int bob_key(void);
 int bob_terminal(void);

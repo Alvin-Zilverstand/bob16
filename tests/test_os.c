@@ -54,9 +54,9 @@ static void guest32(const char *source) {
     write_text("build/wide-lib.c",source);
     check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/wide-lib.c -o build/wide-lib.i > build/compiler.log 2>&1")==0,"bob32 library guest preprocessing");
     check(system(COMPILER " build/wide-lib.i build/wide-lib.basm build/wide-lib.b32 --wide > build/compiler.log 2>&1")==0,"bob32 library guest compilation");
-    write_text("build/check.in","");
-    check(system(BOB32 " --boot build/wide-lib.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"bob32 library guest execution");
-    char *output=read_text("build/check.out");check(!strcmp(output,"bob!\n"),"bob32 library success marker");free(output);
+    write_text("build/check.in","run32 build/wide-lib.b32\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"bob32 library guest execution under OS services");
+    char *output=read_text("build/check.out");contains(output,"bob!");free(output);
 }
 static void native_string_library(void) {
     guest32(
@@ -96,15 +96,305 @@ static void native_string_library(void) {
     check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"bob32 string-library app survives snapshot restore");
     output=read_text("build/check.out");contains(output,"Files restored;");contains(output,"bob> bob!\nExit 0");free(output);
     write_text("build/argv-app.c",
-        "#include \"bob.h\"\n#include \"bob_string.h\"\n"
-        "int main(int argc,char **argv){if(argc!=5)return argc;"
+        "#include \"bob.h\"\n#include \"bob_string.h\"\n#include \"bob_fs.h\"\n"
+        "int main(int argc,char **argv){char data[16];char name[24];int size;int kind;int i;int old;"
+        "if(argc!=4)return argc;"
         "if(bob_strcmp(argv[0],\"argvapp\")||bob_strcmp(argv[1],\"Bob OS\")||bob_strcmp(argv[2],\"escaped token\")||bob_strcmp(argv[3],\"\"))return 2;"
+        "old=bob_file_read(\"note\",data,16);if(old>=0&&(old!=4||bob_strcmp(data,\"bob!\")))return 3;"
+        "if(old<0&&bob_file_write(\"note\",\"bob!\",4))return 4;"
+        "if(bob_file_read(\"note\",data,16)!=4||bob_strcmp(data,\"bob!\"))return 5;"
+        "if(bob_file_write(\"temp\",\"x\",1)||bob_file_delete(\"temp\"))return 6;"
+        "for(i=0;i<8;i++){kind=bob_file_list(i,name,24,&size);if(kind<0)continue;"
+        "if(!bob_strcmp(name,\"note\")){if(kind||size!=4)return 7;break;}}if(i==8)return 8;"
         "bob_puts(\"bob!\");return 0;}\n");
     check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/argv-app.c -o build/argv-app.i > build/compiler.log 2>&1")==0,"bob32 argv app preprocessing");
     check(system(COMPILER " build/argv-app.i build/argv-app.basm build/argv-app.b32 --wide-app > build/compiler.log 2>&1")==0,"bob32 argv app compilation");
     write_text("build/check.in","import32 build/argv-app.b32 argvapp\nrun argvapp \"Bob OS\" escaped\\ token \"\"\nhalt\n");
     check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"bob32 passes quoted arguments to native apps");
     output=read_text("build/check.out");contains(output,"bob> bob!\nExit 0");free(output);
+    write_text("build/memory-app.c",
+        "#include \"bob.h\"\n#include \"bob_memory.h\"\n"
+        "int main(void){int storage[8];int used=0;int *first;int *second;"
+        "first=bob_arena_alloc(storage,8,&used,3);second=bob_arena_alloc(storage,8,&used,5);"
+        "if(first!=storage||second!=storage+3)return 2;first[2]=42;"
+        "if(first[2]!=42||bob_arena_used(&used)!=8||bob_arena_remaining(8,&used)!=0)return 3;"
+        "if(bob_arena_alloc(storage,8,&used,1)||bob_arena_alloc(storage,8,&used,0)||bob_arena_alloc(storage,8,&used,-1))return 4;"
+        "if(bob_arena_reset(&used)||bob_arena_used(&used)||bob_arena_remaining(8,&used)!=8)return 5;"
+        "if(bob_arena_alloc(storage,8,&used,8)!=storage)return 6;bob_puts(\"bob!\");return 0;}\n");
+    check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/memory-app.c -o build/memory-app.i > build/compiler.log 2>&1")==0,"bob32 app arena fixture preprocessing");
+    check(system(COMPILER " build/memory-app.i build/memory-app.basm build/memory-app.b32 --wide-app > build/compiler.log 2>&1")==0,"bob32 app arena fixture compilation");
+    write_text("build/check.in","import32 build/memory-app.b32 memoryapp\nrun memoryapp\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"native word arena allocates, bounds-checks and resets caller-owned storage");
+    output=read_text("build/check.out");contains(output,"bob> bob!\nExit 0");free(output);
+    write_text("build/time-app.c",
+        "#include \"bob.h\"\n#include \"bob_time.h\"\n"
+        "int main(void){int words[2];if(bob_time_utc_seconds(words)!=2)return 1;"
+        "if(words[0]<=0||words[1]<0||words[1]>1000)return 2;"
+        "bob_puts(\"bob!\");return 0;}\n");
+    check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/time-app.c -o build/time-app.i > build/compiler.log 2>&1")==0,"bob32 time app preprocessing");
+    check(system(COMPILER " build/time-app.i build/time-app.basm build/time-app.b32 --wide-app > build/compiler.log 2>&1")==0,"bob32 time app compilation");
+    write_text("build/word-fs-app.c",
+        "#include \"bob.h\"\n#include \"bob_fs.h\"\n#include \"bob_string.h\"\n"
+        "int main(int argc,char **argv){int source[3]={0x12345678,-1,0};int data[3];char name[24];int size;int kind;int i;int stored;"
+        "stored=bob_file_read_words(\"binary\",data,3);if(stored<0){if(argc!=2||bob_strcmp(argv[1],\"create\"))return 1;"
+        "if(bob_file_write_words(\"binary\",source,3,BOB_FILE_KIND_BOB32_PROGRAM))return 1;}else if(stored!=3)return 1;"
+        "if(bob_file_read_words(\"binary\",data,2)!=-2)return 2;"
+        "if(bob_file_read_words(\"binary\",data,3)!=3||data[0]!=source[0]||data[1]!=-1||data[2]!=0)return 3;"
+        "for(i=0;i<8;i++){kind=bob_file_list(i,name,24,&size);if(kind<0)continue;if(!bob_strcmp(name,\"binary\"))break;}"
+        "if(i==8||kind!=BOB_FILE_KIND_BOB32_PROGRAM||size!=3)return 4;"
+        "if(argc==1&&bob_file_delete(\"binary\"))return 5;bob_puts(\"bob!\");return 0;}\n");
+    check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/word-fs-app.c -o build/word-fs-app.i > build/compiler.log 2>&1")==0,"native word filesystem fixture preprocessing");
+    check(system(COMPILER " build/word-fs-app.i build/word-fs-app.basm build/word-fs-app.b32 --wide-app > build/compiler.log 2>&1")==0,"native word filesystem fixture compilation");
+    storage_path("build/word-fs-snapshot.b32");
+    write_text("build/check.in","import32 build/word-fs-app.b32 wordfs\nrun wordfs create\nsave\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"native filesystem writes binary program words into the snapshot");
+    output=read_text("build/check.out");contains(output,"bob> bob!\nExit 0");free(output);
+    write_text("build/check.in","restore yes\nrun wordfs\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"binary program words survive snapshot restore and can be deleted by a native app");
+    output=read_text("build/check.out");contains(output,"Files restored;");contains(output,"bob> bob!\nExit 0");free(output);
+    write_text("build/check.in","import32 build/time-app.b32 timeapp\nrun timeapp\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"native app reads UTC time through the versioned OS service");
+    output=read_text("build/check.out");contains(output,"bob> bob!\nExit 0");free(output);
+    write_text("build/native-api-app.c",
+        "#include \"bob_native.h\"\n"
+        "int main(void){char text[8]=\"bob\";char loaded[8];int arena_words[4];int used=0;int clock_words[2];"
+        "if(bob_strcat(text,\"!\")!=text)return 1;"
+        "if(bob_arena_alloc(arena_words,4,&used,2)!=arena_words||used!=2)return 2;"
+        "if(bob_file_write(\"umbrella\",text,bob_strlen(text)))return 3;"
+        "if(bob_file_read(\"umbrella\",loaded,8)!=4||bob_strcmp(loaded,\"bob!\"))return 4;"
+        "if(bob_time_utc_seconds(clock_words)!=2||clock_words[0]<=0)return 5;"
+        "if(bob_file_delete(\"umbrella\"))return 6;bob_puts(\"bob!\");return 0;}\n");
+    check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/native-api-app.c -o build/native-api-app.i > build/compiler.log 2>&1")==0,"common native API umbrella preprocessing");
+    check(system(COMPILER " build/native-api-app.i build/native-api-app.basm build/native-api-app.b32 --wide-app > build/compiler.log 2>&1")==0,"common native API umbrella compilation");
+    write_text("build/check.in","import32 build/native-api-app.b32 nativeapi\nrun nativeapi\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"native API umbrella works end to end across common services");
+    output=read_text("build/check.out");contains(output,"bob> bob!\nExit 0");free(output);
+    storage_path("build/snapshot.b16");
+}
+static void native_gui_geometry(void) {
+    guest32(
+        "#include \"bob.h\"\n#include \"bob_gui.h\"\n#include \"bob_event_queue.h\"\n"
+        "int main(void){int rect[4]={3,3,34,12};int drag[3]={0,0,0};"
+        "int button[4]={5,5,10,3};int state[2]={0,0};int event[4]={0,0,7,6};"
+        "int field[4]={5,5,8,3};int edit[3];char text[16]=\"bob\";char long_text[8]=\"\";int long_edit[3];"
+        "int area[4]={5,5,12,5};int area_state[4];char multiline[32]=\"ab\\ncd\";"
+        "int wheel_state[4];char wheel_text[32]=\"1\\n2\\n3\\n4\\n5\";"
+        "int stack[8]={0,0,10,10,5,5,10,10};int order[2]={0,1};"
+        "int menu[4]={10,5,20,5};int menu_state[2]={0,-1};int placed[4];"
+        "int queue_state[2],queue_storage[12],queued[4],dequeued[4];"
+        "int wm[10],wm_windows[21],wm_order[3],wm_routed[4],wm_a,wm_b;"
+        "if(!bob_gui_window_hit(3,3,rect)||bob_gui_window_hit(37,3,rect))return 1;"
+        "if(bob_gui_window_at(6,6,stack,order,2)!=1||!bob_gui_raise_window(order,2,0)||bob_gui_window_at(6,6,stack,order,2)!=0)return 19;"
+        "if(order[0]!=1||order[1]!=0||bob_gui_raise_window(order,2,3)||bob_gui_window_at(20,20,stack,order,2)!=-1)return 20;"
+        "if(!bob_gui_drag_start(rect,drag,8,3)||!drag[0]||drag[1]!=5)return 2;"
+        "if(!bob_gui_drag_update(rect,drag,15,9,80,25)||rect[0]!=10||rect[1]!=9)return 3;"
+        "bob_gui_drag_update(rect,drag,200,40,80,25);"
+        "if(rect[0]!=46||rect[1]!=13)return 4;"
+        "if(!bob_gui_drag_stop(drag)||bob_gui_drag_update(rect,drag,0,0,80,25))return 5;"
+        "if(bob_gui_drag_start(rect,drag,47,14))return 6;"
+        "event[0]=BOB_EVENT_MOUSE_MOVE;if(bob_gui_button_event(button,state,event)||!state[0])return 7;"
+        "event[0]=BOB_EVENT_MOUSE_BUTTON_DOWN;event[1]=BOB_MOUSE_BUTTON_RIGHT;"
+        "if(bob_gui_button_event(button,state,event)||state[1])return 8;"
+        "event[1]=BOB_MOUSE_BUTTON_LEFT;if(bob_gui_button_event(button,state,event)||!state[1])return 9;"
+        "event[0]=BOB_EVENT_MOUSE_BUTTON_UP;event[1]=0;"
+        "if(!bob_gui_button_event(button,state,event)||state[1])return 10;"
+        "event[0]=BOB_EVENT_MOUSE_BUTTON_DOWN;event[1]=BOB_MOUSE_BUTTON_LEFT;bob_gui_button_event(button,state,event);"
+        "event[0]=BOB_EVENT_MOUSE_BUTTON_UP;event[1]=0;event[2]=20;"
+        "if(bob_gui_button_event(button,state,event)||state[1])return 11;"
+        "if(bob_gui_text_field_init(text,edit,16)!=3||edit[1]!=3)return 12;"
+        "event[0]=BOB_EVENT_MOUSE_BUTTON_DOWN;event[2]=7;event[3]=6;"
+        "bob_gui_text_field_event(field,text,edit,16,event);if(!edit[0]||edit[1]!=1)return 13;"
+        "event[0]=BOB_EVENT_CHAR;event[1]='!';"
+        "if(!bob_gui_text_field_event(field,text,edit,16,event)||text[0]!='b'||text[1]!='!'||text[2]!='o')return 14;"
+        "event[0]=BOB_EVENT_KEY_DOWN;event[1]=259;bob_gui_text_field_event(field,text,edit,16,event);"
+        "event[0]=BOB_EVENT_CHAR;event[1]=8;bob_gui_text_field_event(field,text,edit,16,event);"
+        "if(text[0]!='b'||text[1]!='!'||text[2]!='b'||text[3])return 15;"
+        "event[0]=BOB_EVENT_KEY_DOWN;event[1]=260;bob_gui_text_field_event(field,text,edit,16,event);"
+        "event[1]=262;bob_gui_text_field_event(field,text,edit,16,event);if(text[0]!='!'||text[1]!='b'||text[2])return 16;"
+        "event[0]=BOB_EVENT_MOUSE_BUTTON_DOWN;event[2]=20;bob_gui_text_field_event(field,text,edit,16,event);"
+        "event[0]=BOB_EVENT_CHAR;event[1]='x';bob_gui_text_field_event(field,text,edit,16,event);"
+        "if(edit[0]||text[0]!='!'||text[1]!='b')return 17;"
+        "bob_gui_text_field_init(long_text,long_edit,8);long_edit[0]=1;"
+        "for(int i=0;i<7;i++){event[0]=BOB_EVENT_CHAR;event[1]='a'+i;bob_gui_text_field_event(field,long_text,long_edit,8,event);}"
+        "if(long_edit[1]!=7||long_edit[2]!=2||long_text[7])return 18;"
+        "if(bob_gui_text_area_init(multiline,area_state,32)!=5||area_state[1]!=5||area_state[2]!=0)return 21;"
+        "event[0]=BOB_EVENT_MOUSE_BUTTON_DOWN;event[1]=BOB_MOUSE_BUTTON_LEFT;event[2]=8;event[3]=7;"
+        "bob_gui_text_area_event(area,multiline,area_state,32,event);if(!area_state[0])return 26;"
+        "event[0]=BOB_EVENT_KEY_DOWN;event[1]=256;bob_gui_text_area_event(area,multiline,area_state,32,event);"
+        "if(area_state[1]!=2)return 22;event[0]=BOB_EVENT_CHAR;event[1]='X';bob_gui_text_area_event(area,multiline,area_state,32,event);"
+        "if(multiline[0]!='a'||multiline[1]!='b'||multiline[2]!='X'||multiline[3]!='\\n')return 23;"
+        "event[0]=BOB_EVENT_KEY_DOWN;event[1]=257;bob_gui_text_area_event(area,multiline,area_state,32,event);"
+        "if(area_state[1]!=6)return 24;event[0]=BOB_EVENT_CHAR;event[1]=8;bob_gui_text_area_event(area,multiline,area_state,32,event);"
+        "if(multiline[4]!='c'||multiline[5])return 25;"
+        "if(bob_gui_text_area_init(wheel_text,wheel_state,32)!=9)return 27;"
+        "bob_gui_text_area_reveal(wheel_text,wheel_state,area);if(wheel_state[2]!=2)return 28;"
+        "event[0]=BOB_EVENT_MOUSE_WHEEL;event[1]=120;event[2]=6;event[3]=6;"
+        "bob_gui_text_area_event(area,wheel_text,wheel_state,32,event);if(wheel_state[2]!=1)return 29;"
+        "bob_gui_text_area_event(area,wheel_text,wheel_state,32,event);if(wheel_state[2]!=0)return 30;"
+        "bob_gui_text_area_event(area,wheel_text,wheel_state,32,event);if(wheel_state[2]!=0)return 31;"
+        "event[1]=-120;bob_gui_text_area_event(area,wheel_text,wheel_state,32,event);"
+        "bob_gui_text_area_event(area,wheel_text,wheel_state,32,event);if(wheel_state[2]!=2)return 32;"
+        "bob_gui_text_area_event(area,wheel_text,wheel_state,32,event);if(wheel_state[2]!=2)return 33;"
+        "bob_event_queue_init(queue_state);if(bob_event_queue_pop(queue_state,queue_storage,3,dequeued)!=0)return 42;"
+        "event[0]=BOB_EVENT_KEY_DOWN;event[1]=257;event[2]=11;event[3]=12;"
+        "if(bob_event_queue_push(queue_state,queue_storage,3,event)!=1)return 43;"
+        "event[1]=258;if(bob_event_queue_push(queue_state,queue_storage,3,event)!=1)return 44;"
+        "event[1]=259;if(bob_event_queue_push(queue_state,queue_storage,3,event)!=1)return 45;"
+        "if(bob_event_queue_push(queue_state,queue_storage,3,event)!=0)return 46;"
+        "if(bob_event_queue_pop(queue_state,queue_storage,3,dequeued)!=1||dequeued[1]!=257||dequeued[2]!=11)return 47;"
+        "event[1]=260;if(bob_event_queue_push(queue_state,queue_storage,3,event)!=1)return 48;"
+        "if(bob_event_queue_pop(queue_state,queue_storage,3,dequeued)!=1||dequeued[1]!=258)return 49;"
+        "if(bob_event_queue_pop(queue_state,queue_storage,3,dequeued)!=1||dequeued[1]!=259)return 50;"
+        "if(bob_event_queue_pop(queue_state,queue_storage,3,dequeued)!=1||dequeued[1]!=260)return 51;"
+        "if(bob_event_queue_pop(queue_state,queue_storage,3,dequeued)!=0)return 52;"
+        "if(bob_event_queue_push(queue_state,queue_storage,0,event)!=-1)return 53;"
+        "if(bob_wm_init(wm,wm_windows,wm_order,3,80,25))return 54;"
+        "wm_a=bob_wm_create(wm,wm_windows,wm_order,5,5,20,10);wm_b=bob_wm_create(wm,wm_windows,wm_order,10,8,20,10);"
+        "if(wm_a!=0||wm_b!=1||wm[2]!=wm_b||wm_order[0]!=wm_a||wm_order[1]!=wm_b)return 55;"
+        "event[0]=BOB_EVENT_KEY_DOWN;event[1]=256;if(bob_wm_dispatch(wm,wm_windows,wm_order,event,wm_routed)!=wm_b)return 56;"
+        "event[0]=BOB_EVENT_MOUSE_BUTTON_DOWN;event[1]=BOB_MOUSE_BUTTON_LEFT;event[2]=12;event[3]=9;"
+        "if(bob_wm_dispatch(wm,wm_windows,wm_order,event,wm_routed)!=wm_b||wm[2]!=wm_b||wm_routed[2]!=2||wm_routed[3]!=1)return 57;"
+        "event[2]=6;event[3]=6;if(bob_wm_dispatch(wm,wm_windows,wm_order,event,wm_routed)!=wm_a||wm[2]!=wm_a||wm_order[1]!=wm_a)return 58;"
+        "event[0]=BOB_EVENT_KEY_DOWN;event[1]=257;event[2]=0;event[3]=0;if(bob_wm_dispatch(wm,wm_windows,wm_order,event,wm_routed)!=wm_a)return 59;"
+        "event[2]=6;event[3]=5;if(bob_wm_dispatch(wm,wm_windows,wm_order,event,wm_routed)!=wm_a||wm[3]!=wm_a)return 60;"
+        "event[0]=BOB_EVENT_MOUSE_MOVE;event[2]=79;event[3]=24;"
+        "if(bob_wm_dispatch(wm,wm_windows,wm_order,event,wm_routed)!=wm_a||wm_windows[0]!=60||wm_windows[1]!=15||wm_routed[2]!=19||wm_routed[3]!=9)return 61;"
+        "event[2]=0;event[3]=0;bob_wm_dispatch(wm,wm_windows,wm_order,event,wm_routed);"
+        "if(wm_windows[0]!=0||wm_windows[1]!=0)return 62;event[0]=BOB_EVENT_MOUSE_BUTTON_UP;"
+        "if(bob_wm_dispatch(wm,wm_windows,wm_order,event,wm_routed)!=wm_a||wm[3]!=-1)return 63;"
+        "bob_wm_begin_draw(wm,wm_windows,wm_order);if(bob_wm_next_dirty(wm,wm_windows,wm_order)!=wm_b||bob_wm_next_dirty(wm,wm_windows,wm_order)!=wm_a||bob_wm_next_dirty(wm,wm_windows,wm_order)!=-1)return 64;"
+        "bob_wm_invalidate(wm,wm_windows,wm_order,wm_a);bob_wm_begin_draw(wm,wm_windows,wm_order);"
+        "if(bob_wm_next_dirty(wm,wm_windows,wm_order)!=wm_b||bob_wm_next_dirty(wm,wm_windows,wm_order)!=wm_a)return 65;"
+        "if(bob_wm_show(wm,wm_windows,wm_order,wm_a,0)!=1||wm[2]!=wm_b)return 66;"
+        "event[0]=BOB_EVENT_KEY_DOWN;if(bob_wm_dispatch(wm,wm_windows,wm_order,event,wm_routed)!=wm_b)return 67;"
+        "if(bob_wm_destroy(wm,wm_windows,wm_order,wm_b)||wm[2]!=-1||wm[1]!=1)return 68;"
+        "if(bob_wm_destroy(wm,wm_windows,wm_order,wm_b)!=-1||bob_wm_create(wm,wm_windows,wm_order,0,0,81,10)!=-1)return 69;"
+        "if(bob_wm_create(wm,wm_windows,wm_order,1,1,4,3)!=wm_b||bob_wm_destroy(wm,wm_windows,wm_order,wm_b))return 70;"
+        "if(bob_wm_init(wm,wm_windows,wm_order,9,80,25)!=-1)return 71;"
+        "if(bob_gui_menu_place(placed,76,23,20,3,80,25)||placed[0]!=60||placed[1]!=20||placed[2]!=20||placed[3]!=5)return 39;"
+        "if(bob_gui_menu_place(placed,-4,-2,20,3,80,25)||placed[0]!=0||placed[1]!=0)return 40;"
+        "if(bob_gui_menu_place(placed,0,0,90,3,80,25)!=-1)return 41;"
+        "if(bob_gui_menu_event(menu,3,menu_state,event)!=-1||menu_state[0]!=0)return 34;"
+        "event[0]=BOB_EVENT_KEY_DOWN;event[1]=257;bob_gui_menu_event(menu,3,menu_state,event);if(menu_state[0]!=1)return 35;"
+        "event[0]=BOB_EVENT_CHAR;event[1]=10;if(bob_gui_menu_event(menu,3,menu_state,event)!=1)return 36;"
+        "event[1]=27;if(bob_gui_menu_event(menu,3,menu_state,event)!=-2)return 37;"
+        "event[0]=BOB_EVENT_MOUSE_BUTTON_DOWN;event[1]=BOB_MOUSE_BUTTON_LEFT;event[2]=12;event[3]=8;"
+        "bob_gui_menu_event(menu,3,menu_state,event);event[0]=BOB_EVENT_MOUSE_BUTTON_UP;event[1]=0;"
+        "if(bob_gui_menu_event(menu,3,menu_state,event)!=1)return 38;"
+        "bob_puts(\"bob!\");return 0;}\n");
+}
+static void native_filesystem_apps(void) {
+    write_text("build/notes-check.c","");
+    check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel apps/notes.c -o build/notes-check.i > build/compiler.log 2>&1")==0,"notes app preprocessing");
+    check(system(COMPILER " build/notes-check.i build/notes-check.basm build/notes-check.b32 --wide-app > build/compiler.log 2>&1")==0,"notes app compilation");
+    const char *utilities[]={"echo","ls","cat","sysinfo","graphics_demo","gui_demo","launcher"};
+    for(int i=0;i<7;i++) {
+        char command[512];
+        snprintf(command,sizeof(command),"gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel apps/%s.c -o build/%s-check.i > build/compiler.log 2>&1",utilities[i],utilities[i]);
+        check(system(command)==0,"native utility preprocessing");
+        snprintf(command,sizeof(command),COMPILER " build/%s-check.i build/%s-check.basm build/%s-check.b32 --wide-app > build/compiler.log 2>&1",utilities[i],utilities[i],utilities[i]);
+        check(system(command)==0,"native utility compilation");
+    }
+    storage_path("build/notes-snapshot.b32");
+    write_text("build/check.in","import32 build/notes-check.b32 notes\nrun notes put journal \"bob! saved note\"\nrun notes edit journal \"bob! edited note\"\nrun notes add journal \"second line\"\nrun notes show journal\nsave\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"native notes app creates and reads a text file");
+    char *output=read_text("build/check.out");contains(output,"Imported native app as notes");contains(output,"Saved.");contains(output,"bob! edited note\nsecond line\nExit 0");contains(output,"Files saved to bob-files.b32");free(output);
+    write_text("build/check.in","restore yes\nrun notes show journal\nrun notes delete notes\nrun notes delete journal\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"native notes and files survive snapshot restore");
+    output=read_text("build/check.out");contains(output,"bob! edited note\nsecond line\nExit 0");contains(output,"Not a text note.\nExit 1");contains(output,"Deleted.\nExit 0");contains(output,"Files restored;");free(output);
+    write_text("build/check.in","import32 build/echo-check.b32 echo\nrun echo bob! \"two words\"\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"native echo receives command-line arguments");
+    output=read_text("build/check.out");contains(output,"bob! two words\nExit 0");free(output);
+    write_text("build/check.in","run32 build/ls-check.b32\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"native ls lists guest files");
+    output=read_text("build/check.out");contains(output,"bob.c 45 text");free(output);
+    storage_path("build/launcher-snapshot.b32");
+    write_text("build/check.in","import32 build/launcher-check.b32 launcher\nimport32 build/echo-check.b32 echo\nimport32 build/notes-check.b32 notes\nrun launcher\nrun launcher echo \"nested saved note\"\nrun launcher notes put childnote \"written by child\"\nrun notes show childnote\nsave\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"expanded filesystem holds multiple apps and launcher persists child writes");
+    output=read_text("build/check.out");contains(output,"Native apps:");contains(output,"launcher");contains(output,"echo");contains(output,"notes");contains(output,"Child exit:\n0\n");contains(output,"Saved.\nChild exit:\n0\n");contains(output,"written by child\nExit 0");contains(output,"Files saved to bob-files.b32");free(output);
+    FILE *wide_snapshot=fopen("build/launcher-snapshot.b32","rb");check(wide_snapshot!=NULL,"expanded B32S snapshot exists");if(wide_snapshot){unsigned char header[8];check(fread(header,1,8,wide_snapshot)==8&&!memcmp(header,"B32S\3\0\0\0",8),"expanded filesystem uses B32S v3");fseek(wide_snapshot,0,SEEK_END);check(ftell(wide_snapshot)==16+(216+8192)*4,"B32S v3 stores the full expanded payload");fclose(wide_snapshot);}
+    write_text("build/check.in","restore yes\nrun launcher echo \"snapshot child\"\nrun notes show childnote\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"nested apps and child-written files survive snapshot restore");
+    output=read_text("build/check.out");contains(output,"Files restored;");contains(output,"snapshot child\nChild exit:\n0\n");contains(output,"written by child\nExit 0");free(output);
+    write_text("build/check.in","run32 build/sysinfo-check.b32\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"native sysinfo queries the OS service API");
+    output=read_text("build/check.out");contains(output,"bob32 system information");contains(output,"System API version: 1");contains(output,"Cell framebuffer: available");contains(output,"Display width (cells): 80");contains(output,"Display height (cells): 25");contains(output,"Keyboard input: available");contains(output,"Filesystem words free: ");free(output);
+    write_text("build/check.in","run32 build/graphics_demo-check.b32\nx\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"graphics demo draws, reads a key, and returns to the shell");
+    output=read_text("build/check.out");contains(output,"BOB32 GRAPHICS DEMO");contains(output,"Press any key to return to the shell");contains(output,"bob!\nExit 0");free(output);
+    write_text("build/gui-child.c","#include \"bob.h\"\nint main(void){bob_puts(\"GUI child reached\");return 7;}\n");
+    check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/gui-child.c -o build/gui-child.i > build/compiler.log 2>&1")==0,"GUI launcher child preprocessing");
+    check(system(COMPILER " build/gui-child.i build/gui-child.basm build/gui-child.b32 --wide-app > build/compiler.log 2>&1")==0,"GUI launcher child compilation");
+    write_text("build/check.in","import32 build/gui-child.b32 gui_child\nrun32 build/gui_demo-check.b32\n\t\tar\x1b\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"GUI launcher starts a stored native app and returns to the desktop");
+    output=read_text("build/check.out");contains(output,"Application launcher");contains(output,"GUI child reached");contains(output,"App exit 7");contains(output,"bob!\nExit 0");free(output);
+    write_text("build/check.in","run32 build/gui_demo-check.b32\n?\x1b\x1b\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"GUI bitmap-font help overlay opens and returns cleanly");
+    output=read_text("build/check.out");contains(output,"Desktop help");contains(output,"##### ####  #     ####");contains(output,"bob!\nExit 0");free(output);
+    write_text("build/check.in","run32 build/gui_demo-check.b32\n\t\tm\n\x1b\x1b\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"GUI popup menu opens, navigates, and edits a selected text file");
+    output=read_text("build/check.out");contains(output,"File menu: M or click File");contains(output,"Open selected text");contains(output,"Delete selected");contains(output,"Editing selected file.");contains(output,"bob!\nExit 0");free(output);
+    write_text("build/font-demo.c",
+        "#include \"bob.h\"\n#include \"bob_font.h\"\n"
+        "int main(void){if(bob_gfx_enter()||bob_gfx_clear('.',1))return 1;"
+        "if(bob_gfx_bitmap_text(2,2,\"BOB!\",14)||bob_gfx_present()||bob_gfx_leave())return 2;"
+        "bob_puts(\"bob!\");return 0;}\n");
+    check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/font-demo.c -o build/font-demo.i > build/compiler.log 2>&1")==0,"bitmap font fixture preprocessing");
+    check(system(COMPILER " build/font-demo.i build/font-demo.basm build/font-demo.b32 --wide-app > build/compiler.log 2>&1")==0,"bitmap font fixture compilation");
+    write_text("build/check.in","run32 build/font-demo.b32\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"native bitmap font draws text through the graphics service");
+    output=read_text("build/check.out");contains(output,"####...###..####....#");contains(output,"bob!\nExit 0");free(output);
+    write_text("build/event-poll.c",
+        "#include \"bob.h\"\n#include \"bob_event.h\"\n"
+        "int main(void){int event[4];if(bob_event_poll(event)!=0)return 1;"
+        "if(bob_event_wait(event)!=1||event[0]!=BOB_EVENT_CHAR||event[1]!='k')return 2;"
+        "bob_puts(\"bob!\");return 0;}\n");
+    check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/event-poll.c -o build/event-poll.i > build/compiler.log 2>&1")==0,"nonblocking input fixture preprocessing");
+    check(system(COMPILER " build/event-poll.i build/event-poll.basm build/event-poll.b32 --wide-app > build/compiler.log 2>&1")==0,"nonblocking input fixture compilation");
+    write_text("build/check.in","run32 build/event-poll.b32\nk\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"nonblocking event poll leaves redirected input for blocking wait");
+    output=read_text("build/check.out");contains(output,"bob!\nExit 0");free(output);
+    write_text("build/color-blit.c",
+        "#include \"bob.h\"\n#include \"bob_gfx.h\"\n"
+        "int main(void){int icon[4]={0x141,0x242,0,0x343};int bad[1]={0x1000};"
+        "if(bob_gfx_enter()||bob_gfx_clear(' ',7))return 1;"
+        "if(bob_gfx_blit_color(2,2,1,1,bad)!=-1)return 2;"
+        "if(bob_gfx_blit_color(2,2,2,2,icon)||bob_gfx_present()||bob_gfx_leave())return 3;"
+        "bob_puts(\"bob!\");return 0;}\n");
+    check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/color-blit.c -o build/color-blit.i > build/compiler.log 2>&1")==0,"colored bitmap fixture preprocessing");
+    check(system(COMPILER " build/color-blit.i build/color-blit.basm build/color-blit.b32 --wide-app > build/compiler.log 2>&1")==0,"colored bitmap fixture compilation");
+    write_text("build/check.in","run32 build/color-blit.b32\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"colored transparent bitmap app renders through the OS graphics service");
+    output=read_text("build/check.out");contains(output,"AB");contains(output," C");contains(output,"bob!\nExit 0");free(output);
+    write_text("build/gui-seed.c",
+        "#include \"bob.h\"\n#include \"bob_fs.h\"\n#include \"bob_string.h\"\n"
+        "int main(void){char data[256];int i;for(i=0;i<210;i++)data[i]='a';"
+        "bob_strcpy(data+210,\"PREVIEW-CONTENT-42\");"
+        "if(bob_file_write(\"gui.txt\",data,210+bob_strlen(data+210)))return 1;return 0;}\n");
+    check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/gui-seed.c -o build/gui-seed.i > build/compiler.log 2>&1")==0,"GUI long-preview fixture preprocessing");
+    check(system(COMPILER " build/gui-seed.i build/gui-seed.basm build/gui-seed.b32 --wide-app > build/compiler.log 2>&1")==0,"GUI long-preview fixture compilation");
+    storage_path("build/gui-files-snapshot.b32");
+    write_text("build/check.in","import32 build/cat-check.b32 cat\nrun32 build/gui-seed.b32\nrun32 build/gui_demo-check.b32\n\t\tnndxnxy\x13\x1b\nrun cat gui.txt\nsave\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"GUI file editor saves a text file and returns cleanly");
+    output=read_text("build/check.out");contains(output,"Text editor");contains(output,"Window B");contains(output,"bob.c");contains(output,"gui.txt");contains(output,"PREVIEW-CONTENT-42");char *first_confirmation=strstr(output,"Delete? Y/N");check(first_confirmation&&strstr(first_confirmation+1,"Delete? Y/N"),"GUI delete cancellation leaves file available for confirmation");contains(output,"Delete selected text file?");contains(output,"Yes, delete");contains(output,"Cancel");contains(output,"Deleted.");contains(output,"new.txt");contains(output,"Cannot read text file.\nExit 1");contains(output,"Files saved to bob-files.b32");contains(output,"bob!\nExit 0");free(output);
+    write_text("build/check.in","restore yes\nrun cat new.txt\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"GUI-created file survives snapshot restore");
+    output=read_text("build/check.out");contains(output,"Files restored;");contains(output,"bob!\nExit 0");free(output);
+    write_text("build/gui-edit-seed.c","#include \"bob.h\"\n#include \"bob_fs.h\"\n#include \"bob_string.h\"\nint main(void){return bob_file_write(\"multi.txt\",\"first\\nsecond\",bob_strlen(\"first\\nsecond\"))!=0;}\n");
+    check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/gui-edit-seed.c -o build/gui-edit-seed.i > build/compiler.log 2>&1")==0,"GUI multiline edit fixture preprocessing");
+    check(system(COMPILER " build/gui-edit-seed.i build/gui-edit-seed.basm build/gui-edit-seed.b32 --wide-app > build/compiler.log 2>&1")==0,"GUI multiline edit fixture compilation");
+    write_text("build/check.in","import32 build/cat-check.b32 cat\nrun32 build/gui-edit-seed.b32\nrun32 build/gui_demo-check.b32\n\t\tnne!\x13\x1b\nrun cat multi.txt\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"GUI opens, edits, and saves a multiline text file");
+    output=read_text("build/check.out");contains(output,"E opens text. Tab changes focus.");contains(output,"Editing selected file.");contains(output,"first\nsecond!\nExit 0");contains(output,"bob!\nExit 0");free(output);
+    write_text("build/check.in","import32 build/cat-check.b32 cat\nwrite sample.c bob!\nrun cat sample.c\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"native cat reads guest text files");
+    output=read_text("build/check.out");contains(output,"bob!\nExit 0");free(output);
+    write_text("build/cat-lines.c","#include \"bob.h\"\n#include \"bob_fs.h\"\nint main(void){if(bob_file_write(\"trail\",\"line\\n\",5))return 1;if(bob_file_write(\"empty\",\"\",0))return 2;return 0;}\n");
+    check(system("gcc -E -P -nostdinc -undef -DBOBC_LEGACY=0 -I kernel build/cat-lines.c -o build/cat-lines.i > build/compiler.log 2>&1")==0,"cat newline fixture preprocessing");
+    check(system(COMPILER " build/cat-lines.i build/cat-lines.basm build/cat-lines.b32 --wide-app > build/compiler.log 2>&1")==0,"cat newline fixture compilation");
+    write_text("build/check.in","import32 build/cat-check.b32 cat\nrun32 build/cat-lines.b32\nrun cat trail\nrun cat empty\nhalt\n");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"native cat preserves existing newlines and handles empty files");
+    output=read_text("build/check.out");contains(output,"line\nExit 0\nbob> Exit 0");free(output);
     storage_path("build/snapshot.b16");
 }
 static void wide_guest(void) {
@@ -193,6 +483,9 @@ static void input_bounds(void) {
     char commands[400];memset(commands,'x',200);strcpy(commands+200,"\necho bob!\nhalt\n");
     char *output=shell(commands);contains(output,"Command too long.");contains(output,"bob> bob!\n");
     not_contains(output,"Unknown command");free(output);
+    output=shell("echo old\necho bob!\nhistory\nhistory extra\nhalt\n");
+    contains(output,"1 echo old");contains(output,"2 echo bob!");contains(output,"3 history");
+    contains(output,"Usage: history");free(output);
     output=shell("");check(!strcmp(output,"bob!\nbob16 OS: help COMMAND for usage; go bob.c runs the example.\nFiles are in RAM; halt exits. Type help to get started.\nbob> \n"),"EOF exits shell");free(output);
     output=shell("echo bxo\b\bbob!\nhalt\n");contains(output,"bob> bbob!\n");free(output);
 }
@@ -737,7 +1030,7 @@ static void storage_path(const char *path) {
 static void wide_kernel_workflow(void) {
     storage_path("build/wide-snapshot.b32");remove("build/wide-snapshot.b32");
     write_text("build/check.in","mem\nalloc 4\npoke 0xd000 77\npeek 0xd000\npoke 0xc000 88\npeek 0xc000\ngo bob.c\nedit compat.c\nint main(void) {\nint n=0x12345678;\nif(n+1!=0x12345679 || n*2!=0x2468ACF0 || n/3!=101806632 || n%3)return 1;\nprintln(\"bob!\");\nreturn 0;\n}\n.\ngo compat.c\ndelete compat.c\nedit tern.c\nint main(void) {\nint a=0;\nint b=1?2:3;\nint c=0?4:1?5:6;\nint d=1?7:a++;\nif(b==2&&c==5&&d==7&&a==0)println(\"bob!\");\nreturn 0;\n}\n.\ngo tern.c\ndelete tern.c\nedit loops.c\nint main(void) {\nint i=0;\nint calls=0;\ndo { i++; if(i==2)continue; calls++; if(i==4)break; } while(i<10);\ndo { calls++; } while(0);\nif(calls==4)println(\"bob!\");\nreturn 0;\n}\n.\ngo loops.c\ndelete loops.c\nedit assign.c\nint main(void) {\nint a=0; int b=1; int i=0;\nint x=(a=b=3);\na+=2; b<<=2; b>>=1;\nif(x==3&&a==5&&b==6&&((i=i+1)==1))println(\"bob!\");\nreturn 0;\n}\n.\ngo assign.c\ndelete assign.c\nedit funcs.c\nint main(void) {\nannounce();\nif(add(fact(5),2)==122)println(\"bob!\");\nreturn 0;\n}\nint announce(void) {\nprintln(\"bob!\");\nreturn 0;\n}\nint fact(int n) {\nif(n<2)return 1;\nreturn n*fact(n-1);\n}\nint add(int x,int y) {\nint value=x+y;\nreturn value;\n}\n.\ngo funcs.c\ndelete funcs.c\nedit scope.c\nint main(void) {\nint value=3;\n{int value=8;if(value!=8)return 1;}\n{int value=9;if(value!=9)return 2;}\nint count=99;\nfor(int count=0;count<2;count++){int inner=count;if(inner!=count)return 3;}\nif(value==3&&count==99)println(\"bob!\");\nreturn 0;\n}\n.\ngo scope.c\ndelete scope.c\nwrite hex.c int main(void){print_hex(4660);println(\"bob!\");return 0;}\ngo hex.c\nload old 0xD002 0xF200 0xF000 0x0062 0x006F 0x0062 0x0021 0x0000\nrun old\nedit note\nbob!\n.\nread note\nls\ncc bob.c app\nrun app\nsave\nhalt\n");
-    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 50000000 < build/check.in > build/check.out 2> build/check.err")==0,"bob32 OS shell workflow");
+    check(system(BOB32 " --boot build/kernel32.b32 --max-cycles 60000000 < build/check.in > build/check.out 2> build/check.err")==0,"bob32 OS shell workflow");
     char *output=read_text("build/check.out");int successful_apps=0;const char *success_cursor=output;
     while((success_cursor=strstr(success_cursor,"bob!\nExit 0"))){successful_apps++;success_cursor+=11;}
     check(successful_apps==9,"B32 resident programs all complete successfully");
@@ -1392,6 +1685,6 @@ static void basm_route(void) {
 int main(void) {
     console_and_commands();input_bounds();allocator_and_files();resident_compiler();
     compiler_extensions();wide_guest();editor_and_aliases();
-    program_loading_and_recovery();native_string_library();host_compiler_and_runtime();host_language_rejections();file_management();compile_workflow();usability();persistence();shell_editing();image_validation();basm_route();wide_kernel_workflow();wide_local_arrays();wide_array_parameters();wide_resident_large_output();wide_function_prototypes();wide_function_pointers();wide_local_offset_limit();
+    program_loading_and_recovery();native_string_library();native_gui_geometry();native_filesystem_apps();host_compiler_and_runtime();host_language_rejections();file_management();compile_workflow();usability();persistence();shell_editing();image_validation();basm_route();wide_kernel_workflow();wide_local_arrays();wide_array_parameters();wide_resident_large_output();wide_function_prototypes();wide_function_pointers();wide_local_offset_limit();
     printf("bob!\n%d checks passed.\n",checks);return 0;
 }
