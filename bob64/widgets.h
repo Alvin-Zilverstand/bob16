@@ -18,6 +18,12 @@ typedef struct {
     u8 Focused,Dirty;
 } BOB64_TEXT_FIELD;
 
+typedef struct {
+    u32 Selected;
+    s32 Pressed;
+    u8 Open;
+} BOB64_MENU_STATE;
+
 #define BOB64_BUTTON_LEFT 1u
 
 static inline int bob64_rect_contains(const BOB64_RECT *rect,s32 x,s32 y) {
@@ -78,6 +84,86 @@ static inline int bob64_button_draw(BOB64_GFX *graphics,const BOB64_RECT *rect,
     return 0;
 }
 
+/* A bounded popup menu. Returns the chosen item, -2 when dismissed, or -1. */
+static inline int bob64_menu_event(const BOB64_RECT *rect,
+        const char *const *items,u32 count,u32 row_height,
+        BOB64_MENU_STATE *state,const BOB64_EVENT *event) {
+    s32 item=-1;
+    if(!rect||!items||!count||row_height<10||!state||!event||!state->Open)
+        return -1;
+    if(state->Selected>=count)state->Selected=0;
+    if(event->Type==BOB64_EVENT_KEY_DOWN) {
+        if(event->Character==0x1b) {
+            state->Open=0;state->Pressed=-1;return -2;
+        }
+        if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x48)) {
+            if(state->Selected)state->Selected--;
+        } else if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x50)) {
+            if(state->Selected+1<count)state->Selected++;
+        } else if(event->Character=='\n'||event->Character=='\r') {
+            u32 selected=state->Selected;
+            state->Open=0;state->Pressed=-1;return (int)selected;
+        }
+        return -1;
+    }
+    if(event->Type!=BOB64_EVENT_MOUSE_MOVE&&
+       event->Type!=BOB64_EVENT_MOUSE_BUTTON)return -1;
+    if(bob64_rect_contains(rect,event->X,event->Y)) {
+        u64 row_offset=(u64)((s64)event->Y-(s64)rect->Y);
+        u64 row=row_offset/row_height;
+        if(row<count) {state->Selected=row;item=(s32)row;}
+    }
+    if(event->Type==BOB64_EVENT_MOUSE_MOVE)return -1;
+    if(event->Buttons&BOB64_BUTTON_LEFT) {
+        state->Pressed=item;return -1;
+    }
+    if(state->Pressed>=0&&state->Pressed==item) {
+        s32 selected=state->Pressed;
+        state->Open=0;state->Pressed=-1;return selected;
+    }
+    state->Pressed=-1;
+    if(item<0) {state->Open=0;return -2;}
+    return -1;
+}
+
+static inline int bob64_menu_draw(BOB64_GFX *graphics,const BOB64_RECT *rect,
+        const char *const *items,u32 count,u32 row_height,
+        const BOB64_MENU_STATE *state) {
+    if(!graphics||!rect||!items||!count||row_height<10||!state||!state->Open||
+       count>0x7fffffffu/row_height||rect->Height<count*row_height||
+       rect->Width<12||rect->Width>0x7fffffffu||
+       rect->X>0x7fffffff-(s32)(rect->Width-1)||
+       rect->Y>0x7fffffff-(s32)(rect->Height-1)||
+       rect->X<0||rect->Y<0||
+       (u32)rect->X+rect->Width>graphics->Width||
+       (u32)rect->Y+rect->Height>graphics->Height)return -1;
+    bob64_gfx_fill_rect(graphics,rect->X,rect->Y,rect->Width,rect->Height,
+                        0x0009111bu);
+    for(u32 i=0;i<count;i++) {
+        s32 y=rect->Y+(s32)(i*row_height);
+        usize length=0;
+        if(!items[i])return -1;
+        while(length<=(rect->Width-12)/6&&items[i][length])length++;
+        if(items[i][length])return -1;
+        if(i==state->Selected)
+            bob64_gfx_fill_rect(graphics,rect->X+1,y+1,rect->Width-2,
+                                row_height-2,0x00335d8cu);
+        bob64_gfx_text(graphics,rect->X+6,y+(s32)(row_height-7)/2,
+                       items[i],0x00ffffffu,1);
+    }
+    bob64_gfx_line(graphics,rect->X,rect->Y,rect->X+(s32)rect->Width-1,
+                   rect->Y,0x007fa3c4u);
+    bob64_gfx_line(graphics,rect->X,rect->Y+(s32)rect->Height-1,
+                   rect->X+(s32)rect->Width-1,
+                   rect->Y+(s32)rect->Height-1,0x007fa3c4u);
+    bob64_gfx_line(graphics,rect->X,rect->Y,rect->X,
+                   rect->Y+(s32)rect->Height-1,0x007fa3c4u);
+    bob64_gfx_line(graphics,rect->X+(s32)rect->Width-1,rect->Y,
+                   rect->X+(s32)rect->Width-1,
+                   rect->Y+(s32)rect->Height-1,0x007fa3c4u);
+    return 0;
+}
+
 static inline int bob64_text_field_sync(BOB64_TEXT_FIELD *field) {
     usize length=0;
     if(!field||!field->Buffer||!field->Capacity)return -1;
@@ -99,7 +185,7 @@ static inline void bob64_text_field_reveal(BOB64_TEXT_FIELD *field,
     if(!field)return;
     if(!visible_columns)visible_columns=1;
     if(field->Cursor<field->Scroll)field->Scroll=field->Cursor;
-    else if(field->Cursor>=field->Scroll+visible_columns)
+    else if(field->Cursor-field->Scroll>=visible_columns)
         field->Scroll=field->Cursor-visible_columns+1;
 }
 
@@ -112,8 +198,8 @@ static inline int bob64_text_field_event(BOB64_TEXT_FIELD *field,
        (event->Buttons&BOB64_BUTTON_LEFT)) {
         field->Focused=(u8)bob64_rect_contains(rect,event->X,event->Y);
         if(field->Focused) {
-            usize column=event->X>rect->X+3?
-                (usize)(event->X-rect->X-3)/6:0;
+            s64 text_offset=(s64)event->X-(s64)rect->X-3;
+            usize column=text_offset>0?(usize)((u64)text_offset/6):0;
             field->Cursor=field->Scroll+column;
             if(field->Cursor>field->Length)field->Cursor=field->Length;
             return 0;

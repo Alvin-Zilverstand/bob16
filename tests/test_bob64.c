@@ -9,6 +9,12 @@
 #include "../bob64/heap.h"
 #include "../bob64/keyboard.h"
 #include "../bob64/mouse.h"
+#include "../bob64/pci.h"
+#include "../bob64/xhci.h"
+#include "../bob64/usb.h"
+#include "../bob64/block_device.h"
+#include "../bob64/partition.h"
+#include "../bob64/disk_store.h"
 #include "../bob64/window.h"
 #include "../bob64/window_server.h"
 #include "../bob64/editor.h"
@@ -42,7 +48,7 @@ typedef struct {
 } HEAP_TEST_ARENA;
 
 typedef struct {
-    _Alignas(16) u8 Bytes[256*4096];
+    _Alignas(16) u8 Bytes[512*4096];
     usize PagesUsed;
 } HEAP_STRESS_ARENA;
 
@@ -166,6 +172,233 @@ static EFI_STATUS EFIAPI firmware_test_query_variable_info(u32 attributes,
 #define CHECK(expression,message) do { if(!(expression)){fprintf(stderr,"bob64 check failed: %s\n",message);return 1;} } while(0)
 
 typedef struct {
+    u8 Data[16u*512u];
+    u32 Reads,Writes,Flushes;
+} BLOCK_TEST_DISK;
+
+static int block_test_read(void *context,u64 lba,u32 count,void *buffer) {
+    BLOCK_TEST_DISK *disk=(BLOCK_TEST_DISK *)context;
+    usize offset=(usize)lba*512u,length=(usize)count*512u;
+    if(!disk||!buffer||lba>=16u||count>16u-lba)return -1;
+    memcpy(buffer,disk->Data+offset,length);disk->Reads++;return 0;
+}
+
+static int block_test_write(void *context,u64 lba,u32 count,
+                            const void *buffer) {
+    BLOCK_TEST_DISK *disk=(BLOCK_TEST_DISK *)context;
+    usize offset=(usize)lba*512u,length=(usize)count*512u;
+    if(!disk||!buffer||lba>=16u||count>16u-lba)return -1;
+    memcpy(disk->Data+offset,buffer,length);disk->Writes++;return 0;
+}
+
+static int block_test_flush(void *context) {
+    BLOCK_TEST_DISK *disk=(BLOCK_TEST_DISK *)context;
+    if(!disk)return -1;
+    disk->Flushes++;return 0;
+}
+
+static int block_device_tests(void) {
+    BLOCK_TEST_DISK disk={0};
+    BOB64_BLOCK_DEVICE read_only={0},writable={0},invalid={0};
+    u8 source[4096],target[4096];
+    for(u32 i=0;i<sizeof(source);i++)source[i]=(u8)(i*29u+0x73u);
+    CHECK(!bob64_block_device_init(&read_only,&disk,16,512,1,
+          block_test_read,0,0)&&read_only.MaxTransferBlocks==8,
+          "initialize a bounded read-only block device");
+    CHECK(!bob64_block_read(&read_only,0,1,target)&&
+          disk.Reads==1&&memcmp(target,disk.Data,512)==0,
+          "read one sector through the block-device callbacks");
+    CHECK(!bob64_block_read(&read_only,8,8,target)&&disk.Reads==2,
+          "allow a maximum-size transfer ending at the final LBA");
+    CHECK(bob64_block_read(&read_only,16,1,target)<0&&
+          bob64_block_read(&read_only,15,2,target)<0&&
+          bob64_block_read(&read_only,0,9,target)<0&&
+          bob64_block_read(&read_only,0,0,target)<0&&
+          bob64_block_read(&read_only,0,1,0)<0&&disk.Reads==2,
+          "reject out-of-range, oversized, empty, and null-buffer reads before I/O");
+    CHECK(bob64_block_write(&read_only,0,1,source)==-2&&
+          bob64_block_flush(&read_only)==-2&&!disk.Writes&&!disk.Flushes,
+          "enforce read-only policy before write or flush callbacks");
+    CHECK(!bob64_block_device_init(&writable,&disk,16,512,0,
+          block_test_read,block_test_write,block_test_flush)&&
+          !bob64_block_write(&writable,1,8,source)&&disk.Writes==1&&
+          !bob64_block_flush(&writable)&&disk.Flushes==1&&
+          !bob64_block_read(&writable,1,8,target)&&
+          memcmp(source,target,sizeof(source))==0,
+          "write, flush, and read back a bounded block range");
+    CHECK(bob64_block_write(&writable,16,1,source)<0&&
+          bob64_block_write(&writable,15,2,source)<0&&
+          bob64_block_write(&writable,0,9,source)<0&&disk.Writes==1,
+          "reject invalid writes before reaching the device backend");
+    CHECK(bob64_block_device_init(&invalid,&disk,16,8192,1,
+          block_test_read,0,0)<0&&
+          bob64_block_device_init(&invalid,&disk,16,512,0,
+          block_test_read,0,0)<0,
+          "reject oversized sectors and writable devices without a write callback");
+    return 0;
+}
+
+typedef struct {
+    u8 Data[64u*512u];
+    u32 Reads,Writes,Flushes,FailWriteAt;
+} GPT_TEST_DISK;
+
+static int gpt_test_read(void *context,u64 lba,u32 count,void *buffer) {
+    GPT_TEST_DISK *disk=(GPT_TEST_DISK *)context;
+    if(!disk||!buffer||lba>=64u||count>64u-lba)return -1;
+    memcpy(buffer,disk->Data+(usize)lba*512u,(usize)count*512u);
+    disk->Reads++;return 0;
+}
+
+static int gpt_test_write(void *context,u64 lba,u32 count,const void *buffer) {
+    GPT_TEST_DISK *disk=(GPT_TEST_DISK *)context;
+    if(!disk||!buffer||lba>=64u||count>64u-lba)return -1;
+    if(disk->FailWriteAt&&disk->Writes+1u==disk->FailWriteAt)return -2;
+    memcpy(disk->Data+(usize)lba*512u,buffer,(usize)count*512u);
+    disk->Writes++;return 0;
+}
+
+static int gpt_test_flush(void *context) {
+    GPT_TEST_DISK *disk=(GPT_TEST_DISK *)context;
+    if(!disk)return -1;
+    disk->Flushes++;return 0;
+}
+
+static u32 gpt_test_crc32(const u8 *bytes,usize length) {
+    u32 value=0xffffffffu;
+    for(usize i=0;i<length;i++) {
+        value^=bytes[i];
+        for(u32 bit=0;bit<8;bit++)
+            value=(value>>1)^(0xedb88320u&-(value&1u));
+    }
+    return ~value;
+}
+
+static void gpt_test_build(GPT_TEST_DISK *disk) {
+    u8 *header=disk->Data+512u,*entries=disk->Data+1024u;
+    for(u32 i=0;i<8;i++)header[i]=(u8)"EFI PART"[i];
+    firmware_test_write32(header+8,0x00010000u);
+    firmware_test_write32(header+12,92);
+    firmware_test_write64(header+24,1);
+    firmware_test_write64(header+32,63);
+    firmware_test_write64(header+40,34);
+    firmware_test_write64(header+48,62);
+    firmware_test_write64(header+72,2);
+    firmware_test_write32(header+80,4);
+    firmware_test_write32(header+84,128);
+    for(u32 i=0;i<BOB64_GPT_GUID_SIZE;i++)
+        entries[i]=bob64_gpt_bob_data_type_guid[i];
+    for(u32 i=0;i<BOB64_GPT_GUID_SIZE;i++)entries[16u+i]=(u8)(i+1u);
+    firmware_test_write64(entries+32,34);
+    firmware_test_write64(entries+40,50);
+    firmware_test_write32(header+88,gpt_test_crc32(entries,512));
+    firmware_test_write32(header+16,0);
+    firmware_test_write32(header+16,gpt_test_crc32(header,92));
+}
+
+static void gpt_test_rechecksum(GPT_TEST_DISK *disk) {
+    u8 *header=disk->Data+512u;
+    firmware_test_write32(header+88,gpt_test_crc32(disk->Data+1024u,512));
+    firmware_test_write32(header+16,0);
+    firmware_test_write32(header+16,gpt_test_crc32(header,92));
+}
+
+static int partition_tests(void) {
+    GPT_TEST_DISK disk={0};
+    BOB64_BLOCK_DEVICE device={0};
+    BOB64_PARTITION partition={0};
+    u8 unknown_guid[BOB64_GPT_GUID_SIZE]={1};
+    CHECK(!bob64_block_device_init(&device,&disk,64,512,1,gpt_test_read,0,0),
+          "initialize the GPT test disk as read-only");
+    CHECK(bob64_gpt_find_partition(&device,bob64_gpt_bob_data_type_guid,
+          &partition)==1,"ignore an unformatted disk without a GPT signature");
+    gpt_test_build(&disk);
+    int find_result=bob64_gpt_find_partition(&device,
+        bob64_gpt_bob_data_type_guid,&partition);
+    CHECK(!find_result&&partition.FirstLba==34&&partition.BlockCount==17&&
+          !memcmp(partition.TypeGuid,bob64_gpt_bob_data_type_guid,16)&&
+          partition.UniqueGuid[0]==1&&disk.Reads>1,
+          "find the bounded bob64 GPT data partition and verify both CRCs");
+    CHECK(bob64_gpt_find_partition(&device,unknown_guid,&partition)==1,
+          "ignore valid GPT partitions with another type GUID");
+    gpt_test_build(&disk);disk.Data[512u+40u]^=1;
+    CHECK(bob64_gpt_find_partition(&device,bob64_gpt_bob_data_type_guid,
+          &partition)<0,"reject a GPT header with a bad CRC");
+    gpt_test_build(&disk);disk.Data[1024u+127u]^=1;
+    CHECK(bob64_gpt_find_partition(&device,bob64_gpt_bob_data_type_guid,
+          &partition)==-14,"reject a GPT entry array with a bad CRC");
+    gpt_test_build(&disk);firmware_test_write64(disk.Data+1024u+40u,63);
+    gpt_test_rechecksum(&disk);
+    CHECK(bob64_gpt_find_partition(&device,bob64_gpt_bob_data_type_guid,
+          &partition)==-10,"reject partitions outside the usable GPT range");
+    gpt_test_build(&disk);disk.Data[1024u+128u]=0x55;
+    disk.Data[1024u+128u+16u]=1;
+    firmware_test_write64(disk.Data+1024u+128u+32u,45);
+    firmware_test_write64(disk.Data+1024u+128u+40u,55);
+    gpt_test_rechecksum(&disk);
+    CHECK(bob64_gpt_find_partition(&device,bob64_gpt_bob_data_type_guid,
+          &partition)==-15,"reject overlapping GPT partitions");
+    gpt_test_build(&disk);firmware_test_write32(disk.Data+512u+80u,129);
+    firmware_test_write32(disk.Data+512u+16u,0);
+    firmware_test_write32(disk.Data+512u+16u,gpt_test_crc32(disk.Data+512u,92));
+    CHECK(bob64_gpt_find_partition(&device,bob64_gpt_bob_data_type_guid,
+          &partition)==-6,"reject unsupported GPT entry-array sizes");
+    return 0;
+}
+
+static int disk_store_tests(void) {
+    GPT_TEST_DISK disk={0};
+    HEAP_TEST_ARENA arena={0};
+    BOB64_HEAP heap;
+    BOB64_BLOCK_DEVICE device={0};
+    BOB64_PARTITION partition={0};
+    BOB64_FILESYSTEM source,target;
+    const char *contents=0;
+    usize length=0;
+    CHECK(!bob64_heap_init(&heap,sizeof(arena.Bytes),heap_test_grow,&arena)&&
+          !bob64_block_device_init(&device,&disk,64,512,0,gpt_test_read,
+              gpt_test_write,gpt_test_flush)&&
+          !bob64_fs_init(&source,&heap)&&!bob64_fs_init(&target,&heap),
+          "initialize filesystems and a writable partition-backed test device");
+    partition.FirstLba=4;partition.BlockCount=60;
+    for(u32 i=0;i<BOB64_GPT_GUID_SIZE;i++)
+        partition.TypeGuid[i]=bob64_gpt_bob_data_type_guid[i];
+    partition.UniqueGuid[0]=1;
+    CHECK(bob64_disk_store_restore(&device,&partition,&target,&heap)==
+          BOB64_DISK_STORE_NOT_FOUND,
+          "report an empty snapshot partition without modifying the filesystem");
+    CHECK(!bob64_fs_write(&source,"save.txt","version one",11)&&
+          !bob64_disk_store_save(&device,&partition,&source,&heap)&&
+          disk.Flushes==2&&
+          !bob64_fs_write(&source,"save.txt","version two",11)&&
+          !bob64_disk_store_save(&device,&partition,&source,&heap)&&
+          disk.Flushes==4,
+          "commit successive B64S snapshots into alternating flushed slots");
+    disk.Data[35u*512u+BOB64_SNAPSHOT_HEADER_SIZE]^=0x5a;
+    CHECK(!bob64_disk_store_restore(&device,&partition,&target,&heap)&&
+          !bob64_fs_read(&target,"save.txt",&contents,&length)&&length==11&&
+          !memcmp(contents,"version one",11),
+          "fall back to the older valid snapshot when the newest payload is corrupt");
+    CHECK(!bob64_fs_write(&source,"save.txt","version three",13)&&
+          !bob64_disk_store_save(&device,&partition,&source,&heap),
+          "replace the invalid snapshot slot with a new committed generation");
+    CHECK(!bob64_fs_write(&source,"save.txt","version four",12),
+          "prepare new filesystem content for an interrupted save");
+    disk.FailWriteAt=disk.Writes+2u;
+    CHECK(bob64_disk_store_save(&device,&partition,&source,&heap)<0,
+          "report failure when the inactive-slot commit header cannot be written");
+    disk.FailWriteAt=0;
+    CHECK(!bob64_disk_store_restore(&device,&partition,&target,&heap)&&
+          !bob64_fs_read(&target,"save.txt",&contents,&length)&&length==13&&
+          !memcmp(contents,"version three",13),
+          "preserve the previous snapshot across an interrupted slot commit");
+    device.ReadOnly=1;
+    CHECK(bob64_disk_store_save(&device,&partition,&source,&heap)<0,
+          "refuse disk snapshot writes through a read-only block device");
+    return 0;
+}
+
+typedef struct {
     u64 Base;
     usize Used;
     usize Capacity;
@@ -207,7 +440,11 @@ static int execute_compiled_main(const BOB64_EXEC_IMAGE *image,s64 *result) {
 static int libc_tests(void) {
     char source[]="bob64!",copy[16],overlap[12]="0123456789";
     static const char expected[]="0101234567";
-    u8 fill[4];
+    char text[32]="",padded[8],truncated[3],reverse[]="bob";
+    char haystack[]="bob64 kernel",empty_needle[]="";
+    char formatted[96],small_output[5],one_byte_output[1],bad_format[8],
+         minimum_integer[32];
+    u8 fill[4],high_bytes[]={0x80,0,0xff};
     CHECK(bob64_memcpy(copy,source,sizeof(source))==copy&&
           bob64_memcmp(copy,source,sizeof(source))==0,
           "copy and compare native application memory");
@@ -221,6 +458,59 @@ static int libc_tests(void) {
           bob64_strcmp("bob64!","bob64!")==0&&bob64_strcmp("a","b")<0&&
           bob64_strcmp("b","a")>0,
           "measure and compare NUL-terminated strings");
+    CHECK(bob64_memchr(source,'6',sizeof(source))==source+3&&
+          bob64_memchr(high_bytes,0xff,sizeof(high_bytes))==high_bytes+2&&
+          !bob64_memchr(source,'x',sizeof(source))&&
+          bob64_strnlen("bob",2)==2&&bob64_strnlen("bob",8)==3,
+          "search byte ranges and measure bounded strings");
+    CHECK(bob64_strncmp("bob64!","bob",3)==0&&
+          bob64_strncmp("bob","bob64!",5)<0&&
+          bob64_strncmp("\xff","\1",1)>0&&
+          bob64_strncmp("a","b",0)==0,
+          "compare bounded strings with unsigned-byte ordering");
+    CHECK(bob64_strcpy(text,"bob")==text&&
+          bob64_strcat(text,"64!")==text&&!bob64_strcmp(text,"bob64!")&&
+          bob64_strncat(text,"ignored",0)==text&&!bob64_strcmp(text,"bob64!")&&
+          bob64_strncat(text,"xyz",2)==text&&!bob64_strcmp(text,"bob64!xy"),
+          "copy and append complete or bounded strings");
+    CHECK(bob64_strncpy(padded,"xy",sizeof(padded))==padded&&
+          padded[0]=='x'&&padded[1]=='y'&&padded[2]==0&&padded[7]==0&&
+          bob64_strncpy(truncated,"long",sizeof(truncated))==truncated&&
+          !bob64_memcmp(truncated,"lon",sizeof(truncated)),
+          "copy bounded strings with padding and no forced terminator");
+    CHECK(bob64_strchr(source,'6')==source+3&&
+          bob64_strchr(source,0)==source+sizeof(source)-1&&
+          !bob64_strchr(source,'x')&&bob64_strrchr(reverse,'b')==reverse+2&&
+          bob64_strrchr(reverse,0)==reverse+3,
+          "find first and last character occurrences including NUL");
+    CHECK(bob64_strstr(haystack,"64 k")==haystack+3&&
+          bob64_strstr(haystack,"missing")==0&&
+          bob64_strstr(haystack,empty_needle)==haystack,
+          "find bounded substrings and handle the empty needle");
+    static const char format_expected[]="bob!:-0007:0x2a:3:te  :%";
+    CHECK(bob64_snprintf(formatted,sizeof(formatted),
+          "%s:%+05d:%#llx:%zu:%-4.2s:%%","bob!",-7,
+          (unsigned long long)42,(usize)3,"text")==
+          (int)(sizeof(format_expected)-1)&&
+          !bob64_strcmp(formatted,format_expected),
+          "format strings, signed values, widths, precision, and LLP64 sizes");
+    CHECK(bob64_snprintf(minimum_integer,sizeof(minimum_integer),"%lld",
+          (long long)(-9223372036854775807LL-1))==20&&
+          !bob64_strcmp(minimum_integer,"-9223372036854775808")&&
+          bob64_snprintf(small_output,sizeof(small_output),"%s","bob64!")==6&&
+          !bob64_strcmp(small_output,"bob6")&&
+          bob64_snprintf(one_byte_output,sizeof(one_byte_output),"bob!")==4&&
+          !one_byte_output[0]&&
+          bob64_snprintf(0,0,"abc")==3,
+          "format minimum signed 64-bit values and safely truncate output");
+    CHECK(bob64_snprintf(formatted,sizeof(formatted),
+          "%#06o:%#.0x:%*.*s:%p",8u,0u,-5,2,"hello",
+          (void *)(uintptr_t)0x123456789abcULL)==28&&
+          !bob64_strcmp(formatted,"000010::he   :0x123456789abc"),
+          "format alternate bases, zero precision, star widths, and 64-bit pointers");
+    CHECK(bob64_snprintf(bad_format,sizeof(bad_format),"%f",1.0)==-1&&
+          bad_format[0]==0,
+          "reject unsupported floating-point format specifiers cleanly");
     return 0;
 }
 
@@ -389,6 +679,14 @@ static int compiler_arithmetic_tests(void) {
     static const char unsigned_division_source[]=
         "usize main(void) { usize value=0x100000001ULL; "
         "return value / 10 + value % 10; }";
+    static const char unsigned_long_long_source[]=
+        "typedef unsigned long long uint64_value; "
+        "uint64_value add(uint64_value value, unsigned long long int amount) { "
+        "return value + amount; } "
+        "int main(void) { uint64_value value=0xffffffffffffffffULL; "
+        "if(sizeof(unsigned long long)!=8 || sizeof(unsigned long long int)!=8 || "
+        "add(value, 1ULL)!=0 || !(value > 0x7fffffffffffffffULL)) return -1; "
+        "return 42; }";
     static const char bitwise_source[]=
         "int main(void) { usize value=0x100000001ULL; "
         "if ((value >> 32) != 1 || (value & 15) != 1 || "
@@ -397,6 +695,43 @@ static int compiler_arithmetic_tests(void) {
         "((-8 >> 2) != -2) || (2 == 1 < 3) || "
         "!(value >= 0x100000001ULL && value <= 0x100000001ULL)) "
         "return -1; return 1; }";
+    static const char sizeof_source[]=
+        "typedef long long wide_t; "
+        "struct SizeProbe { char tag; long value; long long wide; }; "
+        "int main(void) { "
+        "if(sizeof(char)!=1 || sizeof(short)!=2 || sizeof(int)!=4 || "
+        "sizeof(long)!=4 || sizeof(long long)!=8 || sizeof(usize)!=8 || "
+        "sizeof(void *)!=8 || sizeof(char *)!=8 || sizeof(int *)!=8 || "
+        "sizeof(wide_t)!=8 || "
+        "sizeof(int[3])!=12 || sizeof(short[5])!=10 || "
+        "sizeof(usize[2])!=16 || sizeof(struct SizeProbe)!=16) return -1; "
+        "return 42; }";
+    static const char sizeof_expression_source[]=
+        "int calls=0; int side_effect(void) { calls=calls+1; return 42; } "
+        "int main(void) { int value=42; int *pointer=&value; int values[3]; "
+        "if(sizeof(value)!=4 || sizeof(pointer)!=8 || sizeof(values)!=12 || "
+        "sizeof(values[0])!=4 || sizeof(\"bob!\")!=5 || "
+        "sizeof(side_effect())!=4 || calls!=0) return -1; return 42; }";
+    static const char void_pointer_source[]=
+        "void *identity(int, void *); "
+        "void *identity(int tag, void *value) { int *typed=value; "
+        "if(tag!=7) *typed=-1; return value; } "
+        "int main(void) { int number=42; void *opaque=&number; "
+        "int *typed=identity(7,opaque); if(opaque!=typed) return -1; "
+        "return *typed; }";
+    static const char void_pointer_dereference_source[]=
+        "int main(void) { int number=42; void *opaque=&number; "
+        "return *opaque; }";
+    static const char void_pointer_arithmetic_source[]=
+        "int main(void) { int number=42; void *opaque=&number; "
+        "opaque=opaque+1; return 0; }";
+    static const char cast_source[]=
+        "int scalar=42; int main(void) { uintptr_t raw=(uintptr_t)&scalar; "
+        "void *opaque=(void *)raw; int *typed=(int *)opaque; "
+        "long long wide=(long long)typed; int *again=(int *)wide; "
+        "short narrowed=(short)0x11234; short negative=(short)0xffff; "
+        "int narrowed_int=(int)0x10000002aULL; char letter=(char)0x142; "
+        "return *again+narrowed+negative+narrowed_int+letter; }";
     u8 file[BOB64_COMPILER_IMAGE_LIMIT];usize length,error_offset;
     BOB64_EXEC_IMAGE image;
     CHECK(!bob64_compile_c(source,sizeof(source)-1,file,sizeof(file),&length,
@@ -432,10 +767,55 @@ static int compiler_arithmetic_tests(void) {
               &error_offset)&&!bob64_exec_parse(file,length,&image)&&
           !execute_compiled_main(&image,&result)&&result==429496736LL,
           "execute unsigned division and remainder without truncating high bits");
+    CHECK(!bob64_compile_c(unsigned_long_long_source,
+              sizeof(unsigned_long_long_source)-1,file,sizeof(file),&length,
+              &error_offset)&&!bob64_exec_parse(file,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==42,
+          "compile and execute unsigned long long aliases, calls, width, and high-bit comparisons");
     CHECK(!bob64_compile_c(bitwise_source,sizeof(bitwise_source)-1,file,
           sizeof(file),&length,&error_offset)&&!bob64_exec_parse(file,length,&image)&&
           !execute_compiled_main(&image,&result)&&result==1,
           "execute C bitwise precedence, 64-bit shifts, and signed right shift");
+    CHECK(!bob64_compile_c(sizeof_source,sizeof(sizeof_source)-1,file,sizeof(file),
+          &length,&error_offset)&&!bob64_exec_parse(file,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==42,
+          "execute sizeof for LLP64 scalars, 64-bit pointers, arrays, typedefs, and structs");
+    CHECK(!bob64_compile_c(sizeof_expression_source,
+          sizeof(sizeof_expression_source)-1,file,sizeof(file),&length,
+          &error_offset)&&!bob64_exec_parse(file,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==42,
+          "execute sizeof expressions without evaluating calls or decaying arrays");
+    int void_pointer_compile_status=bob64_compile_c(void_pointer_source,
+          sizeof(void_pointer_source)-1,file,sizeof(file),&length,&error_offset);
+    int void_pointer_parse_status=void_pointer_compile_status?1:
+          bob64_exec_parse(file,length,&image);
+    int void_pointer_execute_status=void_pointer_parse_status?1:
+          execute_compiled_main(&image,&result);
+    if(void_pointer_compile_status||void_pointer_parse_status||
+       void_pointer_execute_status||result!=42)
+        fprintf(stderr,"void pointer statuses compile=%d parse=%d execute=%d result=%lld offset=%zu\n",
+          void_pointer_compile_status,void_pointer_parse_status,
+          void_pointer_execute_status,(long long)result,error_offset);
+    CHECK(!void_pointer_compile_status&&!void_pointer_parse_status&&
+          !void_pointer_execute_status&&result==42,
+          "execute opaque 64-bit void pointers through assignment, calls, returns, and typed conversion");
+    int cast_compile=bob64_compile_c(cast_source,sizeof(cast_source)-1,file,
+                                     sizeof(file),&length,&error_offset);
+    int cast_parse=cast_compile?1:bob64_exec_parse(file,length,&image);
+    int cast_execute=cast_parse?1:execute_compiled_main(&image,&result);
+    if(cast_compile||cast_parse||cast_execute||result!=4809)
+        fprintf(stderr,"cast statuses compile=%d parse=%d execute=%d result=%lld offset=%zu\n",
+                cast_compile,cast_parse,cast_execute,(long long)result,error_offset);
+    CHECK(!cast_compile&&!cast_parse&&!cast_execute&&result==4809,
+          "execute explicit LLP64 scalar and 64-bit pointer casts");
+    CHECK(bob64_compile_c(void_pointer_dereference_source,
+          sizeof(void_pointer_dereference_source)-1,file,sizeof(file),&length,
+          &error_offset)!=0,
+          "reject dereferencing an opaque void pointer");
+    CHECK(bob64_compile_c(void_pointer_arithmetic_source,
+          sizeof(void_pointer_arithmetic_source)-1,file,sizeof(file),&length,
+          &error_offset)!=0,
+          "reject arithmetic on an opaque void pointer");
     return 0;
 }
 
@@ -456,6 +836,35 @@ static int compiler_local_tests(void) {
     s64 result=0;
     CHECK(!execute_compiled_main(&image,&result)&&result==0x300000009LL,
           "execute generated local loads/stores and the 64-bit function frame");
+    static const char delayed_initialization_source[]=
+        "int main(void) { char c; short s; long n; long long wide; usize bits; "
+        "int values[2]; char *text; c = 'b'; s = 2; n = 4; "
+        "wide = 0x100000003ULL; bits = (usize)wide; values[0] = 20; "
+        "values[1] = s; text = \"bob!\"; "
+        "return values[0] + values[1] + c + (int)(bits >> 32) + text[0] + n; }";
+    CHECK(!bob64_compile_c(delayed_initialization_source,
+          sizeof(delayed_initialization_source)-1,file,sizeof(file),&length,
+          &error_offset)&&!bob64_exec_parse(file,length,&image),
+          "compile uninitialized scalar and pointer locals before assignment");
+    CHECK(!execute_compiled_main(&image,&result)&&result==223,
+          "execute delayed assignments to char, short, long, wide, pointer, and array locals");
+    static const char increment_source[]=
+        "int main(void) { int i = 4; int old = i++; int newest = ++i; "
+        "int down = i--; ++i; short s = 1; int old_s = s++; ++s; "
+        "char c = 127; int wrapped = ++c; int values[3] = {10, 20, 30}; "
+        "int *p = values; int *old_p = p++; int total = 0; "
+        "for (int j = 3; j > 0; j--) total = total + values[j - 1]; "
+        "int *high = (int *)(usize)0x100000000ULL; int *high_old = high++; "
+        "if (down != 6 || i != 6 || old != 4 || newest != 6 || s != 3 || "
+        "old_s != 1 || wrapped != -128 || c != -128 || old_p[0] != 10 || "
+        "p[0] != 20 || total != 60 || (usize)high != 0x100000004ULL || "
+        "(usize)high_old != 0x100000000ULL) return 1; "
+        "return i + old + newest + s + old_s + total + old_p[0] + p[0] + (p - values); }";
+    CHECK(!bob64_compile_c(increment_source,sizeof(increment_source)-1,file,
+          sizeof(file),&length,&error_offset)&&!bob64_exec_parse(file,length,&image),
+          "compile prefix/postfix increment and decrement with scalar and pointer operands");
+    CHECK(!execute_compiled_main(&image,&result)&&result==111,
+          "execute C increment semantics, scaled pointer steps above 4 GiB, and decrementing for loops");
     static const char string_pointer_source[]=
         "int main(void) { char *text = \"bob!\"; return length(text); } "
         "int length(char *text) { int n = 0; "
@@ -546,6 +955,18 @@ static int compiler_local_tests(void) {
           !bob64_exec_parse(file,length,&image)&&
           !execute_compiled_main(&image,&result)&&result=='O'+42+'g',
           "initialize global pointers to arrays and strings without fixed-address relocations");
+    static const char global_void_pointer_source[]=
+        "int scalar=42; int values[2]={40,2}; "
+        "void *scalar_address=&scalar; void *array_address=values; "
+        "void *string_address=\"bob!\"; "
+        "int main(void) { int *scalar_pointer=scalar_address; "
+        "int *array_pointer=array_address; char *string_pointer=string_address; "
+        "return *scalar_pointer+array_pointer[1]+string_pointer[0]; }";
+    CHECK(!bob64_compile_c(global_void_pointer_source,
+          sizeof(global_void_pointer_source)-1,file,sizeof(file),&length,
+          &error_offset)&&!bob64_exec_parse(file,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==42+2+'b',
+          "initialize global void pointers to scalar objects, arrays, and strings");
     static const char struct_member_source[]=
         "struct Record { int value; char mark; long long count; char *text; }; "
         "struct Record shared; "
@@ -670,6 +1091,18 @@ static int compiler_local_tests(void) {
           "compile int-pointer difference as an element count");
     CHECK(!execute_compiled_main(&image,&result)&&result==2,
           "execute pointer difference in int elements");
+    static const char high_pointer_arithmetic_source[]=
+        "long long main(void) { uintptr_t base = 0x1234567887654320ULL; "
+        "int *pointer = (int *)base; "
+        "uintptr_t advanced = (uintptr_t)(pointer + 3); "
+        "return (long long)(advanced - base) - 12; }";
+    CHECK(!bob64_compile_c(high_pointer_arithmetic_source,
+                           sizeof(high_pointer_arithmetic_source)-1,file,
+                           sizeof(file),&length,&error_offset)&&
+          !bob64_exec_parse(file,length,&image),
+          "compile scaled pointer arithmetic from an address above 4 GiB");
+    CHECK(!execute_compiled_main(&image,&result)&&result==0,
+          "preserve all high address bits in pointer addition and integer casts");
     static const char array_initializer_source[]=
         "int main(void) { int seed = 40; int values[4] = {seed, 2,}; "
         "return values[0] + values[1] + values[2] + values[3]; }";
@@ -898,6 +1331,20 @@ static int compiler_local_tests(void) {
           "compile a pointer passed in the fifth argument slot");
     CHECK(!execute_compiled_main(&image,&result)&&result==42,
           "preserve a 64-bit pointer through stack argument passing");
+    static const char mixed_stack_pointer_source[]=
+        "int main(void) { int values[2]={40,2}; void *opaque=values; "
+        "return inspect(1,2,3,4,values,5,"
+        "identity(1,2,3,4,opaque,42),6); } "
+        "void *identity(int a,int b,int c,int d,void *value,int tag) { "
+        "int *typed=value; if(a+b+c+d!=10||tag!=42) typed[0]=-1; "
+        "return value; } "
+        "int inspect(int a,int b,int c,int d,int *direct,int e,void *opaque,int f) { "
+        "int *converted=opaque; return direct[0]+converted[1]+a+b+c+d+e+f; }";
+    CHECK(!bob64_compile_c(mixed_stack_pointer_source,
+          sizeof(mixed_stack_pointer_source)-1,file,sizeof(file),&length,
+          &error_offset)&&!bob64_exec_parse(file,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==63,
+          "execute mixed register/stack pointer arguments across a nested call");
     static const char bad_call_arity[]=
         "int main(void) { return add(1); } "
         "int add(int left, int right) { return left + right; }";
@@ -953,6 +1400,146 @@ static int compiler_local_tests(void) {
     CHECK(!execute_compiled_main(&image,&result),
           "execute nested loop control flow");
     CHECK(result==4,"route break and continue to the nearest nested loop");
+    static const char do_while_source[]=
+        "int main(void) { int count = 0; do { count = count + 1; } "
+        "while (0); return count; }";
+    CHECK(!bob64_compile_c(do_while_source,sizeof(do_while_source)-1,file,
+                           sizeof(file),&length,&error_offset)&&
+          !bob64_exec_parse(file,length,&image),
+          "compile a do-while loop with a false first condition");
+    CHECK(!execute_compiled_main(&image,&result)&&result==1,
+          "execute a do-while body at least once");
+    static const char do_while_continue_source[]=
+        "int main(void) { int count = 0; int total = 0; do { "
+        "count = count + 1; if (count == 2) continue; "
+        "total = total + count; } while (count < 4); return total; }";
+    CHECK(!bob64_compile_c(do_while_continue_source,
+          sizeof(do_while_continue_source)-1,file,sizeof(file),&length,
+          &error_offset)&&!bob64_exec_parse(file,length,&image),
+          "compile continue in do-while condition flow");
+    CHECK(!execute_compiled_main(&image,&result)&&result==8,
+          "route do-while continue through the loop condition");
+    static const char switch_fallthrough_source[]=
+        "int main(void) { int value = 2; int total = 0; switch (value) { "
+        "case 1: total = 10; break; case 2: total = 20; "
+        "case 3: total = total + 3; break; default: total = 99; } "
+        "return total; }";
+    CHECK(!bob64_compile_c(switch_fallthrough_source,
+          sizeof(switch_fallthrough_source)-1,file,sizeof(file),&length,
+          &error_offset)&&!bob64_exec_parse(file,length,&image),
+          "compile switch cases, default, fallthrough, and break");
+    CHECK(!execute_compiled_main(&image,&result)&&result==23,
+          "dispatch to the matching case and preserve lexical fallthrough");
+    static const char switch_signed_source[]=
+        "int main(void) { int value = -1; int total = 0; switch (value) { "
+        "case 1: total = 1; break; case -1: total = 42; break; "
+        "default: total = 0; } return total; }";
+    int switch_signed_compile=bob64_compile_c(switch_signed_source,
+          sizeof(switch_signed_source)-1,file,sizeof(file),&length,&error_offset);
+    CHECK(!switch_signed_compile&&
+          !bob64_exec_parse(file,length,&image),
+          "compile signed switch values and negative case constants");
+    CHECK(!execute_compiled_main(&image,&result)&&result==42,
+          "sign-extend signed switch values and match negative case constants");
+    static const char switch_character_source[]=
+        "int main(void) { char value = 'B'; int result = 0; switch (value) { "
+        "case 'A': result = 1; break; case 'B': result = 42; break; "
+        "default: result = 0; } return result; }";
+    CHECK(!bob64_compile_c(switch_character_source,
+          sizeof(switch_character_source)-1,file,sizeof(file),&length,
+          &error_offset)&&!bob64_exec_parse(file,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==42,
+          "dispatch signed char values using character case constants");
+    static const char enum_switch_source[]=
+        "enum Color { RED, GREEN = 4, BLUE, }; typedef enum Color Color; "
+        "int choose(Color color) { switch (color) { case RED: return 1; "
+        "case BLUE: return 42; default: return 0; } return 0; } "
+        "int main(void) { enum Color first = GREEN; Color second = BLUE; "
+        "return choose(second) + first; }";
+    CHECK(!bob64_compile_c(enum_switch_source,sizeof(enum_switch_source)-1,
+          file,sizeof(file),&length,&error_offset)&&
+          !bob64_exec_parse(file,length,&image),
+          "compile named enums, implicit values, typedefs, and enum switch labels");
+    CHECK(!execute_compiled_main(&image,&result)&&result==46,
+          "execute enum constants as values and dispatch enum switch cases");
+    static const char enum_global_initializer_source[]=
+        "enum Color { RED, GREEN = 4, BLUE }; enum Color selected = BLUE; "
+        "int palette[2] = { GREEN, BLUE }; "
+        "int main(void) { return selected + palette[0] + palette[1]; }";
+    CHECK(!bob64_compile_c(enum_global_initializer_source,
+          sizeof(enum_global_initializer_source)-1,file,sizeof(file),&length,
+          &error_offset)&&!bob64_exec_parse(file,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==14,
+          "initialize global enum scalars and arrays with enum constants");
+    static const char duplicate_enum_value_source[]=
+        "enum Bad { SAME, SAME }; int main(void) { return SAME; }";
+    CHECK(bob64_compile_c(duplicate_enum_value_source,
+          sizeof(duplicate_enum_value_source)-1,file,sizeof(file),&length,
+          &error_offset),"reject duplicate enum constant identifiers");
+    static const char unknown_enum_tag_source[]=
+        "enum Missing value; int main(void) { return 0; }";
+    CHECK(bob64_compile_c(unknown_enum_tag_source,
+          sizeof(unknown_enum_tag_source)-1,file,sizeof(file),&length,
+          &error_offset),"reject use of an undeclared enum tag");
+    static const char switch_wide_source[]=
+        "int main(void) { long long value = 0x100000001ULL; int result = 0; "
+        "switch (value) { case 1: result = 1; break; "
+        "case 0x100000001ULL: result = 42; break; "
+        "default: result = 0; } return result; }";
+    CHECK(!bob64_compile_c(switch_wide_source,sizeof(switch_wide_source)-1,
+          file,sizeof(file),&length,&error_offset)&&
+          !bob64_exec_parse(file,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==42,
+          "preserve 64-bit values when dispatching switch cases above 4 GiB");
+    static const char switch_continue_source[]=
+        "int main(void) { int total = 0; for (int i = 0; i < 5; i++) { "
+        "switch (i) { case 2: continue; case 4: break; "
+        "default: total = total + i; } total = total + 10; } return total; }";
+    CHECK(!bob64_compile_c(switch_continue_source,
+          sizeof(switch_continue_source)-1,file,sizeof(file),&length,
+          &error_offset)&&!bob64_exec_parse(file,length,&image),
+          "compile switch continue and break nested inside a for loop");
+    CHECK(!execute_compiled_main(&image,&result)&&result==44,
+          "continue skips the loop body while switch break exits only the switch");
+    static const char switch_nested_break_source[]=
+        "int main(void) { int i = 0; int total = 0; while (i < 3) { i++; "
+        "switch (i) { case 1: switch (i) { case 1: total = total + 2; "
+        "break; default: total = 99; } total = total + 3; break; "
+        "case 2: total = total + 5; break; default: break; } "
+        "total = total + 1; } return total; }";
+    CHECK(!bob64_compile_c(switch_nested_break_source,
+          sizeof(switch_nested_break_source)-1,file,sizeof(file),&length,
+          &error_offset)&&!bob64_exec_parse(file,length,&image),
+          "compile nested switches and loops with nearest-break semantics");
+    CHECK(!execute_compiled_main(&image,&result)&&result==13,
+          "route nested switch and loop breaks to their own continuations");
+    static const char duplicate_switch_case_source[]=
+        "int main(void) { switch (1) { case 1: break; case 1: break; } return 0; }";
+    CHECK(bob64_compile_c(duplicate_switch_case_source,
+          sizeof(duplicate_switch_case_source)-1,file,sizeof(file),&length,
+          &error_offset),"reject duplicate switch case values");
+    static const char switch_continue_outside_loop_source[]=
+        "int main(void) { switch (1) { case 1: continue; } return 0; }";
+    CHECK(bob64_compile_c(switch_continue_outside_loop_source,
+          sizeof(switch_continue_outside_loop_source)-1,file,sizeof(file),
+          &length,&error_offset),"reject continue outside a loop inside switch");
+    static const char nested_do_while_source[]=
+        "int main(void) { int outer = 0; int total = 0; do { outer = outer + 1; "
+        "int inner = 0; do { inner = inner + 1; if (inner == 2) continue; "
+        "if (outer == 2) break; total = total + 1; } while (inner < 3); "
+        "} while (outer < 3); return total; }";
+    CHECK(!bob64_compile_c(nested_do_while_source,
+          sizeof(nested_do_while_source)-1,file,sizeof(file),&length,
+          &error_offset)&&!bob64_exec_parse(file,length,&image),
+          "compile nested do-while loops with local break/continue targets");
+    CHECK(!execute_compiled_main(&image,&result)&&result==4,
+          "route nested do-while break and continue to the correct loop");
+    static const char missing_do_while_semicolon[]=
+        "int main(void) { int count = 0; do { count = count + 1; } "
+        "while (count < 2) return count; }";
+    CHECK(bob64_compile_c(missing_do_while_semicolon,
+          sizeof(missing_do_while_semicolon)-1,file,sizeof(file),&length,
+          &error_offset),"reject a do-while loop without its trailing semicolon");
     static const char early_return_source[]=
         "int main(void) { return absolute(-42); } "
         "int absolute(int value) { if (value < 0) return -value; return value; }";
@@ -1257,6 +1844,26 @@ static int paging_tests(void) {
           "reuse a virtual page after removing its previous mapping");
     CHECK(bob64_page_map(&table,0x0000000100000000ULL,0x1000,0)==
           BOB64_PAGING_ALREADY_MAPPED,"reject accidental remapping");
+    CHECK(bob64_page_map_range(&table,0x6000,0x8000,0x4000,0)==
+          BOB64_PAGING_ALREADY_MAPPED&&
+          bob64_page_translate(&table,0x6000,&physical,&flags)==0&&
+          bob64_page_translate(&table,0x8000,&physical,&flags)==0&&
+          bob64_page_translate(&table,0x9000,&physical,&flags)==1&&
+          physical==0xb000,
+          "roll back new page mappings when a later range page collides");
+    CHECK(!bob64_page_map(&table,0x1fd000,0xc000,0)&&
+          !bob64_page_unmap(&table,0x1fd000,0,0),
+          "prepare an empty page-table branch for an allocation-failure rollback");
+    usize saved_table_capacity=storage.Capacity;
+    storage.Capacity=storage.Used;
+    int allocation_rollback_result=bob64_page_map_range(&table,0x1fe000,
+        0x8000,0x3000,0);
+    storage.Capacity=saved_table_capacity;
+    CHECK(allocation_rollback_result==BOB64_PAGING_NO_MEMORY&&
+          bob64_page_translate(&table,0x1fe000,&physical,&flags)==0&&
+          bob64_page_translate(&table,0x1ff000,&physical,&flags)==0&&
+          bob64_page_translate(&table,0x200000,&physical,&flags)==0,
+          "roll back a range when page-table allocation fails after earlier pages map");
     CHECK(!bob64_page_map_range(&table,0x400123,0x500123,0x2200,
                                 BOB64_PAGE_WRITE|BOB64_PAGE_NX),
           "identity-map a byte range spanning partial first and last pages");
@@ -1417,6 +2024,7 @@ static int descriptor_tests(void) {
     BOB64_TSS tss;
     BOB64_IDT_GATE idt[BOB64_IDT_ENTRIES];
     BOB64_DESCRIPTOR_TABLE_POINTER pointer;
+    BOB64_INTERRUPT_FRAME interrupt_frame={0};
     const u64 handler=0x1234567887654321ULL;
     CHECK(!bob64_tss_init(&tss,0x1234567887654000ULL)&&tss.Rsp0==0x1234567887654000ULL&&
           tss.IoMapBase==sizeof(tss)&&tss.Reserved0==0&&
@@ -1429,6 +2037,17 @@ static int descriptor_tests(void) {
           tss.Rsp0==0xabcdef0087654000ULL,
           "switch the TSS privilege stack without truncating its 64-bit address");
     CHECK(!bob64_tss_init(&tss,0x1234567887654000ULL),"restore a valid TSS after bad input");
+    interrupt_frame.CS=BOB64_GDT_KERNEL_CODE_SELECTOR;
+    CHECK(bob64_interrupt_frame_rsp(&interrupt_frame)==
+          (u64)(uintptr_t)&interrupt_frame+
+              __builtin_offsetof(BOB64_INTERRUPT_FRAME,UserRSP),
+          "derive interrupted kernel RSP from the same-privilege exception frame");
+    interrupt_frame.CS=BOB64_GDT_USER_CODE_SELECTOR;
+    interrupt_frame.UserRSP=0x123456789abcdef0ULL;
+    interrupt_frame.UserSS=BOB64_GDT_USER_DATA_SELECTOR;
+    CHECK(bob64_interrupt_frame_rsp(&interrupt_frame)==0x123456789abcdef0ULL&&
+          interrupt_frame.UserSS==BOB64_GDT_USER_DATA_SELECTOR,
+          "preserve the full user RSP and SS from a privilege-change exception frame");
     bob64_gdt_init(gdt,&pointer,&tss);
     CHECK(gdt[0]==0&&gdt[1]==0x00af9a000000ffffULL&&
           gdt[2]==0x00cf92000000ffffULL&&gdt[3]==0x00cff2000000ffffULL&&
@@ -1476,6 +2095,9 @@ static int descriptor_tests(void) {
     CHECK(idt[0x80].OffsetLow==(u16)(uintptr_t)bob64_syscall_entry&&
           idt[0x80].TypeAttributes==0xee,
           "install the user-callable DPL3 syscall gate");
+    CHECK(idt[0x24].OffsetLow==(u16)(uintptr_t)bob64_irq4_entry&&
+          idt[0x24].TypeAttributes==0x8e,
+          "install the kernel-only COM1 serial IRQ gate");
     CHECK(idt[0x21].OffsetLow==(u16)(uintptr_t)bob64_irq1_entry&&
           idt[0x21].TypeAttributes==0x8e,
           "install the kernel-only keyboard IRQ gate");
@@ -1804,6 +2426,9 @@ static int syscall_tests(void) {
     if(bob64_syscall_dispatch(&frame)!=0||frame.RAX!=0x100000123ULL)return -1;
     frame.RAX=BOB64_SYSCALL_SEEK_HANDLE;frame.RCX=stream_handle;frame.RDX=2;
     if(bob64_syscall_dispatch(&frame)!=0||frame.RAX!=2)return -1;
+    frame.RAX=BOB64_SYSCALL_SEEK_HANDLE;frame.RCX=stream_handle;
+    frame.RDX=0x8000000000000000ULL;
+    if(bob64_syscall_dispatch(&frame)!=0||(s64)frame.RAX!=-22)return -1;
     frame.RAX=BOB64_SYSCALL_WRITE_HANDLE;frame.RCX=stream_handle;
     frame.RDX=first+48;frame.R8=2;
     if(bob64_syscall_dispatch(&frame)!=0||frame.RAX!=2||
@@ -2117,7 +2742,7 @@ static int heap_test_shrink(void *context,void *region,usize region_size) {
 
 static int heap_stress_grow(void *context,void **region,usize *region_size) {
     HEAP_STRESS_ARENA *arena=(HEAP_STRESS_ARENA *)context;
-    if(arena->PagesUsed>=128)return 0;
+    if(arena->PagesUsed>=256)return 0;
     *region=arena->Bytes+arena->PagesUsed*4096;
     *region_size=4096;
     arena->PagesUsed++;
@@ -2294,7 +2919,7 @@ static int snapshot_tests(void) {
 
 static int firmware_store_tests(void) {
     static HEAP_STRESS_ARENA arena;
-    static u8 large_payload[40000];
+    static u8 large_payload[100000];
     BOB64_HEAP heap;
     BOB64_FILESYSTEM source,target;
     EFI_RUNTIME_SERVICES services={0};
@@ -2306,6 +2931,7 @@ static int firmware_store_tests(void) {
     static const CHAR16 manifest_a[]={'B','o','b','6','4','S','l','o','t','A',0};
     static const CHAR16 manifest_b[]={'B','o','b','6','4','S','l','o','t','B',0};
     static const CHAR16 chunk_a0[]={'B','o','b','6','4','D','a','t','a','A','0',0};
+    static const CHAR16 chunk_a3[]={'B','o','b','6','4','D','a','t','a','A','3',0};
     static const CHAR16 chunk_b0[]={'B','o','b','6','4','D','a','t','a','B','0',0};
     memset(firmware_test_variables,0,sizeof(firmware_test_variables));
     firmware_test_query_unsupported=0;
@@ -2361,10 +2987,11 @@ static int firmware_store_tests(void) {
               large_snapshot_size,&firmware_status,&maximum_variable_size,
               &remaining_storage_size)&&firmware_status==EFI_SUCCESS&&
           firmware_test_find(manifest_a)>=0&&firmware_test_find(chunk_a0)>=0&&
+          firmware_test_find(chunk_a3)>=0&&
           !bob64_firmware_snapshot_restore(&services,&target)&&
           !bob64_fs_read(&target,"large.bin",&contents,&length)&&
           length==sizeof(large_payload)&&!memcmp(contents,large_payload,length),
-          "split a large snapshot across EFI variables and restore every chunk");
+          "split a 100 KiB B64S snapshot across at least four EFI variables and restore every chunk");
     bob64_heap_free(&heap,large_snapshot);
     CHECK(!bob64_fs_write(&target,"keep.txt","still here",10),
           "seed live state before testing active-slot fallback");
@@ -2727,6 +3354,388 @@ static int executable_tests(void) {
     return 0;
 }
 
+static int serial_input_tests(void) {
+    u8 character=0;
+    bob64_serial_irq_reset();
+    CHECK(bob64_serial_irq_pop(&character)<0,
+          "report an empty COM1 receive queue");
+    for(u32 i=0;i<128;i++)
+        CHECK(!bob64_serial_irq_capture((u8)i),
+              "enqueue COM1 input from its interrupt producer");
+    CHECK(bob64_serial_irq_capture(0xff)<0,
+          "drop new COM1 input when the bounded receive queue is full");
+    for(u32 i=0;i<128;i++)
+        CHECK(!bob64_serial_irq_pop(&character)&&character==(u8)i,
+              "consume COM1 input in FIFO order");
+    CHECK(bob64_serial_irq_pop(&character)<0,
+          "drain the COM1 receive queue completely");
+    CHECK(!bob64_serial_irq_capture('b')&&!bob64_serial_irq_pop(&character)&&
+          character=='b'&&!bob64_serial_irq_capture('o')&&
+          !bob64_serial_irq_pop(&character)&&character=='o',
+          "reuse wrapped COM1 queue slots after draining");
+    return 0;
+}
+
+typedef struct {
+    u8 Bus,Device,Function;
+    u32 Config[16];
+} PCI_TEST_FUNCTION;
+
+typedef struct {
+    PCI_TEST_FUNCTION Functions[4];
+    u32 FunctionCount;
+    BOB64_PCI_DEVICE Devices[8];
+    u32 DeviceCount;
+} PCI_TEST_CONTEXT;
+
+static int pci_test_read(void *opaque,u8 bus,u8 device,u8 function,
+                         u8 offset,u32 *value) {
+    PCI_TEST_CONTEXT *context=(PCI_TEST_CONTEXT *)opaque;
+    if(!context||!value||(offset&3u)||offset>0x3cu)return -1;
+    *value=0xffffffffu;
+    for(u32 i=0;i<context->FunctionCount;i++) {
+        PCI_TEST_FUNCTION *entry=&context->Functions[i];
+        if(entry->Bus==bus&&entry->Device==device&&entry->Function==function) {
+            *value=entry->Config[offset/4];break;
+        }
+    }
+    return 0;
+}
+
+static void pci_test_visit(void *opaque,const BOB64_PCI_DEVICE *device) {
+    PCI_TEST_CONTEXT *context=(PCI_TEST_CONTEXT *)opaque;
+    if(context->DeviceCount<8)
+        context->Devices[context->DeviceCount++]=*device;
+}
+
+static void pci_test_store32(u8 *bytes,u32 offset,u32 value) {
+    for(u32 i=0;i<4;i++)bytes[offset+i]=(u8)(value>>(i*8));
+}
+
+static int pci_tests(void) {
+    PCI_TEST_CONTEXT context={0};
+    u32 count=0;
+    PCI_TEST_FUNCTION *ethernet=&context.Functions[context.FunctionCount++];
+    ethernet->Bus=0;ethernet->Device=1;
+    ethernet->Config[0]=0x100e8086u;
+    ethernet->Config[2]=0x02000001u;
+    PCI_TEST_FUNCTION *bridge=&context.Functions[context.FunctionCount++];
+    bridge->Bus=0;bridge->Device=2;
+    bridge->Config[0]=0x244e8086u;
+    bridge->Config[2]=0x06040000u;
+    bridge->Config[3]=1u<<16;
+    bridge->Config[6]=0x00020200u;
+    PCI_TEST_FUNCTION *xhci=&context.Functions[context.FunctionCount++];
+    xhci->Bus=2;xhci->Device=5;
+    xhci->Config[0]=0x1e318086u;
+    xhci->Config[2]=0x0c033001u;
+    xhci->Config[4]=0x80000004u;
+    xhci->Config[5]=0x000000feu;
+    xhci->Config[6]=0x0000c001u;
+    xhci->Config[8]=0xfebc0000u;
+    CHECK(!bob64_pci_enumerate(pci_test_read,&context,pci_test_visit,
+                               &context,&count)&&count==3&&
+          context.DeviceCount==3,
+          "enumerate PCI functions across secondary buses behind bridges");
+    CHECK(context.Devices[0].VendorId==0x8086&&
+          context.Devices[0].ClassCode==0x02&&
+          context.Devices[1].ClassCode==0x06&&
+          context.Devices[2].Bus==2&&context.Devices[2].Device==5&&
+          bob64_pci_is_usb_controller(&context.Devices[2])&&
+          bob64_pci_is_xhci_controller(&context.Devices[2]),
+          "decode PCI IDs and identify xHCI USB host controllers");
+    CHECK(context.Devices[2].BarValid[0]&&!context.Devices[2].BarIsIo[0]&&
+          context.Devices[2].Bar[0]==0x000000fe80000000ULL&&
+          context.Devices[2].BarValid[2]&&context.Devices[2].BarIsIo[2]&&
+          context.Devices[2].Bar[2]==0xc000&&
+          context.Devices[2].BarValid[4]&&!context.Devices[2].BarIsIo[4]&&
+          context.Devices[2].Bar[4]==0xfebc0000u,
+          "decode 64-bit memory, 32-bit memory, and I/O BAR addresses");
+    CHECK(bob64_pci_enumerate(0,0,0,0,&count)<0&&
+          bob64_pci_enumerate(pci_test_read,&context,0,0,0)<0,
+          "reject incomplete PCI enumerator arguments");
+    u8 xhci_registers[32]={0};
+    BOB64_XHCI_CAPABILITIES capabilities={0};
+    xhci_registers[0]=0x20;xhci_registers[2]=0;xhci_registers[3]=1;
+    pci_test_store32(xhci_registers,4,32u|(8u<<8)|(8u<<24));
+    pci_test_store32(xhci_registers,0x08,(2u<<27)|(3u<<21));
+    pci_test_store32(xhci_registers,0x10,1u);
+    pci_test_store32(xhci_registers,0x14,0x103u);
+    pci_test_store32(xhci_registers,0x18,0x21fu);
+    CHECK(!bob64_xhci_parse_capabilities(xhci_registers,
+              sizeof(xhci_registers),&capabilities)&&
+          capabilities.Version==0x0100&&capabilities.CapabilityLength==0x20&&
+          capabilities.MaxSlots==32&&capabilities.MaxInterrupters==8&&
+          capabilities.MaxPorts==8&&capabilities.HccParameters1==1&&
+          capabilities.HcsParameters2==((2u<<27)|(3u<<21))&&
+          capabilities.MaxScratchpadBuffers==67&&
+          capabilities.DoorbellOffset==0x100&&
+          capabilities.RuntimeOffset==0x200,
+          "parse xHCI version, controller limits, and register offsets");
+    xhci_registers[0]=0x10;
+    CHECK(bob64_xhci_parse_capabilities(xhci_registers,
+              sizeof(xhci_registers),&capabilities)<0,
+          "reject malformed xHCI capability lengths");
+    CHECK(bob64_usb_control_setup(0xa3,0,0,4,4)==0x00040004000000a3ULL&&
+          bob64_usb_control_setup(0x23,3,8,3,0)==0x0000000300080323ULL,
+          "pack USB hub port-status and port-power setup requests little-endian");
+    u8 keyboard_configuration[]={
+        9,2,34,0,1,1,0,50,0,
+        9,4,0,0,1,3,1,1,0,
+        9,0x21,0x11,0x01,0,1,0x22,63,0,
+        7,5,0x81,3,8,0,10
+    };
+    BOB64_USB_HID_BOOT_KEYBOARD keyboard={0};
+    BOB64_USB_HID_BOOT_DEVICE usb_mouse={0};
+    CHECK(!bob64_usb_find_hid_boot_keyboard(keyboard_configuration,
+              sizeof(keyboard_configuration),&keyboard)&&
+          keyboard.ConfigurationValue==1&&keyboard.InterfaceNumber==0&&
+          keyboard.AlternateSetting==0&&keyboard.InterfaceProtocol==1&&
+          keyboard.EndpointAddress==0x81&&
+          keyboard.EndpointAttributes==3&&
+          keyboard.EndpointMaxPacketSize==8&&keyboard.EndpointInterval==10,
+          "find a HID boot-keyboard interrupt-IN endpoint");
+    keyboard_configuration[16]=2;keyboard_configuration[31]=3;
+    CHECK(!bob64_usb_find_hid_boot_mouse(keyboard_configuration,
+              sizeof(keyboard_configuration),&usb_mouse)&&
+          usb_mouse.InterfaceProtocol==2&&usb_mouse.EndpointAddress==0x81&&
+          usb_mouse.EndpointMaxPacketSize==3,
+          "find a HID boot-mouse interface and interrupt-IN endpoint");
+    keyboard_configuration[31]=2;
+    CHECK(bob64_usb_find_hid_boot_mouse(keyboard_configuration,
+              sizeof(keyboard_configuration),&usb_mouse)==1,
+          "ignore USB mouse endpoints too small for the three-byte boot report");
+    keyboard_configuration[31]=8;keyboard_configuration[16]=1;
+    keyboard_configuration[30]=0x02;
+    CHECK(bob64_usb_find_hid_boot_keyboard(keyboard_configuration,
+              sizeof(keyboard_configuration),&keyboard)==1,
+          "ignore a non-interrupt HID keyboard endpoint");
+    keyboard_configuration[30]=0x03;keyboard_configuration[31]=7;
+    CHECK(bob64_usb_find_hid_boot_keyboard(keyboard_configuration,
+              sizeof(keyboard_configuration),&keyboard)==1,
+          "ignore HID keyboard endpoints too small for an eight-byte boot report");
+    keyboard_configuration[31]=8;
+    keyboard_configuration[27]=0;
+    CHECK(bob64_usb_find_hid_boot_keyboard(keyboard_configuration,
+              sizeof(keyboard_configuration),&keyboard)<0,
+          "reject malformed USB configuration descriptor bounds");
+    u8 storage_configuration[]={
+        9,2,32,0,1,2,0,0x80,50,
+        9,4,3,0,2,8,6,0x50,0,
+        7,5,0x02,2,0x00,0x02,0,
+        7,5,0x81,2,0x00,0x02,0
+    };
+    BOB64_USB_MASS_STORAGE storage={0};
+    CHECK(!bob64_usb_find_mass_storage(storage_configuration,
+              sizeof(storage_configuration),&storage)&&
+          storage.ConfigurationValue==2&&storage.InterfaceNumber==3&&
+          storage.AlternateSetting==0&&storage.BulkOutEndpoint==2&&
+          storage.BulkInEndpoint==0x81&&
+          storage.BulkOutMaxPacketSize==512&&
+          storage.BulkInMaxPacketSize==512,
+          "find USB SCSI Bulk-Only storage interfaces and bulk endpoints");
+    storage_configuration[16]=0x62;
+    CHECK(bob64_usb_find_mass_storage(storage_configuration,
+              sizeof(storage_configuration),&storage)==1,
+          "ignore USB storage interfaces with a non-Bulk-Only protocol");
+    storage_configuration[16]=0x50;
+    storage_configuration[27]=0x01;
+    CHECK(bob64_usb_find_mass_storage(storage_configuration,
+              sizeof(storage_configuration),&storage)==1,
+          "ignore USB storage configurations without a bulk-IN endpoint");
+    storage_configuration[27]=0x81;
+    storage_configuration[25]=1;
+    CHECK(bob64_usb_find_mass_storage(storage_configuration,
+              sizeof(storage_configuration),&storage)<0,
+          "reject malformed USB mass-storage endpoint descriptors");
+    u8 msc_cbw[BOB64_USB_MSC_CBW_SIZE],capacity_cdb[10]={0x25};
+    u8 msc_csw[BOB64_USB_MSC_CSW_SIZE]={0x55,0x53,0x42,0x53,
+        0x78,0x56,0x34,0x12,0x08,0,0,0,0};
+    u32 msc_residue=0xffffffffu;
+    u8 msc_status=0xff;
+    CHECK(!bob64_usb_msc_build_cbw(msc_cbw,sizeof(msc_cbw),0x12345678u,
+              0x10203040u,1,2,capacity_cdb,sizeof(capacity_cdb))&&
+          msc_cbw[0]=='U'&&msc_cbw[1]=='S'&&msc_cbw[2]=='B'&&
+          msc_cbw[3]=='C'&&msc_cbw[4]==0x78&&msc_cbw[7]==0x12&&
+          msc_cbw[8]==0x40&&msc_cbw[11]==0x10&&msc_cbw[12]==0x80&&
+          msc_cbw[13]==2&&msc_cbw[14]==10&&msc_cbw[15]==0x25&&
+          msc_cbw[25]==0,
+          "encode a USB Mass Storage BOT command block with 64-bit-safe fields");
+    CHECK(!bob64_usb_msc_parse_csw(msc_csw,sizeof(msc_csw),0x12345678u,
+              0x10203040u,&msc_residue,&msc_status)&&msc_residue==8&&
+          msc_status==0,
+          "validate a matching BOT command status and transfer residue");
+    msc_residue=0xabcdef01u;msc_status=0x7f;
+    CHECK(bob64_usb_msc_parse_csw(msc_csw,sizeof(msc_csw),7,
+              0x10203040u,&msc_residue,&msc_status)<0&&
+          msc_residue==0xabcdef01u&&msc_status==0x7f&&
+          bob64_usb_msc_parse_csw(msc_csw,12,0x12345678u,
+              0x10203040u,&msc_residue,&msc_status)<0,
+          "reject mismatched or truncated BOT status without changing outputs");
+    msc_csw[8]=0x41;msc_csw[9]=0x30;msc_csw[10]=0x20;msc_csw[11]=0x10;
+    CHECK(bob64_usb_msc_parse_csw(msc_csw,sizeof(msc_csw),0x12345678u,
+              0x10203040u,&msc_residue,&msc_status)<0,
+          "reject BOT status residues larger than the requested transfer");
+    msc_csw[8]=0;msc_csw[9]=0;msc_csw[10]=0;msc_csw[11]=0;msc_csw[12]=3;
+    CHECK(bob64_usb_msc_parse_csw(msc_csw,sizeof(msc_csw),0x12345678u,
+              0x10203040u,&msc_residue,&msc_status)<0&&
+          bob64_usb_msc_build_cbw(msc_cbw,30,0x12345678u,0,0,0,
+              capacity_cdb,sizeof(capacity_cdb))<0,
+          "reject invalid BOT status codes and undersized command buffers");
+    u8 rw_cdb[16],rw_cdb_length=0;
+    CHECK(!bob64_scsi_build_read_write_cdb(0x12345678u,3,0,rw_cdb,
+              &rw_cdb_length)&&rw_cdb_length==10&&rw_cdb[0]==0x28&&
+          rw_cdb[2]==0x12&&rw_cdb[5]==0x78&&rw_cdb[8]==3&&
+          !bob64_scsi_build_read_write_cdb(0x100000000ULL,3,1,rw_cdb,
+              &rw_cdb_length)&&rw_cdb_length==16&&rw_cdb[0]==0x8a&&
+          rw_cdb[5]==1&&rw_cdb[9]==0&&rw_cdb[13]==3,
+          "encode SCSI 10-byte and 16-byte reads and writes across the 32-bit LBA boundary");
+    CHECK(!bob64_scsi_build_read_write_cdb(0xffffffffULL,2,0,rw_cdb,
+              &rw_cdb_length)&&rw_cdb_length==16&&rw_cdb[0]==0x88&&
+          bob64_scsi_build_read_write_cdb(0,0,0,rw_cdb,&rw_cdb_length)<0&&
+          bob64_scsi_build_read_write_cdb(~(u64)0,2,0,rw_cdb,
+              &rw_cdb_length)<0,
+          "select 16-byte SCSI commands when a range crosses 4 GiB and reject invalid ranges");
+    u8 capacity10_response[8]={0xff,0xff,0xff,0xff,0,0,2,0};
+    u8 capacity16_response[32]={0,0,0,1,0,0,0,0,0,0,2,0};
+    u8 capacity16_cdb[16];u64 capacity_blocks=0;u32 capacity_block_size=0;
+    int needs_capacity16=0;
+    CHECK(!bob64_scsi_parse_read_capacity10(capacity10_response,8,
+              &capacity_blocks,&capacity_block_size,&needs_capacity16)&&
+          needs_capacity16&&capacity_blocks==0&&capacity_block_size==512&&
+          !bob64_scsi_build_read_capacity16_cdb(capacity16_cdb)&&
+          capacity16_cdb[0]==0x9e&&capacity16_cdb[1]==0x10&&
+          capacity16_cdb[13]==32&&
+          !bob64_scsi_parse_read_capacity16(capacity16_response,32,
+              &capacity_blocks,&capacity_block_size)&&
+          capacity_blocks==0x100000001ULL&&capacity_block_size==512,
+          "probe and parse SCSI READ CAPACITY(16) for disks larger than 2 TiB");
+    u8 hub_descriptor[]={9,0x29,2,0x09,0x00,5,25,0x05,0x03};
+    BOB64_USB_HUB_DESCRIPTOR hub={0};
+    CHECK(!bob64_usb_parse_hub_descriptor(hub_descriptor,
+              sizeof(hub_descriptor),&hub)&&hub.PortCount==2&&
+          hub.Characteristics==9&&hub.PowerOnToGood==5&&
+          hub.ControllerCurrent==25&&hub.DeviceRemovable[0]==5&&
+          hub.PortPowerControlMask[0]==3,
+          "parse USB 2 hub characteristics and port bitmaps");
+    u8 eight_port_hub_descriptor[]={10,0x29,8,0x0a,0,0,1,0,0,0xff};
+    CHECK(!bob64_usb_parse_hub_descriptor(eight_port_hub_descriptor,
+              sizeof(eight_port_hub_descriptor),&hub)&&hub.PortCount==8&&
+          hub.DeviceRemovable[1]==0&&
+          hub.PortPowerControlMask[0]==0xff,
+          "parse distinct removable and power-mask bitmap sizes for eight ports");
+    u8 largest_hub_descriptor[39]={39,0x29,127,0x34,0x12,10,50};
+    largest_hub_descriptor[22]=0xa5;
+    largest_hub_descriptor[38]=0x5a;
+    CHECK(!bob64_usb_parse_hub_descriptor(largest_hub_descriptor,
+              sizeof(largest_hub_descriptor),&hub)&&hub.PortCount==127&&
+          hub.DeviceRemovable[15]==0xa5&&
+          hub.PortPowerControlMask[15]==0x5a,
+          "parse the maximum supported USB hub port bitmap");
+    hub_descriptor[1]=2;
+    CHECK(bob64_usb_parse_hub_descriptor(hub_descriptor,
+              sizeof(hub_descriptor),&hub)<0,
+          "reject a non-hub USB descriptor");
+    hub_descriptor[1]=0x29;hub_descriptor[2]=0;
+    CHECK(bob64_usb_parse_hub_descriptor(hub_descriptor,
+              sizeof(hub_descriptor),&hub)<0,
+          "reject a USB hub with no ports");
+    hub_descriptor[2]=3;hub_descriptor[0]=8;
+    CHECK(bob64_usb_parse_hub_descriptor(hub_descriptor,
+              sizeof(hub_descriptor),&hub)<0,
+          "reject a USB hub descriptor truncated before both bitmaps");
+    hub_descriptor[0]=9;hub_descriptor[2]=2;
+    CHECK(bob64_usb_parse_hub_descriptor(hub_descriptor,8,&hub)<0&&
+          bob64_usb_parse_hub_descriptor(hub_descriptor,
+              sizeof(hub_descriptor),0)<0,
+          "reject truncated hub input and missing parser output");
+    u8 hub_configuration[]={
+        9,2,25,0,1,1,0,0x80,50,
+        9,4,0,0,1,9,0,0,0,
+        7,5,0x81,3,1,0,12
+    };
+    BOB64_USB_HUB_INTERFACE hub_interface={0};
+    CHECK(!bob64_usb_find_hub_interface(hub_configuration,
+              sizeof(hub_configuration),&hub_interface)&&
+          hub_interface.ConfigurationValue==1&&
+          hub_interface.InterfaceNumber==0&&
+          hub_interface.EndpointAddress==0x81&&
+          hub_interface.EndpointAttributes==3&&
+          hub_interface.EndpointMaxPacketSize==1&&
+          hub_interface.EndpointInterval==12,
+          "find the hub-class interface status interrupt endpoint");
+    hub_configuration[21]=2;
+    CHECK(bob64_usb_find_hub_interface(hub_configuration,
+              sizeof(hub_configuration),&hub_interface)==1,
+          "ignore hub interfaces without an interrupt-IN status endpoint");
+    hub_configuration[21]=3;hub_configuration[18]=6;
+    CHECK(bob64_usb_find_hub_interface(hub_configuration,
+              sizeof(hub_configuration),&hub_interface)<0,
+          "reject malformed hub endpoint descriptors");
+    u32 route=0;
+    CHECK(!bob64_usb_route_string_append(0,0,3,&route)&&route==3&&
+          !bob64_usb_route_string_append(route,1,7,&route)&&route==0x73&&
+          !bob64_usb_route_string_append(route,2,16,&route)&&route==0xf73&&
+          bob64_usb_route_string_append(route,3,0,&route)<0&&
+          bob64_usb_route_string_append(0,5,1,&route)<0&&
+          bob64_usb_route_string_append(0x10,1,1,&route)<0,
+          "append validated USB port hops to five-level xHCI route strings");
+    return 0;
+}
+
+typedef struct {
+    u32 Command,Status;
+    int ResetCompletes;
+} XHCI_TEST_REGISTERS;
+
+static int xhci_test_read(void *opaque,u32 offset,u32 *value) {
+    XHCI_TEST_REGISTERS *registers=(XHCI_TEST_REGISTERS *)opaque;
+    if(!registers||!value)return -1;
+    if(offset==0)*value=registers->Command;
+    else if(offset==4)*value=registers->Status;
+    else return -1;
+    return 0;
+}
+
+static int xhci_test_write(void *opaque,u32 offset,u32 value) {
+    XHCI_TEST_REGISTERS *registers=(XHCI_TEST_REGISTERS *)opaque;
+    if(!registers||offset)return -1;
+    registers->Command=value;
+    if(value&BOB64_XHCI_USBCMD_RESET) {
+        if(registers->ResetCompletes) {
+            registers->Command&=~BOB64_XHCI_USBCMD_RESET;
+            registers->Status=BOB64_XHCI_USBSTS_HALTED;
+        }
+    } else if(value&BOB64_XHCI_USBCMD_RUN)
+        registers->Status&=~BOB64_XHCI_USBSTS_HALTED;
+    else registers->Status|=BOB64_XHCI_USBSTS_HALTED;
+    return 0;
+}
+
+static int xhci_tests(void) {
+    XHCI_TEST_REGISTERS registers={BOB64_XHCI_USBCMD_RUN,0,1};
+    u32 final_status=0;
+    CHECK(!bob64_xhci_halt_reset(xhci_test_read,xhci_test_write,&registers,
+              8,&final_status)&&
+          !(registers.Command&(BOB64_XHCI_USBCMD_RUN|
+                               BOB64_XHCI_USBCMD_RESET))&&
+          (final_status&BOB64_XHCI_USBSTS_HALTED),
+          "halt a running xHCI controller and wait for reset completion");
+    registers=(XHCI_TEST_REGISTERS){0,BOB64_XHCI_USBSTS_HALTED,1};
+    CHECK(!bob64_xhci_halt_reset(xhci_test_read,xhci_test_write,&registers,
+              8,&final_status),
+          "reset an xHCI controller that is already halted");
+    registers=(XHCI_TEST_REGISTERS){0,BOB64_XHCI_USBSTS_HALTED,0};
+    CHECK(bob64_xhci_halt_reset(xhci_test_read,xhci_test_write,&registers,
+              3,&final_status)==-2,
+          "time out when an xHCI controller does not finish reset");
+    registers=(XHCI_TEST_REGISTERS){0,BOB64_XHCI_USBSTS_NOT_READY,1};
+    CHECK(bob64_xhci_halt_reset(xhci_test_read,xhci_test_write,&registers,
+              3,&final_status)==-2,
+          "wait for xHCI controller-not-ready state to clear");
+    return 0;
+}
+
 static int keyboard_tests(void) {
     BOB64_KEYBOARD_STATE state={0};
     BOB64_EVENT event;
@@ -2802,6 +3811,65 @@ static int keyboard_tests(void) {
           !bob64_keyboard_irq_pop_event(&event)&&event.Character=='a',
           "drop new keyboard events when the IRQ queue is full");
     bob64_keyboard_irq_set_active(0);
+    bob64_keyboard_reset();bob64_keyboard_irq_set_active(1);
+    u8 hid_report[8]={0,0,4,0,0,0,0,0};
+    CHECK(!bob64_keyboard_hid_report(hid_report)&&
+          !bob64_keyboard_irq_pop_event(&event)&&
+          event.Type==BOB64_EVENT_KEY_DOWN&&event.Key==0x1e&&
+          event.Character=='a',
+          "translate a USB HID boot report into the shared lowercase key event");
+    hid_report[0]=2;hid_report[2]=0;
+    CHECK(!bob64_keyboard_hid_report(hid_report)&&
+          !bob64_keyboard_irq_pop_event(&event)&&event.Key==0x2a&&
+          event.Type==BOB64_EVENT_KEY_DOWN&&
+          !bob64_keyboard_irq_pop_event(&event)&&event.Key==0x1e&&
+          event.Type==BOB64_EVENT_KEY_UP,
+          "translate USB modifier changes and release a held key");
+    hid_report[2]=4;
+    CHECK(!bob64_keyboard_hid_report(hid_report)&&
+          !bob64_keyboard_irq_pop_event(&event)&&event.Key==0x1e&&
+          event.Type==BOB64_EVENT_KEY_DOWN&&event.Character=='A',
+          "translate USB modifier state before producing shifted text");
+    hid_report[0]=0;hid_report[2]=0;
+    CHECK(!bob64_keyboard_hid_report(hid_report)&&
+          !bob64_keyboard_irq_pop_event(&event)&&event.Key==0x2a&&
+          event.Type==BOB64_EVENT_KEY_UP&&
+          !bob64_keyboard_irq_pop_event(&event)&&event.Key==0x1e&&
+          event.Type==BOB64_EVENT_KEY_UP,
+          "emit USB modifier and key releases through the shared event queue");
+    hid_report[2]=1;
+    CHECK(bob64_keyboard_hid_report(hid_report)<0&&
+          bob64_keyboard_irq_pop_event(&event)<0,
+          "ignore USB HID rollover reports without fabricating releases");
+    bob64_keyboard_reset();bob64_keyboard_irq_set_active(0);
+    {
+        BOB64_KEYBOARD_HID_STATE first_keyboard={0},second_keyboard={0};
+        u8 first_report[8]={0,0,4,0,0,0,0,0};
+        u8 second_report[8]={0,0,5,0,0,0,0,0};
+        u8 empty_report[8]={0};
+        bob64_keyboard_reset();bob64_keyboard_irq_set_active(1);
+        CHECK(!bob64_keyboard_hid_report_device(&first_keyboard,first_report)&&
+              !bob64_keyboard_irq_pop_event(&event)&&event.Key==0x1e&&
+              event.Type==BOB64_EVENT_KEY_DOWN&&event.Character=='a',
+              "translate a key held on the first independent USB keyboard");
+        CHECK(!bob64_keyboard_hid_report_device(&second_keyboard,second_report)&&
+              !bob64_keyboard_irq_pop_event(&event)&&event.Key==0x30&&
+              event.Type==BOB64_EVENT_KEY_DOWN&&event.Character=='b',
+              "preserve separate held-key state for a second USB keyboard");
+        CHECK(!bob64_keyboard_hid_report_device(&first_keyboard,empty_report)&&
+              !bob64_keyboard_irq_pop_event(&event)&&event.Key==0x1e&&
+              event.Type==BOB64_EVENT_KEY_UP&&
+              !bob64_keyboard_hid_report_device(&second_keyboard,empty_report)&&
+              !bob64_keyboard_irq_pop_event(&event)&&event.Key==0x30&&
+              event.Type==BOB64_EVENT_KEY_UP,
+              "release keys independently when multiple USB keyboards are attached");
+        bob64_keyboard_reset();bob64_keyboard_irq_set_active(0);
+    }
+    hid_report[0]=0;hid_report[2]=4;
+    CHECK(!bob64_keyboard_hid_report(hid_report)&&
+          bob64_keyboard_poll()=='a',
+          "deliver queued USB keyboard text while PS/2 input is polling-only");
+    bob64_keyboard_irq_set_active(0);
     return 0;
 }
 
@@ -2859,6 +3927,64 @@ static int mouse_tests(void) {
           "decode extended mouse buttons alongside wheel movement");
     CHECK(!bob64_mouse_irq_queue_init(100,80),
           "initialize the IRQ mouse packet decoder and event queue");
+    CHECK(!bob64_mouse_usb_report(0,4,3,0)&&
+          !bob64_mouse_poll_event(&event)&&
+          event.Type==BOB64_EVENT_MOUSE_MOVE&&event.X==54&&event.Y==43&&
+          event.DeltaX==4&&event.DeltaY==3,
+          "route USB mouse movement through the shared pointer event queue");
+    CHECK(!bob64_mouse_usb_report(1,0,0,0)&&
+          !bob64_mouse_poll_event(&event)&&
+          event.Type==BOB64_EVENT_MOUSE_BUTTON&&event.Buttons==1&&
+          event.X==54&&event.Y==43,
+          "route USB mouse button transitions through the shared event queue");
+    CHECK(!bob64_mouse_usb_report(0,-4,-3,0)&&
+          !bob64_mouse_poll_event(&event)&&!event.Buttons&&
+          event.X==50&&event.Y==40,
+          "release USB mouse buttons and preserve signed movement");
+    CHECK(!bob64_mouse_usb_report(0,0,0,-1)&&
+          !bob64_mouse_poll_event(&event)&&
+          event.Type==BOB64_EVENT_MOUSE_WHEEL&&event.Wheel==-1&&
+          event.X==50&&event.Y==40,
+          "route signed USB mouse wheel reports through the shared event queue");
+    CHECK(!bob64_mouse_irq_queue_init(100,80)&&
+          !bob64_mouse_usb_report_device(0,1,0,0,0)&&
+          !bob64_mouse_poll_event(&event)&&event.Buttons==1&&
+          !bob64_mouse_usb_report_device(1,2,0,0,0)&&
+          !bob64_mouse_poll_event(&event)&&event.Buttons==3&&
+          !bob64_mouse_usb_report_device(0,0,0,0,0)&&
+          !bob64_mouse_poll_event(&event)&&event.Buttons==2&&
+          !bob64_mouse_usb_report_device(1,0,0,0,0)&&
+          !bob64_mouse_poll_event(&event)&&event.Buttons==0&&
+          bob64_mouse_usb_report_device(BOB64_MOUSE_USB_DEVICE_LIMIT,
+              0,0,0,0)<0,
+          "aggregate independent button holds and releases from multiple USB mice");
+    CHECK(!bob64_mouse_irq_queue_init(100,80)&&
+          !bob64_mouse_usb_report_device(8,1,0,0,0)&&
+          !bob64_mouse_poll_event(&event)&&event.Buttons==1&&
+          !bob64_mouse_usb_report_device(31,2,0,0,0)&&
+          !bob64_mouse_poll_event(&event)&&event.Buttons==3&&
+          !bob64_mouse_usb_report_device(8,0,0,0,0)&&
+          !bob64_mouse_poll_event(&event)&&event.Buttons==2&&
+          !bob64_mouse_usb_report_device(31,0,0,0,0)&&
+          !bob64_mouse_poll_event(&event)&&event.Buttons==0&&
+          bob64_mouse_usb_report_device(32,1,0,0,0)<0,
+          "aggregate independent USB mouse holds above the former eight-device limit");
+    CHECK(!bob64_mouse_irq_queue_init(100,80)&&
+          !bob64_mouse_usb_report_device(2,2,0,0,0)&&
+          !bob64_mouse_poll_event(&event)&&event.Buttons==2&&
+          bob64_mouse_irq_capture(0x09)<0&&
+          bob64_mouse_irq_capture(0)<0&&
+          !bob64_mouse_irq_capture(0)&&
+          !bob64_mouse_poll_event(&event)&&event.Buttons==3&&
+          !bob64_mouse_usb_report_device(2,0,0,0,0)&&
+          !bob64_mouse_poll_event(&event)&&event.Buttons==1&&
+          bob64_mouse_irq_capture(0x08)<0&&
+          bob64_mouse_irq_capture(0)<0&&
+          !bob64_mouse_irq_capture(0)&&
+          !bob64_mouse_poll_event(&event)&&event.Buttons==0,
+          "combine USB and PS/2 mouse buttons without losing another device's hold");
+    CHECK(!bob64_mouse_irq_queue_init(100,80),
+          "reset pointer state before testing PS/2 mouse IRQ packets");
     bob64_mouse_irq_set_active(1);
     CHECK(bob64_mouse_irq_capture(0x08)<0&&bob64_mouse_irq_capture(1)<0&&
           !bob64_mouse_irq_capture(0)&&!bob64_mouse_irq_pop_event(&event)&&
@@ -2906,6 +4032,21 @@ static int window_manager_tests(void) {
     CHECK(bob64_wm_dispatch(&manager,&event,&routed)==(s64)second&&
           !manager.Dragging&&windows[1].X==95&&windows[1].Y==100,
           "apply final pointer movement before ending a drag");
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_MOUSE_BUTTON;
+    event.Buttons=1;event.X=100;event.Y=110;
+    CHECK(bob64_wm_dispatch(&manager,&event,&routed)==(s64)second&&
+          manager.Dragging==second,
+          "begin another window drag before testing extreme pointer coordinates");
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_MOUSE_MOVE;
+    event.Buttons=1;event.X=(-2147483647-1);event.Y=2147483647;
+    CHECK(bob64_wm_dispatch(&manager,&event,&routed)==(s64)second&&
+          windows[1].X==0&&windows[1].Y==330&&
+          routed.X==(-2147483647-1)&&routed.Y==2147483317,
+          "safely clamp a dragged window and local pointer at signed-coordinate limits");
+    event.Type=BOB64_EVENT_MOUSE_BUTTON;event.Buttons=0;
+    CHECK(bob64_wm_dispatch(&manager,&event,&routed)==(s64)second&&
+          !manager.Dragging,
+          "release a window drag after an out-of-range pointer event");
     CHECK(!bob64_wm_move(&manager,second,1000,1000)&&
           windows[1].X==440&&windows[1].Y==330,
           "clamp moved windows to the screen edges");
@@ -2935,6 +4076,20 @@ static int window_manager_tests(void) {
     CHECK(!bob64_wm_destroy(&manager,wide_handle)&&
           bob64_wm_destroy(&manager,wide_handle)<0,
           "destroy window handles without leaving stale slots");
+    CHECK(!bob64_wm_init(&manager,windows,4,order,100,80),
+          "initialize a small window manager for USB wheel routing");
+    first=bob64_wm_create(&manager,10,10,80,60,0);
+    CHECK(first,"create a GUI window for USB wheel routing");
+    CHECK(!bob64_mouse_irq_queue_init(100,80),
+          "initialize the pointer before testing USB wheel routing");
+    CHECK(!bob64_mouse_usb_report(0,0,0,-1),
+          "enqueue USB wheel input before GUI routing");
+    CHECK(!bob64_mouse_poll_event(&event)&&
+          event.Type==BOB64_EVENT_MOUSE_WHEEL&&event.Wheel==-1,
+          "read the USB wheel event from the shared mouse queue");
+    CHECK(bob64_wm_dispatch(&manager,&event,&routed)==(s64)first&&
+          routed.X==40&&routed.Y==30&&routed.Wheel==-1,
+          "route a USB wheel event from the shared mouse queue into the managed GUI window");
     return 0;
 }
 
@@ -2949,6 +4104,39 @@ static int gui_widget_tests(void) {
           bob64_rect_contains(&(BOB64_RECT){0x7ffffff0,0,64,8},
                               0x7ffffff0,1),
           "hit-test 64-bit GUI widget rectangles without signed endpoint overflow");
+    bob64_gfx_fill_rect(&graphics,-4,0,8,1,0x00123456u);
+    CHECK(pixels[0]==0x00123456u&&pixels[3]==0x00123456u&&pixels[4]==0,
+          "clip partially off-screen GUI rectangles to the framebuffer");
+    bob64_gfx_fill_rect(&graphics,(-2147483647-1),1,0xffffffffu,1,
+                        0x00654321u);
+    CHECK(pixels[24]==0x00654321u&&pixels[47]==0x00654321u,
+          "clip full-width GUI rectangles without overflowing or walking off-screen pixels");
+    for(u32 i=0;i<24;i++)pixels[10*24+i]=0;
+    bob64_gfx_line(&graphics,(-2147483647-1),10,2147483647,10,
+                   0x00abcdefu);
+    CHECK(pixels[10*24]==0x00abcdefu&&pixels[10*24+23]==0x00abcdefu,
+          "clip a full-range horizontal line before rasterizing it");
+    bob64_gfx_line(&graphics,(-2147483647-1),(-2147483647-1),
+                   2147483647,2147483647,0x00010203u);
+    CHECK(pixels[0]==0x00010203u&&pixels[19*24+19]==0x00010203u,
+          "clip a full-range diagonal line without signed arithmetic overflow");
+    u32 undersized_pixels[1]={0};
+    BOB64_GFX undersized_graphics={undersized_pixels,24,20,1};
+    bob64_gfx_pixel(&undersized_graphics,0,0,0x00ffffffu);
+    CHECK(undersized_pixels[0]==0,
+          "reject framebuffer writes when the pixel capacity is too small");
+    u32 scaled_text_pixels[16]={0};
+    BOB64_GFX scaled_text_graphics={scaled_text_pixels,4,4,16};
+    bob64_gfx_text(&scaled_text_graphics,(-2147483647-1),0,"A",
+                   0x00ffffffu,0x80000000u);
+    CHECK(scaled_text_pixels[0]==0x00ffffffu&&
+          scaled_text_pixels[15]==0x00ffffffu,
+          "clip a maximum-scale glyph using widened text coordinates");
+    for(u32 i=0;i<16;i++)scaled_text_pixels[i]=0;
+    bob64_gfx_text(&scaled_text_graphics,2147483647,2147483647,"A",
+                   0x00ffffffu,0xffffffffu);
+    for(u32 i=0;i<16;i++)CHECK(scaled_text_pixels[i]==0,
+          "keep extreme off-screen glyph placement outside the framebuffer");
     event.Type=BOB64_EVENT_MOUSE_MOVE;event.X=4;event.Y=5;
     CHECK(!bob64_button_event(&rect,&state,&event)&&state.Hovered&&!state.Pressed&&
           !bob64_button_draw(&graphics,&rect,"OK",&state)&&
@@ -2975,6 +4163,50 @@ static int gui_widget_tests(void) {
           bob64_button_draw(&graphics,&rect,
               "THIS LABEL DOES NOT FIT",&state)<0,
           "reject overflowing or unclipped native GUI button geometry");
+    u32 menu_pixels[96*48]={0};
+    BOB64_GFX menu_graphics={menu_pixels,96,48,96*48};
+    BOB64_RECT menu_rect={4,4,84,36};
+    const char *const menu_items[]={"OPEN FILE","DELETE FILE"};
+    const char *const wide_menu_items[]={"OPEN","DELETE","CLOSE"};
+    BOB64_MENU_STATE menu_state={0,-1,1};
+    CHECK(!bob64_menu_draw(&menu_graphics,&menu_rect,menu_items,2,18,
+                           &menu_state)&&
+          menu_pixels[5*96+5]==0x00335d8cu,
+          "draw a selected item in the reusable popup menu");
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_MOUSE_MOVE;
+    event.X=12;event.Y=25;
+    CHECK(bob64_menu_event(&menu_rect,menu_items,2,18,&menu_state,&event)==-1&&
+          menu_state.Selected==1,
+          "move popup selection with mouse hover");
+    event.Type=BOB64_EVENT_MOUSE_BUTTON;event.Buttons=BOB64_BUTTON_LEFT;
+    CHECK(bob64_menu_event(&menu_rect,menu_items,2,18,&menu_state,&event)==-1&&
+          menu_state.Pressed==1,
+          "arm a popup action on left-button press");
+    event.Buttons=0;
+    CHECK(bob64_menu_event(&menu_rect,menu_items,2,18,&menu_state,&event)==1&&
+          !menu_state.Open&&menu_state.Pressed==-1,
+          "activate a popup action only after release inside its row");
+    menu_state=(BOB64_MENU_STATE){0,-1,1};
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_KEY_DOWN;
+    event.Key=BOB64_EVENT_KEY_EXTENDED|0x50;
+    CHECK(bob64_menu_event(&menu_rect,menu_items,2,18,&menu_state,&event)==-1&&
+          menu_state.Selected==1,
+          "navigate popup menu items with the Down key");
+    event.Key=0;event.Character='\n';
+    CHECK(bob64_menu_event(&menu_rect,menu_items,2,18,&menu_state,&event)==1&&
+          !menu_state.Open,
+          "activate the selected popup item with Enter");
+    menu_state=(BOB64_MENU_STATE){0,-1,1};event.Character=0x1b;
+    CHECK(bob64_menu_event(&menu_rect,menu_items,2,18,&menu_state,&event)==-2&&
+          !menu_state.Open,
+          "dismiss a popup menu with Escape");
+    menu_state=(BOB64_MENU_STATE){0,-1,1};
+    menu_rect=(BOB64_RECT){0,-2147483647-1,1,0xffffffffu};
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_MOUSE_MOVE;
+    event.X=0;event.Y=2147483646;
+    CHECK(bob64_menu_event(&menu_rect,wide_menu_items,3,2147483647u,
+                           &menu_state,&event)==-1&&menu_state.Selected==2,
+          "compute popup rows safely across the full signed-coordinate range");
     u32 field_pixels[96*24]={0};
     char text[16]="notes.txt";
     BOB64_GFX field_graphics={field_pixels,96,24,96*24};
@@ -2983,6 +4215,14 @@ static int gui_widget_tests(void) {
     CHECK(!bob64_text_field_init(&field,text,sizeof(text))&&
           field.Length==9&&field.Cursor==9,
           "initialize a bounded native filename text field");
+    field_rect=(BOB64_RECT){-2147483647-1,-2147483647-1,0xffffffffu,
+                            0xffffffffu};
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_MOUSE_BUTTON;
+    event.Buttons=BOB64_BUTTON_LEFT;event.X=2147483646;event.Y=0;
+    CHECK(!bob64_text_field_event(&field,&field_rect,&event)&&field.Focused&&
+          field.Cursor==field.Length,
+          "place a text-field caret without overflowing signed coordinates");
+    field_rect=(BOB64_RECT){2,2,72,16};
     event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_MOUSE_BUTTON;
     event.Buttons=BOB64_BUTTON_LEFT;event.X=field_rect.X+3+5*6;
     event.Y=field_rect.Y+6;
@@ -3039,17 +4279,28 @@ static int window_server_tests(void) {
                                  8,8,8,0)&&
           !bob64_window_server_init(&server,&heap,owner,8,8),
           "initialize a kernel-owned compositor for one 64-bit app owner");
+    CHECK(!server.Damaged&&server.BytesAllocated==0,
+          "clear initial full-screen damage after compositor setup");
     first=bob64_window_server_create(&server,owner,1,1,3,3);
     CHECK(first&&bob64_window_server_write_pixels(&server,owner,first,0,red,9)==0&&
           !bob64_window_server_present(&server,owner,first)&&
-          framebuffer[1*8+1]==0x000000ffu&&framebuffer[0]!=0x000000ffu,
-          "composite an app surface without exposing its kernel window record");
+          framebuffer[1*8+1]==0x000000ffu&&framebuffer[0]!=0x000000ffu&&
+          !server.Damaged,
+          "composite and retire damage for an app surface");
     second=bob64_window_server_create(&server,owner,2,2,3,3);
     CHECK(second&&second!=first&&
           bob64_window_server_write_pixels(&server,owner,second,0,green,9)==0&&
           !bob64_window_server_present(&server,owner,second)&&
-          framebuffer[2*8+2]==0x0000ff00u&&framebuffer[1*8+1]==0x000000ffu,
+          framebuffer[2*8+2]==0x0000ff00u&&framebuffer[1*8+1]==0x000000ffu&&
+          !server.Damaged,
           "compose overlapping surfaces in z-order while preserving visible pixels");
+    u32 yellow=0x00ffff00u;
+    CHECK(!bob64_window_server_write_pixels(&server,owner,second,4,&yellow,1)&&
+          server.Damaged&&server.DamageLeft==3&&server.DamageTop==3&&
+          server.DamageRight==4&&server.DamageBottom==4&&
+          !bob64_window_server_present(&server,owner,second)&&
+          framebuffer[3*8+3]==0x0000ffffu&&!server.Damaged,
+          "composite a single changed surface pixel without repainting the screen");
     CHECK(bob64_window_server_present(&server,owner+1,second)<0&&
           bob64_window_server_move(&server,owner+1,second,4,4)<0&&
           bob64_window_server_destroy(&server,owner+1,second)<0,
@@ -3060,6 +4311,12 @@ static int window_server_tests(void) {
           routed.ScreenX==3&&routed.ScreenY==3&&server.Manager.Focused==second&&
           server.Manager.Dragging==second,
           "route mouse focus and title-bar dragging through kernel window state");
+    event.Type=BOB64_EVENT_MOUSE_MOVE;event.Buttons=1;event.X=3;event.Y=3;
+    CHECK(bob64_window_server_route_event(&server,owner,&event,&routed)==(s64)second&&
+          !server.Damaged,
+          "skip framebuffer composition for a mouse move that changes no pixels");
+    event.Type=BOB64_EVENT_MOUSE_BUTTON;event.Buttons=0;event.X=3;event.Y=3;
+    (void)bob64_window_server_route_event(&server,owner,&event,&routed);
     CHECK(!bob64_window_server_move(&server,owner,second,4,4)&&
           framebuffer[2*8+2]==0x000000ffu&&framebuffer[4*8+4]==0x0000ff00u,
           "redraw exposed surfaces after a window moves");
@@ -3307,7 +4564,7 @@ static int shell_tests(void) {
           "clear command resets the display");
     shell_test_command(&shell,"help");
     CHECK(strstr(output.Text,"version show kernel version")!=0&&
-          strstr(output.Text,"restore  restore firmware or RAM checkpoint")!=0&&
+          strstr(output.Text,"restore  restore persistent or RAM checkpoint")!=0&&
           strstr(output.Text,"cc SOURCE [OUTPUT]")!=0&&
           strstr(output.Text,"desktop.b64e [FILE]")!=0&&
           strstr(output.Text,"Up/Down command history")!=0,
@@ -3383,6 +4640,9 @@ int main(int argc,char **argv) {
     CHECK(memory_tests()==0,"physical page allocator regression tests");
     CHECK(console_tests()==0,"GOP framebuffer console regression tests");
     CHECK(compression_tests()==0,"bounded LZ4 snapshot compression regression tests");
+    CHECK(block_device_tests()==0,"bounded block-device read/write/flush regression tests");
+    CHECK(partition_tests()==0,"CRC-checked GPT bob64 data-partition discovery tests");
+    CHECK(disk_store_tests()==0,"transactional block-backed B64S snapshot persistence tests");
     CHECK(heap_tests()==0,"64-bit heap allocator regression tests");
     CHECK(snapshot_tests()==0,"versioned B64S snapshot regression tests");
     CHECK(firmware_store_tests()==0,
@@ -3393,6 +4653,9 @@ int main(int argc,char **argv) {
     CHECK(compiler_process_tests(resident_compiler_image,
           resident_compiler_image_length)==0,
           "resident compiler output integration with the process loader");
+    CHECK(serial_input_tests()==0,"COM1 interrupt receive-queue regression tests");
+    CHECK(pci_tests()==0,"PCI bus and USB host-controller enumeration tests");
+    CHECK(xhci_tests()==0,"xHCI halt/reset state-machine tests");
     CHECK(keyboard_tests()==0,"PS/2 keyboard scan-code regression tests");
     CHECK(mouse_tests()==0,"PS/2 mouse packet and pointer regression tests");
     CHECK(window_manager_tests()==0,"64-bit GUI window-manager regression tests");
@@ -3463,7 +4726,8 @@ int main(int argc,char **argv) {
         CHECK(app_file,"read compiler-produced B64E application");
         CHECK(!bob64_exec_parse(app_file,app_size,&app)&&
               app.AbiVersion==BOB64_APP_ABI_VERSION&&app.EntryOffset>0&&
-              app.CodeSize==BOB64_PAGE_SIZE&&app.FileSize>app.CodeSize&&
+              app.CodeSize>=BOB64_PAGE_SIZE&&app.CodeSize%BOB64_PAGE_SIZE==0&&
+              app.FileSize>app.CodeSize&&
               app.MemorySize>=app.FileSize&&app.MemorySize<=BOB64_PROCESS_IMAGE_LIMIT,
               "parse compiler-produced B64E metadata and bounded memory layout");
         CHECK(app.Image[app.EntryOffset]==0x48&&app.Image[app.EntryOffset+1]==0x83&&
@@ -3519,6 +4783,9 @@ int main(int argc,char **argv) {
               contains_bytes(app.Image,(usize)app.FileSize,
                              "UP DOWN WHEEL ENTER RUN",23)&&
               contains_bytes(app.Image,(usize)app.FileSize,"WHEEL MOVE",10)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"M:MENU",6)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"OPEN SELECTED",13)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"DELETE FILE",11)&&
               contains_bytes(app.Image,(usize)app.FileSize,"APPS",4)&&
               contains_bytes(app.Image,(usize)app.FileSize,"X CLOSE",7)&&
               contains_bytes(app.Image,(usize)app.FileSize,
@@ -3693,8 +4960,12 @@ int main(int argc,char **argv) {
               app.AbiVersion==BOB64_APP_ABI_VERSION&&app.EntryOffset>0&&
               app.MemorySize>=app.FileSize&&app.CodeSize>0&&
               contains_bytes(app.Image,(usize)app.FileSize,
-                             "bob64 live mouse event passed",29),
-              "package the live mouse IRQ test as a valid B64E app");
+                             "bob! live mouse move passed",
+                             sizeof("bob! live mouse move passed")-1)&&
+              contains_bytes(app.Image,(usize)app.FileSize,
+                             "bob! live mouse wheel passed",
+                             sizeof("bob! live mouse wheel passed")-1),
+              "package the live mouse movement and wheel IRQ test as a valid B64E app");
         free(app_file);
     }
 

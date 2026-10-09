@@ -1,7 +1,7 @@
 CC ?= gcc
 BOB64_CC ?= x86_64-w64-mingw32-gcc
 CFLAGS ?= -std=gnu11 -O2 -Wall -Wextra -Werror
-.PHONY: all c-os test bob64 bob64-test bob64-handoff bob64-handoff-test bob64cc bob64-app-test
+.PHONY: all c-os test bob64 bob64-test bob64-handoff bob64-handoff-test bob64-handoff-storage-test bob64-handoff-storage-active-test bob64cc bob64-app-test
 
 all:
 	$(CC) $(CFLAGS) tools/build.c -o build-tool
@@ -29,6 +29,16 @@ bob64-handoff:
 bob64-handoff-test:
 	$(CC) $(CFLAGS) tools/build.c -o build-tool
 	BOB64_CC="$(BOB64_CC)" ./build-tool --bob64-handoff-test
+
+# Isolated opt-in image that writes a patterned sector on its temporary QEMU test disk.
+bob64-handoff-storage-test:
+	$(CC) $(CFLAGS) tools/build.c -o build-tool
+	BOB64_CC="$(BOB64_CC)" ./build-tool --bob64-handoff-storage-test
+
+# Isolated test image that pauses with an xHCI storage transfer outstanding.
+bob64-handoff-storage-active-test:
+	$(CC) $(CFLAGS) tools/build.c -o build-tool
+	BOB64_CC="$(BOB64_CC)" ./build-tool --bob64-handoff-storage-active-test
 
 bob64cc:
 	$(CC) $(CFLAGS) tools/bob64cc.c -o bob64cc

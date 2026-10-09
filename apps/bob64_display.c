@@ -1,10 +1,13 @@
 #include "../bob64/app.h"
 #include "../bob64/gfx.h"
+#include "../bob64/widgets.h"
 
 #define DEMO_WIDTH 640u
 #define DEMO_HEIGHT 400u
 
 static u32 pixels[DEMO_WIDTH*DEMO_HEIGHT];
+static const BOB64_RECT close_button={552,8,72,22};
+static BOB64_BUTTON_STATE close_state;
 
 static void draw_demo(BOB64_GFX *graphics) {
     u32 width=graphics->Width,height=graphics->Height;
@@ -18,8 +21,9 @@ static void draw_demo(BOB64_GFX *graphics) {
                         height-(u32)(margin*2),0x1b2b40u);
     bob64_gfx_fill_rect(graphics,margin,margin,width-(u32)(margin*2),
                         (u32)header_height,0x345d89u);
-    bob64_gfx_text(graphics,margin*2,margin*2,"BOB32 GRAPHICS DEMO",
+    bob64_gfx_text(graphics,margin*2,margin*2,"BOB64 GRAPHICS DEMO",
                    0x00ffffffu,3);
+    (void)bob64_button_draw(graphics,&close_button,"CLOSE",&close_state);
     bob64_gfx_line(graphics,margin,header_height+margin*2,
         (s32)width-margin,header_height+margin*2,0x00f0c879u);
     bob64_gfx_text(graphics,margin*2,panel_y-margin*2,
@@ -39,7 +43,8 @@ static void draw_demo(BOB64_GFX *graphics) {
     bob64_gfx_fill_rect(graphics,margin,panel_y+(s32)panel_height+margin,
                         width-(u32)(margin*2),3,0x006d849fu);
     bob64_gfx_text(graphics,margin*2,
-        (s32)height-margin*6,"PRESS X OR ESCAPE TO RETURN",0x00ffffffu,2);
+        (s32)height-margin*6,"CLICK CLOSE OR PRESS X / ESCAPE",
+        0x00ffffffu,2);
 }
 
 s64 bob64_app_main(const BOB64_APP_STARTUP *startup) {
@@ -67,6 +72,15 @@ s64 bob64_app_main(const BOB64_APP_STARTUP *startup) {
         if(event.Type==BOB64_EVENT_KEY_DOWN&&
            (event.Character=='x'||event.Character=='X'||event.Character==0x1b)) {
             result=0;break;
+        }
+        if(event.Type==BOB64_EVENT_MOUSE_MOVE||
+           event.Type==BOB64_EVENT_MOUSE_BUTTON) {
+            if(bob64_button_event(&close_button,&close_state,&event)) {
+                result=0;break;
+            }
+            draw_demo(&graphics);
+            result=bob64_app_window_present(window,pixels,DEMO_WIDTH,DEMO_HEIGHT);
+            if(result!=(s64)(DEMO_WIDTH*DEMO_HEIGHT))goto cleanup;
         }
     }
 cleanup:

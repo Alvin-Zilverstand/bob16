@@ -40,6 +40,7 @@ int bob64_page_table_clone_isolated(BOB64_PAGE_TABLE *destination,
                                     u64 isolated_base,u64 isolated_size);
 int bob64_page_map(BOB64_PAGE_TABLE *table,u64 virtual_address,u64 physical_address,
                    u64 flags);
+/* A failed range map removes every leaf mapping added by that call. */
 int bob64_page_map_range(BOB64_PAGE_TABLE *table,u64 virtual_address,
                          u64 physical_address,u64 byte_size,u64 flags);
 int bob64_page_protect(BOB64_PAGE_TABLE *table,u64 virtual_address,u64 flags);

@@ -607,6 +607,7 @@ u64 BOB64_MS_ABI bob64_syscall_dispatch(BOB64_INTERRUPT_FRAME *frame) {
     if(frame->RAX==BOB64_SYSCALL_SEEK_HANDLE) {
         BOB64_SYSCALL_HANDLE *handle=find_handle(frame->RCX);
         if(!handle)frame->RAX=(u64)-9;
+        else if(frame->RDX>0x7fffffffffffffffULL)frame->RAX=(u64)-22;
         else {handle->Position=frame->RDX;frame->RAX=handle->Position;}
         return 0;
     }

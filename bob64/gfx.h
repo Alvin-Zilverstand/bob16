@@ -24,28 +24,96 @@ static inline int bob64_gfx_init(BOB64_GFX *graphics,u32 *pixels,usize capacity)
 }
 
 static inline void bob64_gfx_pixel(BOB64_GFX *graphics,s32 x,s32 y,u32 color) {
-    if(graphics&&x>=0&&y>=0&&(u32)x<graphics->Width&&(u32)y<graphics->Height)
-        graphics->Pixels[(usize)(u32)y*graphics->Width+(u32)x]=color&0x00ffffffu;
+    if(graphics&&graphics->Pixels&&graphics->Width<=BOB64_GFX_MAX_WIDTH&&
+       graphics->Height<=BOB64_GFX_MAX_HEIGHT&&x>=0&&y>=0&&
+       (u32)x<graphics->Width&&(u32)y<graphics->Height) {
+        usize index=(usize)(u32)y*graphics->Width+(u32)x;
+        if((u64)graphics->Width*graphics->Height<=graphics->Capacity&&
+           index<graphics->Capacity)
+            graphics->Pixels[index]=color&0x00ffffffu;
+    }
 }
 
-static inline void bob64_gfx_fill_rect(BOB64_GFX *graphics,s32 x,s32 y,
+static inline void bob64_gfx_fill_rect(BOB64_GFX *graphics,s64 x,s64 y,
                                        u32 width,u32 height,u32 color) {
-    if(!graphics)return;
-    for(u32 row=0;row<height;row++)for(u32 column=0;column<width;column++)
-        bob64_gfx_pixel(graphics,x+(s32)column,y+(s32)row,color);
+    s64 left=x,top=y,right=x+(s64)width,bottom=y+(s64)height;
+    usize row_start,row_end;
+    if(!graphics||!graphics->Pixels||!width||!height||
+       graphics->Width>BOB64_GFX_MAX_WIDTH||
+       graphics->Height>BOB64_GFX_MAX_HEIGHT||
+       (u64)graphics->Width*graphics->Height>graphics->Capacity)return;
+    if(left<0)left=0;
+    if(top<0)top=0;
+    if(right>graphics->Width)right=graphics->Width;
+    if(bottom>graphics->Height)bottom=graphics->Height;
+    if(left>=right||top>=bottom)return;
+    row_start=(usize)top*graphics->Width+(usize)left;
+    row_end=row_start+(usize)(right-left);
+    for(s64 row=top;row<bottom;row++) {
+        for(usize pixel=row_start;pixel<row_end;pixel++)
+            graphics->Pixels[pixel]=color&0x00ffffffu;
+        row_start+=graphics->Width;row_end+=graphics->Width;
+    }
+}
+
+static inline u32 bob64_gfx_line_outcode(s64 x,s64 y,u32 width,u32 height) {
+    return (x<0?1u:(x>=(s64)width?2u:0u))|
+           (y<0?4u:(y>=(s64)height?8u:0u));
+}
+
+/* Interpolate only between endpoints on the segment; each magnitude is at most
+ * UINT32_MAX, so the unsigned product fits without requiring a 128-bit type. */
+static inline s64 bob64_gfx_line_interpolate(s64 start,s64 end,s64 numerator,
+                                              s64 denominator) {
+    s64 delta=end-start;
+    u64 delta_magnitude=(u64)(delta<0?-delta:delta);
+    u64 numerator_magnitude=(u64)(numerator<0?-numerator:numerator);
+    u64 denominator_magnitude=(u64)(denominator<0?-denominator:denominator);
+    u64 step=(delta_magnitude*numerator_magnitude)/denominator_magnitude;
+    int negative=((delta<0)^(numerator<0)^(denominator<0));
+    return start+(negative?-(s64)step:(s64)step);
 }
 
 static inline void bob64_gfx_line(BOB64_GFX *graphics,s32 x0,s32 y0,s32 x1,s32 y1,
                                   u32 color) {
-    s32 dx=x1>x0?x1-x0:x0-x1,sx=x0<x1?1:-1;
-    s32 dy=y1>y0?y0-y1:y1-y0,sy=y0<y1?1:-1;
-    s32 error=dx+dy;
+    s64 ax=x0,ay=y0,bx=x1,by=y1;
+    u32 width,height;
+    if(!graphics||!graphics->Pixels||!graphics->Width||!graphics->Height||
+       graphics->Width>BOB64_GFX_MAX_WIDTH||
+       graphics->Height>BOB64_GFX_MAX_HEIGHT||
+       (u64)graphics->Width*graphics->Height>graphics->Capacity)return;
+    width=graphics->Width;height=graphics->Height;
     for(;;) {
-        bob64_gfx_pixel(graphics,x0,y0,color);
-        if(x0==x1&&y0==y1)break;
-        s32 twice=error*2;
-        if(twice>=dy){error+=dy;x0+=sx;}
-        if(twice<=dx){error+=dx;y0+=sy;}
+        u32 a=bob64_gfx_line_outcode(ax,ay,width,height);
+        u32 b=bob64_gfx_line_outcode(bx,by,width,height);
+        u32 outside;
+        s64 x,y;
+        if(!(a|b))break;
+        if(a&b)return;
+        outside=a?a:b;
+        if(outside&4u) {
+            y=0;x=bob64_gfx_line_interpolate(ax,bx,-ay,by-ay);
+        } else if(outside&8u) {
+            y=(s64)height-1;
+            x=bob64_gfx_line_interpolate(ax,bx,y-ay,by-ay);
+        } else if(outside&1u) {
+            x=0;y=bob64_gfx_line_interpolate(ay,by,-ax,bx-ax);
+        } else {
+            x=(s64)width-1;
+            y=bob64_gfx_line_interpolate(ay,by,x-ax,bx-ax);
+        }
+        if(outside==a)ax=x,ay=y;
+        else bx=x,by=y;
+    }
+    s64 dx=bx>ax?bx-ax:ax-bx,sx=ax<bx?1:-1;
+    s64 dy=by>ay?ay-by:by-ay,sy=ay<by?1:-1;
+    s64 error=dx+dy;
+    for(;;) {
+        bob64_gfx_pixel(graphics,(s32)ax,(s32)ay,color);
+        if(ax==bx&&ay==by)break;
+        s64 twice=error*2;
+        if(twice>=dy){error+=dy;ax+=sx;}
+        if(twice<=dx){error+=dx;ay+=sy;}
     }
 }
 
@@ -64,16 +132,26 @@ static inline u32 bob64_gfx_glyph(u8 value) {
     return 37;
 }
 
+typedef struct {
+    BOB64_GFX *Graphics;
+} BOB64_GFX_FONT_CONTEXT;
+
+static inline void bob64_gfx_font_plot_pixel(void *opaque,s64 x,s64 y,
+        u32 scale,u32 color) {
+    BOB64_GFX_FONT_CONTEXT *context=(BOB64_GFX_FONT_CONTEXT *)opaque;
+    bob64_gfx_fill_rect(context->Graphics,x,y,scale,scale,color);
+}
+
 static inline void bob64_gfx_text(BOB64_GFX *graphics,s32 x,s32 y,
                                   const char *text,u32 color,u32 scale) {
+    s64 cursor_x=x,origin_y=y;
+    BOB64_GFX_FONT_CONTEXT context={graphics};
     if(!graphics||!text||!scale)return;
     while(*text) {
         u32 glyph=bob64_gfx_glyph((u8)*text++);
-        for(u32 column=0;column<5;column++)for(u32 row=0;row<7;row++)
-            if(bob64_font5x7[glyph][column]&(1u<<row))
-                bob64_gfx_fill_rect(graphics,x+(s32)(column*scale),
-                    y+(s32)(row*scale),scale,scale,color);
-        x+=(s32)(6*scale);
+        bob64_font_draw_glyph(&bob64_font5x7,glyph,cursor_x,origin_y,scale,
+                              bob64_gfx_font_plot_pixel,&context,color);
+        cursor_x+=(s64)6*scale;
     }
 }
 

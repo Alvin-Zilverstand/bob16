@@ -74,10 +74,11 @@ the existing emulator/build outputs stay separate.
   normalizing hardware error-code and no-error-code frames before saving all
   general-purpose registers and calling the Microsoft x64 C dispatcher. The
   common path restores registers and uses `iretq`. `interrupts.c` wires an IDT
-  to those stubs and a fatal fallback, and prints full 64-bit register values
-  over COM1 and the framebuffer before halting. The opt-in handoff loads the
-  IDT. The DPL3 vector `0x80` enters a dedicated syscall stub; runtime
-  exception and syscall delivery still need firmware/emulator testing.
+  to those stubs and a fatal fallback, and prints all saved general registers,
+  the interrupted 64-bit RSP, and user SS over COM1 and the framebuffer. Page
+  faults also report the 64-bit CR2 address. The DPL3 vector `0x80` enters a
+  dedicated syscall stub; QEMU runtime tests exercise syscall delivery and
+  recover from a user invalid-opcode exception.
 - `bob64/kernel.c` is the first kernel-owned C entry point. It checks the
   boot-information structure, active CR3, memory-map range, and stack, then
   reports the 64-bit root and map details, checks the growable kernel heap, then
@@ -98,7 +99,9 @@ the existing emulator/build outputs stay separate.
   kernel's `bob64/console.c` draws a compact 5x7 text font, wraps and scrolls,
   and mirrors output to COM1. Unsupported or invalid GOP modes retain the serial
   console fallback. Host tests exercise format encoding, glyph output, and
-  invalid framebuffer bounds; actual display output still needs UEFI testing.
+  invalid framebuffer bounds. QEMU/OVMF runtime tests capture a PPM screen dump
+  while the desktop is open and verify its dimensions and sampled color variety;
+  physical firmware/display combinations still need broader testing.
 - `bob64/heap.c` provides a 16-byte-aligned, coalescing kernel heap with
   `alloc`, `calloc`, and `free`. Kernel entry adopts the page allocator and
   page-table pool seeded by boot, then grows the heap by mapping physical 4 KiB
@@ -114,10 +117,51 @@ the existing emulator/build outputs stay separate.
   queue used by the shell and app event service after the kernel remaps the PIC;
   the kernel keeps polling as a fallback if the controller is unavailable.
   IRQ12 feeds a bounded mouse-event queue through the same app event service;
-  COM1 remains polled. Unit tests cover scan-code state, keyboard/mouse queue
-  behavior, and shell command/edit behavior. A 100 Hz PIT IRQ now supplies a
-  monotonic tick counter through the versioned syscall ABI. USB keyboards,
-  history and completion remain future work.
+  COM1 receive uses a bounded IRQ4 queue when available and falls back to
+  polling otherwise. Unit tests cover serial/keyboard/mouse queues and shell
+  command/edit behavior. A 100 Hz PIT IRQ supplies a monotonic tick counter
+  through the versioned syscall ABI. Shell history and completion are
+  implemented. USB HID boot-keyboard reports enter the shared key-event queue
+  and shell input path, while boot-mouse reports update the shared pointer and
+  mouse-event queue. QEMU verifies both with the 8042 disabled.
+- `bob64/pci.c` enumerates PCI functions from bus 0 and follows secondary buses
+  through PCI-to-PCI bridges. It identifies USB host-controller class codes and
+  decodes assigned I/O, 32-bit memory, and 64-bit memory BARs. Host tests cover
+  bridge traversal, xHCI classification, and BAR decoding; QEMU/OVMF adds a
+  qemu-xhci controller and verifies detection during the kernel's boot. The
+  kernel enables PCI memory decoding, maps xHCI registers uncached, parses the
+  version/limits/scratchpad requirement and offsets with aligned MMIO reads,
+  then halts and resets the controller. It identity-maps DMA pages, initializes
+  command/event rings and the event-ring segment table, starts the xHC, and
+  verifies a No Op command completion. Host state-machine tests cover running/
+  halted, controller-not-ready and reset-timeout paths; QEMU verifies the real
+  command completion and scans root-port status. The QEMU profile attaches an
+  emulated USB keyboard and verifies root-port reset, slot assignment, an
+  Address Device command, and endpoint-0 GET_DESCRIPTOR requests for the device
+  and configuration descriptors. A bounded descriptor parser locates the HID
+  boot-keyboard interface and interrupt-IN endpoint. The kernel sends
+  SET_CONFIGURATION and HID SET_PROTOCOL and configures the interrupt-IN
+  endpoint. It keeps a report transfer posted, decodes HID key transitions into
+  the existing queue, and re-arms after each report. Up to 32 directly
+  connected boot-HID devices have independent slots, rings, report buffers,
+  and event polling, bounded by the controller's advertised slot count. Each
+  USB keyboard tracks held keys and modifiers independently, and USB/PS/2 mouse
+  buttons are aggregated so one device's release preserves another's holds. With
+  the 8042 disabled, QEMU attaches both a keyboard and mouse,
+  types `version`, launches the managed mouse smoke app and verifies movement,
+  wheel, and button activation, then launches the desktop, opens and closes
+  Help, and returns to the shell. Three-button boot reports are supported.
+  xHCI root-port disconnect events release held USB keyboard keys/modifiers and
+  mouse buttons; repeated transfer failures also release the device state.
+  QEMU hot-unplug testing holds a key, removes the keyboard, and verifies
+  release. Directly connected HID devices are re-enumerated after a port
+  reconnect, reusing inactive HID records and disabling the removed xHCI slot;
+  the QEMU disconnect probe verifies a new interrupt report after re-add.
+  USB 2 hubs now enumerate boot-HID children and handle downstream HID
+  hotplug; a separate QEMU hub profile verifies input, held-key release, and
+  reconnection. A QEMU `many` profile checks nine directly
+  connected devices (one keyboard and eight mice) and requires every expected
+  HID endpoint to configure before accepting the shell and GUI input checks.
 - `bob64/filesystem.c` adds a flat, volatile binary-safe filesystem backed by the
   kernel heap. It supports 64-bit lengths, case-sensitive names, atomic file
   replacement, listing, reads, and deletion; names reject path separators and
@@ -128,19 +172,23 @@ the existing emulator/build outputs stay separate.
   format with 64-bit total/data lengths and a CRC-32. Restore validates version,
   size, checksum, record bounds, names, and duplicate files before replacing
   the live filesystem. The shell's `save` and `restore` commands keep a RAM
-  checkpoint and store a compressed B64S copy in a non-volatile UEFI variable
-  when firmware capacity permits. Startup restores that snapshot after
+  checkpoint and store a compressed B64S copy in non-volatile UEFI variables
+  when firmware capacity permits, and can store it in a dedicated GPT partition
+  on USB mass storage. Startup restores that snapshot after
   installing the default apps. Host tests cover round-trip, empty files,
   replace-on-restore,
   truncation, unsupported versions, checksum errors, and unchanged state after
   rejected input. A mock runtime-services suite verifies compressed variable
   save/restore, corruption rejection, and missing-variable behavior. QEMU/OVMF
   reboot testing saved a shell-created file to writable NVRAM, reset the VM, and
-  verified the file after automatic restore. Disk-backed
-  filesystem persistence and directories remain future stages; the
-  app filesystem ABI supports bounded whole-file operations and ABI v12 streaming
-  handles with 64-bit seek positions and bounded reads/writes; disk-backed
-  persistence remains outstanding.
+  verified the file after automatic restore. The disk store uses two alternating
+  checksummed B64S generations and is wired into shell save/restore and boot
+  restore; host tests cover damaged-generation fallback and failed commits.
+  The opt-in QEMU/OVMF `-DiskSnapshotTest` passed save, reset, disk restore,
+  continued shell/app/GUI use, and raw-image B64D/B64S verification. Directories
+  and direct per-file block-backed storage are still future work. The app filesystem ABI supports bounded whole-file
+  operations and ABI v12 streaming handles with 64-bit seek positions and
+  bounded reads/writes.
 - `bob64/exec.c` defines B64E version 1, a flat position-independent 64-bit
   executable image with a versioned ABI, exact payload length, 64-bit memory
   size and entry offset, page-aligned code/data boundary, payload CRC-32, and
@@ -170,8 +218,9 @@ the existing emulator/build outputs stay separate.
   bounded chunks into the device surface without exposing its address. Tests
   cover the syscall and both GOP channel formats.
   `apps/bob64_display.c` exercises the app-facing wrapper and is packaged as a
-  B64E image with a bounded 1024x768 static surface; runtime execution awaits
-  UEFI verification.
+  B64E image with a bounded 1024x768 static surface. QEMU/OVMF verifies its
+  640x400 managed window, pixel presentation, close controls, and return to the
+  shell.
 - `bob64/window.h` ports the reusable window-manager behavior to app-owned
   fixed-capacity 64-bit state: nonzero 64-bit handles, full-width context
   pointers, visibility, focus, z-order, hit testing, title-bar dragging,
@@ -185,18 +234,28 @@ the existing emulator/build outputs stay separate.
   filenames, streams files in 4 KiB chunks, and supports up to 16 KiB of text,
   matching the resident compiler's source limit. The shell launches it with
   `run desktop.b64e [filename]`; host tests cover the editor buffer, packaged
-  UI strings, file ABI and window manager. The full existing bob GUI, a file
-  picker and real UEFI interaction remain to be ported/verified.
+  UI strings, file ABI and window manager. QEMU/OVMF verifies the Files,
+  Editor, Applications, Help and delete-confirmation windows; keyboard and
+  mouse selection, menus and buttons; editing and Save As; launching child
+  apps; and returning to the desktop. Independent apps still run synchronously,
+  so launching one pauses input to the desktop until it exits. A physical UEFI
+  machine has not been used for validation.
 - `bob64/ABI.md` records the register-preservation rules, stack alignment and
   shadow-space contract, pointer ownership, and application entry shape. The
   compiler's aggregate behavior follows the Microsoft x64 ABI; aggregate
   returns are not part of the application-entry contract. `bob64/app.h` exposes
   syscall wrappers for native C apps without kernel-internal types. The small
-  `bob64/libc.c` runtime provides memory and string operations with 64-bit sizes.
+  `bob64/libc.c` runtime provides memory operations and common string helpers
+  with 64-bit sizes, plus bounded `bob64_snprintf` formatting for strings,
+  characters, signed/unsigned integers, pointers, flags, widths, and precision.
+  Floating-point conversions are rejected because the runtime has no floating-
+  point formatting support. Host tests cover string edge cases, format
+  truncation, 64-bit pointers, and integer boundaries; the boot smoke app also
+  formats and checks output from a packaged ring-3 x86-64 image under QEMU.
 - `bob64/compiler.c` is the first resident x86-64 code-generation stage. The
   shell exposes `cc bob.c [OUTPUT]`, which packages the accepted source directly
   as B64E; `run app.b64e` launches it. The current syntax accepts `int` or
-  `long`, `long long`, or `int main(void)`, initialized `int`/`long`/`long long`
+  `long`, `long long`, or `int main(void)`, initialized or uninitialized scalar
   locals and assignments,
   `bob64_app_write` calls with typed `char *` expressions and scalar length
   expressions, and 64-bit integer
@@ -212,9 +271,20 @@ the existing emulator/build outputs stay separate.
   The compiler recognizes `usize`/`uintptr_t` as unsigned 64-bit scalar types
   and `isize`/`intptr_t` as signed 64-bit scalar types in declarations and
   function signatures. These are built-in type names. Bounded file-scope
+  declarations also accept `unsigned long long` and the equivalent spelling
+  `unsigned long long int`, backed by the same unsigned 64-bit representation;
+  the host suite checks `sizeof`, calls, wraparound, and comparisons across bit
+  63. The embedded `bob.c` demo repeats the type, call, wraparound, and
+  high-bit comparison checks through the resident compiler under QEMU.
+  Other unsigned object widths are still unsupported. Bounded file-scope
   typedefs alias supported scalar types, scalar pointers, and previously
   declared named structs; alias chains work, while typedef arrays, function
   pointers, anonymous structs and header inclusion remain unsupported.
+  Explicit scalar and pointer casts now support integer/pointer round trips and
+  the LLP64 narrowing/sign-extension rules for `char`, `short`, and `int`;
+  host compiler execution tests cover truncation at 8, 16, and 32 bits, signed
+  extension, and preserving 64-bit pointer values. The QEMU resident compile
+  and run path exercises these casts in the embedded `bob.c` demonstration.
   `usize *`, `uintptr_t *`, `isize *`,
   `intptr_t *`, and `long long *` map to signed/unsigned wide-pointer types with
   eight-byte loads, stores, indexing and scaled pointer arithmetic. They work as local,
@@ -229,7 +299,13 @@ the existing emulator/build outputs stay separate.
   expressions must match the declared pointee type. Returning a pointer through
   `long long`/`usize` remains accepted for the compiler's existing raw-address
   tests. Host execution tests cover pointer identity through a prototype and a
-  returned string literal used by the caller.
+  returned string literal used by the caller. Opaque `void *` values can now be
+  stored in local/global variables and struct fields, passed and returned,
+  compared with compatible object pointers, and converted back to a typed
+  object pointer. Global initializers can point to scalars, arrays, and strings.
+  `void *` arithmetic, indexing, and dereference remain rejected until a typed
+  conversion is made. Host runtime tests exercise the Microsoft x64 call ABI
+  and verify invalid dereference and arithmetic are rejected.
 - `bob64/process.c` adds a callback-backed B64E loader core. It reparses the
   exact file before allocation, maps up to 16 MiB of app memory at
   `0x0000004000000000`, keeps code user-readable/executable and read-only, and
@@ -251,8 +327,10 @@ the existing emulator/build outputs stay separate.
   of base relocations for firmware-selected load addresses. It also exercises
   four-level mapping, translation, permissions, canonical-address checks,
   physical-width limits in both allocator and page tables, multi-page range
-  mapping, protect/unmap/remap behavior, duplicate-map rejection, bootstrap identity mappings, synthetic
-  CPUID feature decoding, 64-bit GDT/IDT layouts, and exception-stub wiring.
+  mapping with rollback on collisions and allocation failure, protect/unmap/
+  remap behavior, duplicate-map rejection, bootstrap identity mappings,
+  synthetic CPUID feature decoding, 64-bit GDT/IDT layouts, and exception-stub
+  wiring.
 
 ## Still required by the migration goal
 
@@ -261,12 +339,15 @@ the existing emulator/build outputs stay separate.
   console, COM1 diagnostics, ring-3 smoke app, and shell. A runtime script
   repeats the boot and checks its serial milestones.
 - [x] Exercise ring-3 syscalls and user exception recovery after loading the
-  GDT/IDT and new CR3. A deliberate invalid opcode was diagnosed with the full
-  register frame and returned to the kernel; the corrected smoke app now exits
-  normally. The IDT now also contains PIT, PS/2 keyboard, and PS/2 mouse IRQ
+  GDT/IDT and new CR3. A deliberate invalid opcode is diagnosed with the full
+  64-bit GPR frame, interrupted RSP and user SS, then returned to the kernel.
+  The smoke app sets R15 to a distinctive value above 4 GiB, and QEMU asserts
+  its exact printed value and the high user stack. A diagnosed protection
+  fault also reports the exact CR2 address above 4 GiB. The IDT contains PIT,
+  PS/2 keyboard, and PS/2 mouse IRQ
   handlers; PIT tick advancement is now checked at runtime, keyboard IRQ
-  delivery is exercised by the shell/desktop sessions, and live mouse-event
-  assertions remain open below.
+  delivery is exercised by the shell/desktop sessions, and movement plus wheel
+  events are verified in a focused ring-3 window below.
 - [x] Verify actual ring-3 text protection and data NX behavior. QEMU runtime
   probes attempt to write the read-only executable page and execute the NX data
   page; both receive the expected user page-fault error bits and return to the
@@ -304,7 +385,30 @@ the existing emulator/build outputs stay separate.
   restored on return. Host syscall tests cover nested context restoration, and
   the boot image includes a `bob!` nested-launch smoke app; QEMU runtime testing
   confirms the child returns and the parent continues.
-- [ ] Add USB keyboard support; COM1 remains polled.
+- [x] Buffer COM1 input through a bounded IRQ4 receive queue with polling
+  fallback. Host tests cover FIFO order, saturation and slot reuse; the QEMU
+  runtime suite sends `version`, `write`, and `cat` commands through the serial
+  port and verifies shell output and filesystem round-trip.
+- [x] Add PCI configuration-space enumeration as the discovery foundation for
+  USB support. The kernel follows PCI bridges, reports USB host controllers,
+  enables its memory decoding, and decodes BAR resources. Unit tests and
+  QEMU/OVMF verify xHCI capability reads and a completed halt/reset; USB input
+  is provided by the separate USB HID input milestone below.
+- [x] Complete xHCI DMA rings and direct-attach USB HID support for up to
+  32 devices, bounded by the controller's slot count. Initial
+  command/event rings, QEMU-verified No Op completion, and connected-root-port
+  detection, USB2 root-port reset, Enable Slot, Address Device, device and
+  configuration descriptor reads, and HID boot keyboard/mouse endpoint
+  discovery are in place. QEMU verifies SET_CONFIGURATION/SET_PROTOCOL,
+  endpoint configuration, ongoing report re-arming, keyboard shell input, and
+  mouse events with the 8042 disabled. Three-button reports are supported,
+  four-byte reports pass signed wheel deltas into the GUI event queue, and
+  independent keyboard/mouse state is tested. A QEMU `many` profile configures
+  one keyboard and eight mice together. Root-port hot-unplug releases held input
+  state, verified by a QEMU device-removal probe. Directly attached HID devices
+  automatically re-enumerate after reconnect; the QEMU probe verifies a fresh
+  interrupt report. USB 2 hub child enumeration, hotplug, and reconnection are
+  covered in the hub milestones below; other USB classes remain open.
 - [x] Add an eight-command shell history on Up/Down and Tab completion for
   built-in commands plus file arguments to `cat`, `rm`, `run`, and `cc`. Host
   tests cover draft restoration, keyboard arrow translation, and unique command
@@ -315,12 +419,61 @@ the existing emulator/build outputs stay separate.
   tests cover multi-variable round-trip, corruption fallback, missing storage,
   and firmware without `QueryVariableInfo`. QEMU/OVMF runtime testing saved a
   file in the shell, reset the VM, restored the snapshot, and verified that
-  file. Disk-backed filesystem persistence remains open.
-- [ ] Port remaining device services and add USB keyboard support.
+  file. The two-slot USB GPT snapshot store passed both host fallback tests and
+  the opt-in QEMU/OVMF disk save/reset/restore test.
+- [x] Release held USB HID state after root-port removal. The kernel handles
+  xHCI port-status-change events, releases per-device keyboard modifiers/keys
+  and aggregated mouse buttons, and stops resubmitting reports after repeated
+  transfer errors. A QEMU hot-unplug probe holds a key, removes the keyboard,
+  and verifies the release marker.
+- [x] Automatically re-enumerate directly connected USB HID devices after
+  root-port reconnection. The kernel defers unrelated xHCI events during
+  synchronous commands, disables the removed slot, reuses an inactive HID
+  record, and submits a fresh interrupt transfer. QEMU verifies hot-unplug,
+  held-key release, re-add, re-enumeration, and a returned interrupt report.
+- `bob64/usb.c` also locates USB hub-class interfaces and their status interrupt
+  endpoints, parses USB 2 hub descriptors with bounded 1–127-port bitmaps, and
+  packs USB control setup packets for xHCI control transfers. Host tests cover
+  packet encoding, descriptor selection, small and maximum-size hubs, and
+  malformed/truncated input. At boot, the kernel selects a detected USB 2 hub's
+  configuration, reads its hub descriptor, marks the xHCI slot as a hub, powers
+  its downstream ports when switching is supported, waits the advertised
+  power-good interval, and reads their status. A QEMU profile verifies an
+  eight-port hub reports both an attached keyboard and mouse, resets both
+  connected ports, addresses the children with their topology route strings,
+  configures their HID endpoints, and exercises keyboard and mouse input through
+  the shell and managed window. It also configures the hub status endpoint;
+  QEMU hot-adds a keyboard and verifies that the kernel reads the changed port,
+  resets it, addresses the child, and configures its HID endpoint. The kernel
+  clears reported port-change features so stale status reports do not repeat.
+  The one-page control ring currently limits hub support to 16 ports.
+- [x] Raise direct-attach HID support beyond eight devices. HID records and the
+  aggregated mouse-button state now support up to 32 devices, bounded by the
+  xHCI controller's slot count. QEMU verifies nine directly attached devices.
+- [x] Add boot-time USB 2 hub child addressing and HID discovery. The kernel
+  builds bounded xHCI route strings, carries parent high-speed transaction
+  translator context through full-speed hubs, configures HID endpoints found
+  behind hubs, and submits their reports. QEMU verifies keyboard and mouse
+  input through an eight-port hub.
+- [x] Configure USB 2 hub status endpoints and monitor downstream change
+  reports. QEMU hot-adds a keyboard behind an eight-port hub and confirms the
+  xHCI interrupt endpoint delivers its status bitmap.
+- [x] Read and clear changed hub ports, then reset and enumerate newly attached
+  devices. QEMU hot-adds a downstream keyboard and verifies enumeration and
+  continued shell/desktop input. Boot-time scanning is capped at 16 ports and
+  the child topology queue is bounded to 32 devices.
+- [x] Verify hub-child hot-unplug and reconnection. QEMU removes the original
+  keyboard, confirms the hot-added keyboard can type, holds a key while removing
+  that keyboard, checks held input is released, then re-adds a keyboard and
+  verifies shell input recovers.
 - [x] Add typed pointer returns to the resident x86-64 compiler for
   `char *`, `short *`, `int *`, and declared struct pointers. Tests cover
   prototype calls, string literal and struct pointer returns, and rejection of
   incompatible pointee types.
+- [x] Add opaque 64-bit `void *` storage, assignment, parameter/return passing,
+  global object/array/string initializers, and object-pointer compatibility.
+  Runtime tests verify pointer identity through a helper call and typed
+  conversion; void-pointer arithmetic and dereference remain rejected.
 - [x] Add `void` helper functions and scalar `char` returns to the resident
   compiler. Void helpers accept explicit `return;` or fall through, can be called
   as statements, and are rejected in value contexts. Scalar `char` returns
@@ -362,10 +515,27 @@ the existing emulator/build outputs stay separate.
   `if`/`else` and `while` support signed
   relational/equality comparisons, and expressions support unary `!` plus
   short-circuit `&&`/`||`. Basic `for` loops now emit initialization, condition,
-  body, and scalar assignment update code. `break` and `continue` patch to the
+  body, and scalar assignment or increment/decrement update code. Prefix/postfix
+  increment and decrement work on scalar and typed pointer locals, with pointer
+  steps scaled by their pointee width. `break` and `continue` patch to the
   nearest loop; `for` continue enters its update clause. Early `return`
   statements work inside branches and loops; the subset still requires a final
-  return at the end of each function.
+  return at the end of each function. `do`/`while` now emits a post-tested loop;
+  `continue` targets its condition, and host tests execute nested do-loops,
+  continue, break, and the mandatory first iteration. The resident QEMU smoke
+  source also exercises do/while and continue. `switch` now dispatches integer
+  expressions to integer/character `case` constants, supports one `default`,
+  fallthrough, and `break`; `continue` skips the switch to its surrounding
+  loop. Host execution tests cover nested switches and nearest-control break
+  routing, signed values, and a 64-bit case above 4 GiB; the resident QEMU smoke
+  source tests case fallthrough.
+- The resident compiler now accepts named enum tags, up to 64 enumerators,
+  explicit literal values and implicit increments, enum-typed locals and
+  parameters, and `typedef enum Tag Alias;`. Enumerator names are usable in
+  expressions, global scalar/array initializers, and `switch` labels; duplicate constants and unknown tags fail
+  compilation. Host execution tests cover explicit and implicit numbering,
+  typedefs, function arguments, and enum-based switch dispatch. The resident
+  QEMU demo uses an enum for its switch test.
 - [x] Expand the resident compiler's bounded source, machine-code, and global
   data capacities from 4 KiB each to 16 KiB each. Host execution tests compile
   and run a source file larger than 4 KiB with generated code beyond the old
@@ -375,6 +545,16 @@ the existing emulator/build outputs stay separate.
   1 KiB frame and 64 variables. Code generation now uses disp8 or disp32 RBP
   operands as needed. Host execution tests cover forty local scalars, a 64-item
   local integer array and a 256-byte initialized character array.
+- [x] Support scalar local declarations without initializers and later
+  assignments, matching C's indeterminate-before-store behavior. Host execution
+  tests cover `char`, `short`, `long`, `long long`, `usize`, and pointer locals;
+  the QEMU-compiled `bob.c` smoke program declares and assigns locals in
+  separate statements.
+- [x] Add prefix and postfix `++`/`--` for scalar and typed pointer variables,
+  including scaled pointer steps and use in `for` updates. Host execution tests
+  cover value preservation, narrow signed wrap, forward/reverse loops, and
+  pointer arithmetic above 4 GiB; the QEMU-compiled `bob.c` smoke program
+  exercises both forms and pointer-return side effects.
 - [x] Add bounded resident C typedefs for scalar, pointer, and named-struct
   aliases. Host execution tests cover aliases in declarations, arrays, struct
   fields, pointer parameters/returns, and member access through an aliased
@@ -387,11 +567,20 @@ the existing emulator/build outputs stay separate.
   Host execution tests cover operator precedence, signed arithmetic shift, and
   unsigned right shift above 4 GiB; the QEMU resident-compiler smoke program
   exercises the same operators in the running kernel.
+- [x] Add compile-time `sizeof` for supported types and expressions in the
+  resident compiler. Host execution checks LLP64 scalar widths, 64-bit pointers,
+  typedefs, struct layout, arrays, strings, indexed elements, and that calls in
+  sizeof expressions remain unevaluated, including the required
+  `sizeof(void *) == 8` check. The QEMU-compiled `bob!` program also checks these
+  sizes in the running kernel.
 - [x] Add a kernel-owned per-app window manager and port the desktop's file and
   editor windows to its surfaces. Syscall ABI v12 creates, focuses, destroys,
   validates and copies app surfaces, composites z-order, routes input with
   64-bit handles and local/screen coordinates, and releases the session on app
-  exit. Concurrent apps are still not displayed together.
+  exit. The compositor tracks clipped damage from surface writes, focus changes,
+  moves, and destruction, then recomposes only the affected screen rectangle;
+  idle pointer motion does no framebuffer work. Concurrent apps are still not
+  displayed together.
 - [x] Run the native desktop under QEMU/OVMF at 1280x800. Both managed windows
   rendered; keyboard input created a third window, Escape returned to the
   shell, and Ctrl+S saved editor text through the file syscall. The full screen
@@ -406,6 +595,11 @@ the existing emulator/build outputs stay separate.
   editor; host packaging tests cover the control strings. QEMU/OVMF now opens
   the Applications launcher, starts its selected `bob!` child, and verifies
   that the desktop returns to the shell with a zero exit status.
+- [x] Make Enter open a selected ordinary file in the editor or run a selected
+  `.b64e` app, while keeping `O` as an explicit file-open shortcut and `A` / Run
+  App as explicit app-launch controls. The QEMU desktop smoke test presses Tab
+  and Enter in the Files window, verifies `bob.b64e` prints `bob!`, and confirms
+  control returns to the open desktop.
 - [x] Port reusable button behavior to the native framebuffer GUI. The
   `bob64/widgets.h` button handles hover/pressed states and activates only on
   an inside left-button release; the desktop uses it for Run App, APPS and
@@ -420,7 +614,8 @@ the existing emulator/build outputs stay separate.
   Yes/Cancel confirmation window. `D` and the file-window Delete button open
   the dialog; `Y`/Enter confirms and `N`/Escape cancels. The open editor file
   remains protected. The handoff build and full QEMU/OVMF regression pass;
-  direct QEMU interaction coverage for this dialog remains to be added.
+  QEMU verifies cancellation preserves a disposable file and confirmation
+  removes it.
 - [x] Port the Bob32 desktop's on-screen help overlay as a managed Bob64 help
   window. It is reachable from the Files panel or `H`/`?`, and documents the
   native desktop's current navigation, app-launch, delete, save, and focus
@@ -460,17 +655,25 @@ the existing emulator/build outputs stay separate.
   their virtual memory sizes. Host packaging tests assert the desktop's
   multi-megabyte zero-fill tail is loaded from B64E `MemorySize`, and QEMU
   verifies the desktop runs and B64S save/restore still succeeds.
-- [ ] Port the remaining applications to the kernel window API. Syscall ABI v11
-  also provides bounded file reads/writes/list/delete, console I/O,
-  full-screen presentation, blocking PS/2 keyboard/mouse events, ABI query, and
-  process exit. The host `bob64cc`
-  bridge continues to package the broader C subset supported by GCC.
-- [ ] Port the remaining existing applications and full GUI/widget behavior;
-  the current native text editor is an initial, limited desktop milestone.
+- [x] Port the existing user-facing Bob32 applications to the Bob64 native
+  app ABI, retaining their console workflows and providing managed windows for
+  the desktop, notes, graphics, launcher, file list, text viewer, system info,
+  and echo output. The native apps are packaged as B64E; host smoke tests cover
+  the utilities, while QEMU exercises their shell and windowed paths.
+- [x] Add a managed-window mode to `echo.b64e` without changing its shell
+  argument-printing mode. The GUI wraps argument text, supports keyboard and
+  wheel scrolling, and closes through Escape or its Close button; QEMU verifies
+  a guest launch, input handling, and clean return to the shell.
+- [x] Port Bob32's popup file-action menu as a reusable Bob64 widget. The Files
+  window opens it with `M`; it supports mouse hover/click, Up/Down, Enter,
+  Escape, and Open/Run/Delete actions. Host tests cover draw, selection,
+  activation, and dismissal; the QEMU suite covers its keyboard path.
 - [x] Port Bob32's graphics demo as a 640x400 kernel-composited Bob64 window.
   The native `display.b64e` app draws colored panels and diagonal lines, prints
-  `bob!`, and returns to the shell on X or Escape. The QEMU runtime test checks
-  presentation, clean app exit, and compatibility with snapshot save/restore.
+  `bob!`, and returns to the shell through a clickable Close button or X/Escape.
+  QEMU drags the window by its title bar, clicks the moved Close button through
+  the PS/2 IRQ and app event path, then checks clean app exit and snapshot
+  compatibility.
 - [x] Port the system-information utility as native `info.b64e`. It reports the
   syscall ABI, available display resolution, uptime, and RAM filesystem usage;
   the kernel embeds and launches it in the application smoke path. The kernel
@@ -482,25 +685,105 @@ the existing emulator/build outputs stay separate.
   the B64E image; QEMU opens it, checks `bob!`, and verifies a clean return to
   the shell. The shell can also run the launcher with `APP [ARG ...]`; ABI v12
   validates and forwards the full argv vector to the selected child.
+- [x] Verify the native launcher Close button's mouse press/release contract in
+  QEMU: pressing inside and releasing outside cancels activation, while a
+  complete inside click closes the launcher after its child app returns.
+- [x] Give `ls.b64e gui [FILE]` a managed file-list window with file names and
+  sizes, initial file selection, and keyboard/wheel selection. Double-click or
+  Enter/Open runs an executable or starts the `cat` text viewer with the selected
+  filename; preserve the existing shell listing. QEMU double-clicks bob.c and
+  verifies returning through both windows.
+- [x] Add `cat.b64e gui FILE` as a managed text viewer with bounded 16 KiB file
+  loading, wrapped lines, keyboard/page/mouse-wheel scrolling and clean close;
+  keep the original streaming console `cat FILE` path. QEMU opens `bob.c`, sends
+  scroll input, and verifies the app returns to the shell.
+- [x] Add `info.b64e gui` as a managed system-information window with a refresh
+  key while preserving the existing console report. QEMU opens it, refreshes
+  values, and confirms Escape returns to the shell.
+- [x] Expand B64S compressed firmware snapshots from two to six bounded data
+  chunks per slot so the added native GUI apps still fit. Host tests round-trip
+  a 100 KiB file through at least four chunks; QEMU verifies firmware save,
+  reboot, restore and app launch.
 - [x] Run the kernel-generated ring-3 `bob!` app under x64 UEFI emulation. The
   QEMU runtime test also compiles `bob.c` through the resident shell compiler,
   launches the resulting B64E app, and checks `bob!` and a zero exit status.
   The source exercises local character/integer arrays, helper functions, array
   parameters, loops, pointer-based syscall output, computed string length,
-  forty local variables, a 64-element stack array and a nested call with sixteen
-  integer arguments (four register-passed and twelve stack-passed).
+  local/global opaque `void *` conversions to scalar, array and string pointers,
+  separately declared and then assigned locals, forty local variables, a
+  64-element stack array and a nested call with
+  sixteen integer arguments (four register-passed and twelve stack-passed).
+  It also calls an eight-argument function with direct and opaque pointers on
+  the stack, where the seventh argument is produced by a nested six-argument
+  pointer-returning call whose fifth argument is itself stack-passed. Both
+  callees dereference the pointers and check the original array is intact.
+  Host compiler execution tests cover the same mixed register/stack pointer
+  case.
   The test saves the compiled app in B64S, resets, and launches it again after
   restore, then relaunches the GUI and a child app from the restored system.
-- [ ] Complete the full acceptance flow and add runtime tests for broader
-  calling-convention/stack cases and the remaining widget interactions.
-  The ring-3 app image runs at a virtual address above
-  4 GiB; host tests also cover synthetic high addresses and broad ABI/memory
-  cases.
+- [x] Verify live PS/2 mouse movement, wheel, and button delivery through IRQ12
+  and the app event ABI under QEMU. The ring-3 smoke app creates and focuses a
+  managed window, verifies the routed handle and window-local coordinates,
+  activates a managed button, and prints `bob!`; the runtime test injects all
+  three event types through QEMU's mouse monitor command.
+- [x] Complete the end-to-end acceptance flow under QEMU/OVMF: boot to the
+  shell, access files, resident-compile and launch `bob!`, use the managed GUI,
+  save and restore B64S, then continue using the restored apps and desktop. The
+  resident compiler tests also cover sixteen stack/register arguments and
+  nested mixed register/stack pointer calls in both host execution and the
+  running guest. The ring-3 image runs above 4 GiB; host tests cover synthetic
+  high addresses and broad ABI/memory cases.
+- [x] Exercise the desktop Help dismissal and file-delete confirmation flow in
+  QEMU. The runtime test verifies Help closes back to Files, Cancel preserves a
+  disposable RAM file through a mouse click, and confirmation removes that
+  exact file through the Yes keyboard shortcut.
+- [x] Exercise desktop file-popup mouse dismissal and selection in QEMU. After
+  keyboard navigation changes the highlighted action, a click outside closes
+  the popup without activating an item; reopening it and clicking Close Menu
+  selects the row, and the desktop remains usable through the remaining checks.
+- [ ] Complete runtime coverage for the remaining widget interactions and
+  port outstanding device services beyond the existing HID and USB storage
+  paths. QEMU verifies editor dirty-state protection, filename editing, popup
+  dismissal and mouse selection, filename-field Home/Right/End navigation,
+  insertion, Backspace and forward Delete, button press/release behavior, file
+  deletion, and exact saved text. The USB MSC driver covers BOT recovery, hotplug,
+  READ/WRITE(10) and READ/WRITE(16), bounded transfers, and validated GPT
+  partitions. B64S uses two checksummed generations; the full QEMU snapshot
+  regression saves, reboots, restores and verifies both a compiled app and the
+  desktop. A sparse 2 TiB+ GPT disk verifies this flow with its data partition
+  above the 32-bit LBA boundary and checks the raw B64D/B64S data at those high
+  offsets. Host regressions also exercise popup row selection, text-field
+  caret placement, window dragging, and routed local coordinates at the full
+  signed 32-bit coordinate limits; widget math widens before subtraction to
+  avoid overflow. The shared renderer clips off-screen rectangles and lines
+  before drawing and rejects pixel writes when the declared framebuffer
+  capacity is too small. Text glyph coordinates also use widened arithmetic,
+  so maximum-scale glyphs clip safely at signed coordinate limits. The window
+  compositor recomposes only changed surface, focus, and movement regions and
+  skips idle pointer events. Host tests cover single-pixel damage, overlapping
+  windows, move exposure, and idle motion; the full QEMU/OVMF desktop regression
+  passes. Further widget input combinations and additional USB classes remain
+  to be ported and tested.
 - [x] Verify bob64 boots in x64 UEFI emulation and performs its own kernel
   initialization without executing 32-bit kernel or app code. The broader
-  migration remains active: the resident C subset, USB and other device
-  support, disk-backed persistence, and remaining application ports still need
-  work.
+  migration remains active: the resident C subset and USB/device support still
+  need work.
+- [x] Remove the 32-bit LBA ceiling from USB mass storage. Probe READ CAPACITY
+  (10), fall back to READ CAPACITY (16) when the device reports the sentinel
+  last LBA, and issue READ/WRITE (16) whenever a request cannot fit in the
+  10-byte CDB form. GPT-backed data partitions can now sit above the 32-bit
+  LBA boundary (about 2 TiB with 512-byte sectors). Host tests cover command
+  selection, boundary-crossing requests, capacity parsing above 4 billion
+  sectors, and malformed ranges; the full host suite passes. A dedicated QEMU
+  probe boots with a sparse 2 TiB+ USB disk, reads its capacity through READ
+  CAPACITY (16), and verifies a patterned sector at LBA `0x100000000` through
+  READ (16).
+- [x] Verify GPT discovery and B64S persistence with the bob64 data partition
+  starting above the 32-bit LBA boundary. The extended snapshot regression
+  creates a sparse 2 TiB+ GPT image, saves a checkpoint, reboots, restores it,
+  launches a compiled app and the desktop, then checks the committed B64D
+  header and B64S payload at their high raw-image offsets. The full regression,
+  including COM1 runtime checks, passes.
 
 ## Build and test
 
@@ -509,7 +792,13 @@ build-tool --bob64
 build-tool --bob64-test
 build-tool --bob64-handoff
 build-tool --bob64-handoff-test
+build-tool --bob64-handoff-storage-test
+build-tool --bob64-handoff-storage-active-test
+build-tool --bob64-handoff-storage64-test
 tools/test_bob64_qemu.ps1 -QemuPath <qemu-system-x86_64.exe> -OvmfCodePath <edk2-x86_64-code.fd> -OvmfVarsPath <edk2-x86_64-vars.fd>
+tools/test_bob64_qemu.ps1 -QemuPath <qemu-system-x86_64.exe> -OvmfCodePath <edk2-x86_64-code.fd> -OvmfVarsPath <edk2-i386-vars.fd> -ImageRoot build/bob64-handoff-storage-active-test -ProbeOnly -ProbeDevice storage-active-disconnect
+tools/test_bob64_qemu.ps1 -QemuPath <qemu-system-x86_64.exe> -OvmfCodePath <edk2-x86_64-code.fd> -OvmfVarsPath <edk2-i386-vars.fd> -ImageRoot build/bob64-handoff-storage64-test -ProbeOnly -ProbeDevice storage64
+tools/test_bob64_qemu.ps1 -QemuPath <qemu-system-x86_64.exe> -OvmfCodePath <edk2-x86_64-code.fd> -OvmfVarsPath <edk2-i386-vars.fd> -LargeLbaDiskSnapshotTest
 ```
 
 The safe output goes to `build/bob64/EFI/BOOT/BOOTX64.EFI`; the opt-in handoff
@@ -517,10 +806,13 @@ The safe output goes to `build/bob64/EFI/BOOT/BOOTX64.EFI`; the opt-in handoff
 the PE/COFF architecture and subsystem, 64-bit pointers, synthetic addresses
   above 4 GiB, memory-map descriptor strides, page allocation/coalescing,
   allocation-ledger capacity, invalid free handling and overflow checks. The
-  PowerShell QEMU test performs a real OVMF boot of the handoff image and checks
-  serial markers through the kernel shell; it needs the QEMU executable and
+  PowerShell QEMU test performs a real OVMF boot of the handoff image, checks
+  serial markers through the kernel shell, and captures a desktop framebuffer
+  image to verify live GOP rendering; it needs the QEMU executable and
   `edk2-x86_64-code.fd` paths supplied by the caller. The full script does not
-  replace testing on physical UEFI hardware.
+  replace testing on physical UEFI hardware. `-ProbeOnly -ProbeDevice disconnect`
+  holds a USB keyboard key, hot-unplugs it and verifies release, re-adds the
+  keyboard, and verifies that the new HID endpoint returns an interrupt report.
 
 ## Memory layout boundary
 

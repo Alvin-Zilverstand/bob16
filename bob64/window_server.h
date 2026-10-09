@@ -17,7 +17,9 @@ typedef struct {
     usize SurfaceBytes[BOB64_WINDOW_SERVER_CAPACITY];
     u64 Owner;
     u64 BytesAllocated;
+    u32 DamageLeft,DamageTop,DamageRight,DamageBottom;
     u8 Active;
+    u8 Damaged;
 } BOB64_WINDOW_SERVER;
 
 int bob64_window_server_init(BOB64_WINDOW_SERVER *server,BOB64_HEAP *heap,

@@ -5,7 +5,11 @@
 #include "mouse.h"
 
 #define BOB64_COM1 0x3f8u
+#define BOB64_SERIAL_INPUT_QUEUE_SIZE 128u
 static int serial_available;
+static volatile u8 serial_irq_active;
+static u8 serial_input_queue[BOB64_SERIAL_INPUT_QUEUE_SIZE];
+static volatile u32 serial_input_head,serial_input_tail;
 static u8 pic_ready;
 static u8 pic_master_mask=0xff,pic_slave_mask=0xff;
 static volatile u64 timer_tick_count;
@@ -73,7 +77,32 @@ void bob64_early_console_hex64(u64 value) {
     serial_hex64(value);
 }
 
+void bob64_serial_irq_reset(void) {
+    serial_input_head=serial_input_tail=0;
+}
+
+int bob64_serial_irq_capture(u8 character) {
+    u32 head=serial_input_head,tail=serial_input_tail;
+    if((u32)(head-tail)>=BOB64_SERIAL_INPUT_QUEUE_SIZE)return -1;
+    serial_input_queue[head&(BOB64_SERIAL_INPUT_QUEUE_SIZE-1)]=character;
+    __asm__ volatile("":::"memory");
+    serial_input_head=head+1;
+    return 0;
+}
+
+int bob64_serial_irq_pop(u8 *character) {
+    u32 tail=serial_input_tail,head=serial_input_head;
+    if(!character||tail==head)return -1;
+    __asm__ volatile("":::"memory");
+    *character=serial_input_queue[tail&(BOB64_SERIAL_INPUT_QUEUE_SIZE-1)];
+    __asm__ volatile("":::"memory");
+    serial_input_tail=tail+1;
+    return 0;
+}
+
 int bob64_early_console_try_read(void) {
+    u8 character;
+    if(serial_irq_active)return bob64_serial_irq_pop(&character)?-1:character;
     if(!serial_available||(port_in8(BOB64_COM1+5)&1)==0)return -1;
     return port_in8(BOB64_COM1);
 }
@@ -96,6 +125,8 @@ int bob64_interrupts_build_idt(BOB64_IDT_GATE entries[BOB64_IDT_ENTRIES],u16 sel
                               BOB64_IDT_INTERRUPT_GATE))return -1;
     }
     if(bob64_idt_set_gate(&entries[0x20],(u64)(uintptr_t)bob64_irq0_entry,
+       selector,0,0,BOB64_IDT_INTERRUPT_GATE))return -1;
+    if(bob64_idt_set_gate(&entries[0x24],(u64)(uintptr_t)bob64_irq4_entry,
        selector,0,0,BOB64_IDT_INTERRUPT_GATE))return -1;
     if(bob64_idt_set_gate(&entries[0x80],(u64)(uintptr_t)bob64_syscall_entry,
        selector,0,3,BOB64_IDT_INTERRUPT_GATE))return -1;
@@ -129,6 +160,23 @@ static void pic_unmask(u8 irq) {
         pic_master_mask=(u8)(pic_master_mask&~(1u<<2));
     }
     port_out8(0xa1,pic_slave_mask);port_out8(0x21,pic_master_mask);
+}
+
+int bob64_interrupts_enable_serial(void) {
+    u64 saved_flags;
+    if(!serial_available)return -1;
+    __asm__ volatile("pushfq; pop %0; cli":"=r"(saved_flags)::"memory");
+    if(pic_initialize())goto failed;
+    bob64_serial_irq_reset();
+    while(port_in8(BOB64_COM1+5)&1u)(void)port_in8(BOB64_COM1);
+    port_out8(BOB64_COM1+1,0x01); /* receive-data interrupt only */
+    serial_irq_active=1;
+    pic_unmask(4);
+    if(saved_flags&0x200)__asm__ volatile("sti":::"memory");
+    return 0;
+failed:
+    if(saved_flags&0x200)__asm__ volatile("sti":::"memory");
+    return -1;
 }
 
 void bob64_timer_irq_tick(void) { timer_tick_count++; }
@@ -213,6 +261,21 @@ failed:
 void BOB64_MS_ABI bob64_irq_dispatch(const BOB64_INTERRUPT_FRAME *frame) {
     if(frame&&frame->Vector==0x20) bob64_timer_irq_tick();
     else if(frame&&frame->Vector==0x21) (void)bob64_keyboard_irq_service();
+    else if(frame&&frame->Vector==0x24) {
+        for(u32 pending=0;pending<16;pending++) {
+            u8 interrupt_id=port_in8(BOB64_COM1+2);
+            u8 reason=(u8)((interrupt_id>>1)&7u);
+            if(interrupt_id&1u)break;
+            if(reason==2||reason==6||reason==3) {
+                u8 line_status=port_in8(BOB64_COM1+5);
+                while(line_status&1u) {
+                    (void)bob64_serial_irq_capture(port_in8(BOB64_COM1));
+                    line_status=port_in8(BOB64_COM1+5);
+                }
+            } else if(reason==0)(void)port_in8(BOB64_COM1+6);
+            else break;
+        }
+    }
     else if(frame&&frame->Vector==0x2c) {
         (void)bob64_mouse_irq_service();
         port_out8(0xa0,0x20);
@@ -235,7 +298,9 @@ u64 BOB64_MS_ABI bob64_exception_dispatch(const BOB64_INTERRUPT_FRAME *frame) {
         diagnostic_register("vector",frame->Vector);
         diagnostic_register("error",frame->ErrorCode);
         diagnostic_register("rip",frame->RIP);
+        diagnostic_register("rsp",bob64_interrupt_frame_rsp(frame));
         diagnostic_register("cs",frame->CS);
+        if(from_user)diagnostic_register("ss",frame->UserSS);
         diagnostic_register("rflags",frame->RFLAGS);
         diagnostic_register("rax",frame->RAX);diagnostic_register("rbx",frame->RBX);
         diagnostic_register("rcx",frame->RCX);diagnostic_register("rdx",frame->RDX);
@@ -245,6 +310,11 @@ u64 BOB64_MS_ABI bob64_exception_dispatch(const BOB64_INTERRUPT_FRAME *frame) {
         diagnostic_register("r11",frame->R11);diagnostic_register("r12",frame->R12);
         diagnostic_register("r13",frame->R13);diagnostic_register("r14",frame->R14);
         diagnostic_register("r15",frame->R15);
+        if(frame->Vector==14) {
+            u64 cr2;
+            __asm__ volatile("mov %%cr2,%0":"=r"(cr2));
+            diagnostic_register("cr2",cr2);
+        }
     }
     if(from_user) {
         bob64_user_exception_vector=frame->Vector;

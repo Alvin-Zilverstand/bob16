@@ -137,6 +137,50 @@ bob64_irq1_entry:
     add rsp,16
     iretq
 
+.globl bob64_irq4_entry
+bob64_irq4_entry:
+    push 0
+    push 36
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12,rsp
+    cld
+    and rsp,-16
+    sub rsp,32
+    mov rcx,r12
+    call bob64_irq_dispatch
+    mov rsp,r12
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp,16
+    iretq
+
 .globl bob64_irq12_entry
 bob64_irq12_entry:
     push 0

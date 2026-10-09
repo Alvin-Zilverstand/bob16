@@ -48,6 +48,12 @@ static inline void bob64_wm_clamp(BOB64_WINDOW_MANAGER *manager,BOB64_WINDOW *wi
     if(window->Y>max_y)window->Y=max_y;
 }
 
+static inline s32 bob64_wm_saturate_s32(s64 value) {
+    if(value<(-2147483647LL-1))return (-2147483647-1);
+    if(value>2147483647LL)return 2147483647;
+    return (s32)value;
+}
+
 static inline void bob64_wm_dirty_all(BOB64_WINDOW_MANAGER *manager) {
     for(u32 i=0;i<manager->Count;i++) {
         BOB64_WINDOW *window=bob64_wm_find(manager,manager->ZOrder[i]);
@@ -254,12 +260,14 @@ static inline s64 bob64_wm_dispatch(BOB64_WINDOW_MANAGER *manager,
                (event->Type==BOB64_EVENT_MOUSE_MOVE||event->Type==BOB64_EVENT_MOUSE_BUTTON)) {
                 if((event->Type==BOB64_EVENT_MOUSE_MOVE&&(event->Buttons&1u))||
                    event->Type==BOB64_EVENT_MOUSE_BUTTON)
-                    bob64_wm_move(manager,target,event->X-manager->DragOffsetX,
-                                  event->Y-manager->DragOffsetY);
+                    bob64_wm_move(manager,target,
+                        bob64_wm_saturate_s32((s64)event->X-manager->DragOffsetX),
+                        bob64_wm_saturate_s32((s64)event->Y-manager->DragOffsetY));
                 if(released&1u)manager->Dragging=0;
                 window=bob64_wm_find(manager,target);
             }
-            routed->X=event->X-window->X;routed->Y=event->Y-window->Y;
+            routed->X=bob64_wm_saturate_s32((s64)event->X-window->X);
+            routed->Y=bob64_wm_saturate_s32((s64)event->Y-window->Y);
         }
     }
     if(event->Type==BOB64_EVENT_MOUSE_MOVE||event->Type==BOB64_EVENT_MOUSE_BUTTON||

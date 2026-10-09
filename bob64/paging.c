@@ -192,7 +192,14 @@ int bob64_page_map_range(BOB64_PAGE_TABLE *table,u64 virtual_address,
     for(u64 i=0;i<pages;i++) {
         int result=bob64_page_map(table,virtual_page+i*BOB64_PAGE_SIZE,
                                   physical_page+i*BOB64_PAGE_SIZE,flags);
-        if(result)return result;
+        if(result) {
+            while(i) {
+                i--;
+                (void)bob64_page_unmap(table,
+                    virtual_page+i*BOB64_PAGE_SIZE,0,0);
+            }
+            return result;
+        }
     }
     return 0;
 }

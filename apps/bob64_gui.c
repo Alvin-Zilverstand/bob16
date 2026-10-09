@@ -47,12 +47,17 @@ static const BOB64_RECT delete_cancel_button={120,82,88,18};
 static const BOB64_RECT help_close_button={156,132,68,18};
 static const BOB64_RECT applications_run_button={8,38,68,16};
 static const BOB64_RECT applications_close_button={82,38,64,16};
+static const BOB64_RECT file_menu_rect={8,70,140,72};
+static const char *const file_menu_items[]={
+    "OPEN SELECTED","RUN APP","DELETE FILE","CLOSE MENU"
+};
 static BOB64_BUTTON_STATE file_run_state,file_apps_state;
 static BOB64_BUTTON_STATE file_delete_state;
 static BOB64_BUTTON_STATE file_help_state;
 static BOB64_BUTTON_STATE applications_run_state,applications_close_state;
 static BOB64_BUTTON_STATE delete_yes_state,delete_cancel_state;
 static BOB64_BUTTON_STATE help_close_state;
+static BOB64_MENU_STATE file_menu_state={0,-1,0};
 static BOB64_TEXT_FIELD filename_field;
 static u32 file_count,selected_file,file_scroll;
 static u32 selected_application,application_scroll;
@@ -608,13 +613,13 @@ static void gui_draw_window(const BOB64_WINDOW *window,int focused) {
         u32 list_bottom=window->Height>156?window->Height-156:70;
         u32 rows=list_bottom>70?(list_bottom-70)/14:0;
         bob64_gfx_text(graphics,window->X+10,window->Y+31,
-            "UP DOWN / WHEEL MOVE",0x009eb3c7u,1);
+            "UP/DN WHEEL MOVE M:MENU",0x009eb3c7u,1);
         bob64_button_draw(graphics,&file_run_button,"RUN APP",&file_run_state);
         bob64_button_draw(graphics,&file_apps_button,"APPS",&file_apps_state);
         bob64_button_draw(graphics,&file_delete_button,"DELETE",&file_delete_state);
         bob64_button_draw(graphics,&file_help_button,"HELP",&file_help_state);
         bob64_gfx_text(graphics,window->X+10,window->Y+52,
-            "O OPEN R REFRESH D DELETE",0x009eb3c7u,1);
+            "ENTER OPEN/RUN O OPEN R REFRESH",0x009eb3c7u,1);
         bob64_gfx_text(graphics,window->X+10,window->Y+61,editor_status,
                        0x008fc8ffu,1);
         bob64_gfx_text(graphics,window->X+10,
@@ -633,6 +638,10 @@ static void gui_draw_window(const BOB64_WINDOW *window,int focused) {
         }
         if(!file_count)bob64_gfx_text(graphics,window->X+10,window->Y+72,
             "NO FILES",0x008fc8ffu,1);
+        if(file_menu_state.Open)
+            bob64_menu_draw(graphics,&file_menu_rect,file_menu_items,
+                sizeof(file_menu_items)/sizeof(file_menu_items[0]),18,
+                &file_menu_state);
     } else if(window->Handle==delete_window) {
         bob64_gfx_text(graphics,window->X+16,window->Y+40,
             "DELETE THIS FILE?",0x00ffffffu,1);
@@ -646,13 +655,15 @@ static void gui_draw_window(const BOB64_WINDOW *window,int focused) {
         bob64_gfx_text(graphics,window->X+12,window->Y+38,
             "FILES: ARROWS/WHEEL SELECT",0x00e2ebf5u,1);
         bob64_gfx_text(graphics,window->X+12,window->Y+54,
-            "O OPENS; A RUNS AN APP",0x00e2ebf5u,1);
+            "ENTER OPENS FILES OR RUNS APPS",0x00e2ebf5u,1);
         bob64_gfx_text(graphics,window->X+12,window->Y+70,
             "D OR DELETE ASKS FIRST",0x00e2ebf5u,1);
         bob64_gfx_text(graphics,window->X+12,window->Y+86,
             "P OPENS THE APP LAUNCHER",0x00e2ebf5u,1);
         bob64_gfx_text(graphics,window->X+12,window->Y+102,
             "CTRL S SAVES; TAB SWITCHES",0x00e2ebf5u,1);
+        bob64_gfx_text(graphics,window->X+12,window->Y+118,
+            "M OPENS FILE ACTION MENU",0x00e2ebf5u,1);
         bob64_button_draw(graphics,&help_close_button,"CLOSE",
                           &help_close_state);
     } else if(window->Handle==applications_window) {
@@ -850,7 +861,10 @@ static void gui_key(const BOB64_EVENT *event) {
             gui_copy(editor_status,"WINDOW CLOSE FAILED",sizeof("WINDOW CLOSE FAILED"));
     }
     else if(manager.Focused==files_window) {
-        if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x48)) {
+        if(event->Character=='m'||event->Character=='M') {
+            file_menu_state.Open=1;file_menu_state.Selected=0;
+            file_menu_state.Pressed=-1;
+        } else if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x48)) {
             if(selected_file)selected_file--;
             gui_reveal_selected_file();
             gui_refresh_file_preview();
@@ -864,8 +878,13 @@ static void gui_key(const BOB64_EVENT *event) {
             gui_refresh_files();editor_open_armed=0;
         } else if(event->Character=='a'||event->Character=='A') {
             gui_run_selected_app();editor_open_armed=0;
-        } else if(event->Character=='o'||event->Character=='O'||
-                  event->Character=='\n')gui_open_selected_file();
+        } else if(event->Character=='\n') {
+            if(selected_file<file_count&&
+               gui_is_application(file_entries[selected_file].Name))
+                gui_run_selected_app();
+            else gui_open_selected_file();
+        } else if(event->Character=='o'||event->Character=='O')
+            gui_open_selected_file();
         else if(event->Character=='d'||event->Character=='D')gui_delete_selected_file();
         else if(event->Character=='h'||event->Character=='H'||
                 event->Character=='?')gui_open_help();
@@ -915,6 +934,24 @@ s64 bob64_app_main(const BOB64_APP_STARTUP *startup) {
     for(;;) {
         if(gui_draw(cursor_x,cursor_y))return -4;
         if(bob64_app_wait_event(&event))return -5;
+        if(file_menu_state.Open) {
+            BOB64_WINDOW *menu_window=bob64_wm_find(&manager,files_window);
+            BOB64_RECT menu_screen=file_menu_rect;
+            int action;
+            screen_event=event;
+            screen_event.X=event.ScreenX;screen_event.Y=event.ScreenY;
+            if(menu_window) {
+                menu_screen.X+=menu_window->X;
+                menu_screen.Y+=menu_window->Y;
+            }
+            action=bob64_menu_event(&menu_screen,file_menu_items,
+                sizeof(file_menu_items)/sizeof(file_menu_items[0]),18,
+                &file_menu_state,&screen_event);
+            if(action==0)gui_open_selected_file();
+            else if(action==1)gui_run_selected_app();
+            else if(action==2)gui_delete_selected_file();
+            continue;
+        }
         if(event.Type==BOB64_EVENT_KEY_DOWN&&event.Character==0x1b&&
            manager.Focused==delete_window) {
             gui_finish_delete(0);continue;

@@ -81,6 +81,17 @@ static void run_file_command(BOB64_SHELL *shell,char *arguments) {
     print_hex64(shell,(u64)status);output(shell,"\r\n");
 }
 
+static void show_font_test(BOB64_SHELL *shell) {
+    if(shell->Clear)shell->Clear(shell->Context);
+    output(shell,"ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n");
+    output(shell,"abcdefghijklmnopqrstuvwxyz\r\n");
+    output(shell,"0123456789\r\n\r\n");
+    output(shell,"0 O\r\n1 l I\r\n5 S\r\n8 B\r\n\r\n");
+    output(shell,"[] {} () <> / \\ | _ - + = : ; , . ! ?\r\n");
+    output(shell,"bob64 kernel shell\r\n");
+    output(shell,"The quick brown fox jumps over the lazy dog.\r\n");
+}
+
 static void compile_file_command(BOB64_SHELL *shell,char *arguments) {
     char source[BOB64_FS_NAME_CAPACITY],destination[BOB64_FS_NAME_CAPACITY];
     usize source_length=0,destination_length=0,error_offset=0;
@@ -227,7 +238,8 @@ static int completion_add_file(void *context,const char *name,usize length) {
 
 static void shell_complete(BOB64_SHELL *shell) {
     static const char *commands[]={"help","clear","mem","heap","version",
-        "save","restore","ls","cat","write","rm","run","cc","echo"};
+        "save","restore","ls","cat","write","rm","run","cc","echo",
+        "fonttest"};
     BOB64_SHELL_COMPLETIONS matches={0};
     const char *prefix=shell->Line;
     usize prefix_length=shell->Length;
@@ -333,8 +345,9 @@ static void execute(BOB64_SHELL *shell) {
         output(shell,"run desktop.b64e [FILE]  edit a RAM text file in the GUI\r\n");
         output(shell,"cc SOURCE [OUTPUT]  compile supported C to B64E (try bob.c)\r\n");
         output(shell,"Up/Down command history; Tab completes commands and files\r\n");
-        output(shell,"save  checkpoint files in RAM and firmware storage\r\n");
-        output(shell,"restore  restore firmware or RAM checkpoint\r\n");
+        output(shell,"save  checkpoint files in RAM and persistent storage\r\n");
+        output(shell,"restore  restore persistent or RAM checkpoint\r\n");
+        output(shell,"fonttest show the printable ASCII font sample\r\n");
         output(shell,"echo  print text\r\nversion show kernel version\r\n");
     } else if(equals(line,"clear")) {
         if(shell->Clear)shell->Clear(shell->Context);
@@ -345,6 +358,7 @@ static void execute(BOB64_SHELL *shell) {
         print_hex64(shell,(u64)bob64_heap_mapped_bytes(shell->Heap));
         output(shell," bytes\r\n");
     } else if(equals(line,"version"))output(shell,"bob64 kernel 0.1\r\n");
+    else if(equals(line,"fonttest"))show_font_test(shell);
     else if(equals(line,"save")) {
         usize size,written;
         if(bob64_fs_snapshot_size(shell->Filesystem,&size)) {
@@ -362,17 +376,17 @@ static void execute(BOB64_SHELL *shell) {
         shell->Snapshot=snapshot;shell->SnapshotSize=written;
         if(shell->SnapshotSave&&
            !shell->SnapshotSave(shell->SnapshotContext,snapshot,written))
-            output(shell,"saved B64S v1 checkpoint to firmware storage and RAM\r\n");
-        else output(shell,"saved B64S v1 in RAM; firmware save failed\r\n");
+            output(shell,"saved B64S v1 checkpoint to persistent storage and RAM\r\n");
+        else output(shell,"saved B64S v1 in RAM; persistent save failed\r\n");
     } else if(equals(line,"restore")) {
         if(shell->SnapshotRestore) {
             int persistent_result=shell->SnapshotRestore(shell->SnapshotContext,
                                                           shell->Filesystem);
             if(!persistent_result) {
-                output(shell,"restored B64S v1 from firmware storage\r\n");return;
+                output(shell,"restored B64S v1 from persistent storage\r\n");return;
             }
             if(persistent_result<0) {
-                output(shell,"firmware snapshot invalid; files unchanged\r\n");return;
+                output(shell,"persistent snapshot invalid; files unchanged\r\n");return;
             }
         }
         if(!shell->Snapshot||bob64_fs_snapshot_restore(shell->Filesystem,

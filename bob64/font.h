@@ -1,6 +1,12 @@
 #ifndef BOB64_FONT_H
 #define BOB64_FONT_H
 
+#define FONT_WIDTH 8u
+#define FONT_HEIGHT 16u
+#define LINE_HEIGHT 18u
+#define CHAR_SPACING 1u
+#define FONT_CELL_WIDTH (FONT_WIDTH+CHAR_SPACING)
+
 /* Compact 5x7 font: blank, A-Z, 0-9, ?, !, -, period, colon, equals, >. */
 static const u8 bob64_font5x7[44][5]={
     {0,0,0,0,0},
@@ -27,5 +33,40 @@ static const u8 bob64_font5x7[44][5]={
     {0x00,0x36,0x36,0x00,0x00},{0x14,0x14,0x14,0x14,0x14},
     {0x41,0x22,0x14,0x08,0x00}
 };
+
+typedef struct {
+    const u8 *Data;
+    u8 Width,Height;
+    u16 GlyphCount;
+    u8 BytesPerGlyph,ColumnMajor,MostSignificantBitFirst;
+} BOB64_BITMAP_FONT;
+
+static const BOB64_BITMAP_FONT bob64_font5x7={
+    &bob64_font5x7[0][0],5,7,44,5,1,0
+};
+
+typedef void (*BOB64_FONT_PLOT_PIXEL)(void *context,s64 x,s64 y,
+                                     u32 scale,u32 color);
+
+static inline int bob64_font_sample(const BOB64_BITMAP_FONT *font,u32 glyph,
+                                    u32 x,u32 y) {
+    u32 axis,bit;
+    if(!font||!font->Data||glyph>=font->GlyphCount||x>=font->Width||
+       y>=font->Height)return 0;
+    if(font->ColumnMajor)axis=x,bit=y;
+    else axis=y,bit=x;
+    u8 mask=font->MostSignificantBitFirst?
+        (u8)(0x80u>>bit):(u8)(1u<<bit);
+    return (font->Data[(usize)glyph*font->BytesPerGlyph+axis]&mask)!=0;
+}
+
+static inline void bob64_font_draw_glyph(const BOB64_BITMAP_FONT *font,
+        u32 glyph,s64 x,s64 y,u32 scale,BOB64_FONT_PLOT_PIXEL plot,
+        void *context,u32 color) {
+    if(!font||!plot||!scale||glyph>=font->GlyphCount)return;
+    for(u32 row=0;row<font->Height;row++)for(u32 column=0;column<font->Width;column++)
+        if(bob64_font_sample(font,glyph,column,row))
+            plot(context,x+(s64)column*scale,y+(s64)row*scale,scale,color);
+}
 
 #endif

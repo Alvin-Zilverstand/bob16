@@ -4,6 +4,17 @@
 #include "abi.h"
 #include "event.h"
 
+/* The resident compiler and native GCC apps share Bob64's LLP64 data model. */
+#if defined(__cplusplus)
+static_assert(sizeof(void *)==8,"Bob64 apps require 64-bit pointers");
+static_assert(sizeof(short)==2&&sizeof(int)==4&&sizeof(long)==4&&
+              sizeof(long long)==8,"Bob64 apps require the LLP64 data model");
+#else
+_Static_assert(sizeof(void *)==8,"Bob64 apps require 64-bit pointers");
+_Static_assert(sizeof(short)==2&&sizeof(int)==4&&sizeof(long)==4&&
+               sizeof(long long)==8,"Bob64 apps require the LLP64 data model");
+#endif
+
 /* Native apps use int 0x80; only RAX is changed by a returning service. */
 static inline s64 bob64_app_query_abi(void) {
     register u64 rax __asm__("rax")=BOB64_SYSCALL_QUERY_ABI;

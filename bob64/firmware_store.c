@@ -9,7 +9,7 @@
     EFI_VARIABLE_BOOTSERVICE_ACCESS|EFI_VARIABLE_RUNTIME_ACCESS)
 #define BOB64_FIRMWARE_SNAPSHOT_RAW_LIMIT (32u*1024u*1024u)
 #define BOB64_FIRMWARE_CHUNK_SIZE 30720u
-#define BOB64_FIRMWARE_CHUNK_COUNT 2u
+#define BOB64_FIRMWARE_CHUNK_COUNT 6u
 #define BOB64_FIRMWARE_MANIFEST_SIZE 32u
 #define BOB64_FIRMWARE_ACTIVE_SIZE 16u
 
@@ -22,11 +22,19 @@ static const CHAR16 firmware_manifest_names[2][14]={
     {'B','o','b','6','4','S','l','o','t','A',0},
     {'B','o','b','6','4','S','l','o','t','B',0}
 };
-static const CHAR16 firmware_chunk_names[2][2][16]={
+static const CHAR16 firmware_chunk_names[2][BOB64_FIRMWARE_CHUNK_COUNT][16]={
     {{'B','o','b','6','4','D','a','t','a','A','0',0},
-     {'B','o','b','6','4','D','a','t','a','A','1',0}},
+     {'B','o','b','6','4','D','a','t','a','A','1',0},
+     {'B','o','b','6','4','D','a','t','a','A','2',0},
+     {'B','o','b','6','4','D','a','t','a','A','3',0},
+     {'B','o','b','6','4','D','a','t','a','A','4',0},
+     {'B','o','b','6','4','D','a','t','a','A','5',0}},
     {{'B','o','b','6','4','D','a','t','a','B','0',0},
-     {'B','o','b','6','4','D','a','t','a','B','1',0}}
+     {'B','o','b','6','4','D','a','t','a','B','1',0},
+     {'B','o','b','6','4','D','a','t','a','B','2',0},
+     {'B','o','b','6','4','D','a','t','a','B','3',0},
+     {'B','o','b','6','4','D','a','t','a','B','4',0},
+     {'B','o','b','6','4','D','a','t','a','B','5',0}}
 };
 static const CHAR16 firmware_active_name[]={
     'B','o','b','6','4','A','c','t','i','v','e',0
