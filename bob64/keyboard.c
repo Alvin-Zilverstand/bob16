@@ -123,20 +123,26 @@ int bob64_keyboard_decode(BOB64_KEYBOARD_STATE *state,u8 scancode) {
     return (int)event.Character;
 }
 
+int bob64_keyboard_event_input(const BOB64_EVENT *event) {
+    if(!event||event->Type!=BOB64_EVENT_KEY_DOWN)return -1;
+    if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x48))
+        return BOB64_KEYBOARD_INPUT_UP;
+    if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x50))
+        return BOB64_KEYBOARD_INPUT_DOWN;
+    return event->Character?(int)event->Character:-1;
+}
+
 int bob64_keyboard_poll(void) {
-    u8 status,scancode;
+    BOB64_EVENT event;
     if(keyboard_irq_active) {
-        BOB64_EVENT event;
-        while(!bob64_keyboard_irq_pop_event(&event))
-            if(event.Type==BOB64_EVENT_KEY_DOWN&&event.Character)
-                return (int)event.Character;
+        while(!bob64_keyboard_irq_pop_event(&event)) {
+            int input=bob64_keyboard_event_input(&event);
+            if(input>=0)return input;
+        }
         return -1;
     }
-    __asm__ volatile("inb $0x64,%0":"=a"(status));
-    if(status==0xff||!(status&1))return -1;
-    if(status&0x20) { __asm__ volatile("inb $0x60,%0":"=a"(scancode));return -1; }
-    __asm__ volatile("inb $0x60,%0":"=a"(scancode));
-    return bob64_keyboard_decode(&keyboard_state,scancode);
+    if(bob64_keyboard_poll_event(&event))return -1;
+    return bob64_keyboard_event_input(&event);
 }
 
 int bob64_keyboard_poll_event(BOB64_EVENT *event) {

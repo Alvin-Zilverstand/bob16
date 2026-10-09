@@ -20,6 +20,11 @@ typedef struct {
 
 _Static_assert(sizeof(BOB64_USER_RETURN_FRAME)==40,
                "assembly user-return frame layout");
+_Static_assert(__builtin_offsetof(BOB64_USER_RETURN_FRAME,ReturnValue)==8&&
+               __builtin_offsetof(BOB64_USER_RETURN_FRAME,PreviousReturnValue)==16&&
+               __builtin_offsetof(BOB64_USER_RETURN_FRAME,PreviousInterruptState)==24&&
+               __builtin_offsetof(BOB64_USER_RETURN_FRAME,PreviousActive)==32,
+               "assembly user-return frame offsets");
 
 typedef void (*BOB64_SYSCALL_WRITE)(void *context,u8 character);
 typedef int (*BOB64_SYSCALL_READ_USER)(void *context,u64 address,
@@ -39,6 +44,10 @@ typedef s64 (*BOB64_SYSCALL_FILE_READ_AT)(void *context,const char *name,u64 off
 typedef s64 (*BOB64_SYSCALL_FILE_WRITE_AT)(void *context,const char *name,u64 offset,
                                            const u8 *buffer,usize length);
 typedef int (*BOB64_SYSCALL_EVENT_WAIT)(void *context,BOB64_EVENT *event);
+typedef int (*BOB64_SYSCALL_APP_RUN)(void *context,const char *name,
+                                     usize argument_count,
+                                     const char *const *arguments,
+                                     s64 *exit_status);
 
 extern volatile u64 bob64_user_active;
 extern volatile u64 bob64_user_depth;
@@ -58,6 +67,8 @@ void bob64_syscall_set_file_stream(BOB64_SYSCALL_FILE_OPEN open_file,
                                    BOB64_SYSCALL_FILE_WRITE_AT write_at,
                                    void *context);
 void bob64_syscall_set_wait_event(BOB64_SYSCALL_EVENT_WAIT wait_event,void *context);
+void bob64_syscall_set_app_runner(BOB64_SYSCALL_APP_RUN run_application,
+                                  void *context);
 void bob64_syscall_set_window_server(BOB64_WINDOW_SERVER *server,u64 owner);
 void bob64_syscall_set_address_space(const BOB64_PAGE_TABLE *page_table);
 /* Nested kernel app runs save and restore the complete syscall service state. */

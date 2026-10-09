@@ -32,11 +32,15 @@ typedef struct {
     void *FileStreamContext;
     BOB64_SYSCALL_EVENT_WAIT WaitEvent;
     void *WaitEventContext;
+    BOB64_SYSCALL_APP_RUN RunApplication;
+    void *AppRunnerContext;
     BOB64_WINDOW_SERVER *WindowServer;
     u64 WindowOwner;
     const BOB64_PAGE_TABLE *PageTable;
     u32 SurfaceChunk[BOB64_SYSCALL_COPY_CHUNK_BYTES/sizeof(u32)];
     u8 Buffer[BOB64_SYSCALL_MAX_BUFFER];
+    char ArgumentStorage[BOB64_SYSCALL_MAX_ARGUMENT_BYTES];
+    char *Arguments[BOB64_SYSCALL_MAX_ARGUMENTS];
     BOB64_FILE_INFO FileEntries[BOB64_SYSCALL_MAX_FILES];
     BOB64_SYSCALL_HANDLE Handles[BOB64_SYSCALL_OPEN_HANDLES];
     u64 NextHandle;
@@ -64,11 +68,15 @@ static u32 syscall_context_depth;
 #define syscall_file_stream_context syscall_context.FileStreamContext
 #define syscall_wait_event syscall_context.WaitEvent
 #define syscall_wait_event_context syscall_context.WaitEventContext
+#define syscall_run_application syscall_context.RunApplication
+#define syscall_app_runner_context syscall_context.AppRunnerContext
 #define syscall_window_server syscall_context.WindowServer
 #define syscall_window_owner syscall_context.WindowOwner
 #define syscall_page_table syscall_context.PageTable
 #define syscall_surface_chunk syscall_context.SurfaceChunk
 #define syscall_buffer syscall_context.Buffer
+#define syscall_argument_storage syscall_context.ArgumentStorage
+#define syscall_arguments syscall_context.Arguments
 #define syscall_file_entries syscall_context.FileEntries
 #define syscall_handles syscall_context.Handles
 #define syscall_next_handle syscall_context.NextHandle
@@ -153,6 +161,12 @@ void bob64_syscall_set_wait_event(BOB64_SYSCALL_EVENT_WAIT wait_event,void *cont
     syscall_wait_event_context=context;
 }
 
+void bob64_syscall_set_app_runner(BOB64_SYSCALL_APP_RUN run_application,
+                                  void *context) {
+    syscall_run_application=run_application;
+    syscall_app_runner_context=context;
+}
+
 void bob64_syscall_set_window_server(BOB64_WINDOW_SERVER *server,u64 owner) {
     syscall_window_server=server;
     syscall_window_owner=server?owner:0;
@@ -201,6 +215,69 @@ u64 BOB64_MS_ABI bob64_syscall_dispatch(BOB64_INTERRUPT_FRAME *frame) {
     if(frame->RAX==BOB64_SYSCALL_GET_TICKS) {
         frame->RAX=bob64_timer_ticks();
         return 0;
+    }
+    if(frame->RAX==BOB64_SYSCALL_RUN_APPLICATION) {
+        char name[BOB64_SYSCALL_MAX_FILENAME+1];
+        u64 name_address=frame->RCX,name_length=frame->RDX;
+        u64 status_address=frame->R8;
+        u64 argument_count=frame->RSI,argument_vector=frame->R9;
+        usize argument_bytes=0;
+        s64 exit_status=0;
+        if(!syscall_run_application||!syscall_read_user||!syscall_write_user) {
+            frame->RAX=(u64)-38;return 0;
+        }
+        if(!name_length||name_length>BOB64_SYSCALL_MAX_FILENAME) {
+            frame->RAX=(u64)-22;return 0;
+        }
+        if(argument_count>BOB64_SYSCALL_MAX_ARGUMENTS||
+           (argument_count&&!argument_vector)) {frame->RAX=(u64)-22;return 0;}
+        if(syscall_validate_user_range(syscall_page_table,name_address,name_length,
+               BOB64_PAGE_USER,BOB64_SYSCALL_MAX_BUFFER)||
+           syscall_validate_user_range(syscall_page_table,status_address,
+               sizeof(exit_status),BOB64_PAGE_USER|BOB64_PAGE_WRITE,
+               sizeof(exit_status))||
+           syscall_read_user(syscall_read_user_context,name_address,name,
+                             (usize)name_length)) {
+            frame->RAX=(u64)-14;return 0;
+        }
+        name[name_length]=0;
+        if(argument_count) {
+            u64 vector_bytes=argument_count*sizeof(u64);
+            if(syscall_validate_user_range(syscall_page_table,argument_vector,
+                    vector_bytes,BOB64_PAGE_USER,BOB64_SYSCALL_MAX_ARGUMENT_BYTES)) {
+                frame->RAX=(u64)-14;return 0;
+            }
+            for(usize i=0;i<(usize)argument_count;i++) {
+                u64 string_address=0;
+                int terminated=0;
+                if(syscall_read_user(syscall_read_user_context,
+                       argument_vector+i*sizeof(u64),&string_address,sizeof(u64))||
+                   !string_address) {frame->RAX=(u64)-14;return 0;}
+                syscall_arguments[i]=syscall_argument_storage+argument_bytes;
+                while(argument_bytes<sizeof(syscall_context.ArgumentStorage)) {
+                    char character;
+                    if(syscall_validate_user_range(syscall_page_table,
+                           string_address,1,BOB64_PAGE_USER,
+                           BOB64_SYSCALL_MAX_ARGUMENT_BYTES)||
+                       syscall_read_user(syscall_read_user_context,string_address,
+                           &character,1)) {frame->RAX=(u64)-14;return 0;}
+                    string_address++;
+                    syscall_argument_storage[argument_bytes++]=character;
+                    if(!character){terminated=1;break;}
+                }
+                if(!terminated) {frame->RAX=(u64)-7;return 0;}
+            }
+        }
+        int result=syscall_run_application(syscall_app_runner_context,name,
+                    (usize)argument_count,
+                    (const char *const *)syscall_arguments,
+                    &exit_status);
+        if(result) {frame->RAX=(u64)(result<0?result:-5);return 0;}
+        if(syscall_write_user(syscall_write_user_context,status_address,
+                              &exit_status,sizeof(exit_status))) {
+            frame->RAX=(u64)-14;return 0;
+        }
+        frame->RAX=0;return 0;
     }
     if(frame->RAX==BOB64_SYSCALL_WRITE_CHAR) {
         if(!syscall_write_character) {

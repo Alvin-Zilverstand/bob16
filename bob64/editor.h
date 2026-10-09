@@ -3,7 +3,7 @@
 
 #include "abi.h"
 
-#define BOB64_EDITOR_CAPACITY BOB64_SYSCALL_MAX_BUFFER
+#define BOB64_EDITOR_CAPACITY (4u*BOB64_SYSCALL_MAX_BUFFER)
 
 typedef struct {
     char Text[BOB64_EDITOR_CAPACITY+1];
@@ -12,6 +12,15 @@ typedef struct {
     u32 ScrollRow;
     u8 Dirty;
 } BOB64_EDITOR;
+
+static inline int bob64_editor_is_binary_text(const char *text,usize length) {
+    if(!text&&length)return 1;
+    for(usize i=0;i<length;i++) {
+        u8 value=(u8)text[i];
+        if(!value||(value<32&&value!='\n'&&value!='\r'&&value!='\t'))return 1;
+    }
+    return 0;
+}
 
 static inline void bob64_editor_init(BOB64_EDITOR *editor,const char *text,u32 length) {
     if(!editor)return;
@@ -94,6 +103,11 @@ static inline void bob64_editor_handle_key(BOB64_EDITOR *editor,const BOB64_EVEN
     else if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x4d))bob64_editor_move(editor,1);
     else if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x48))bob64_editor_move_vertical(editor,-1);
     else if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x50))bob64_editor_move_vertical(editor,1);
+    else if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x47))
+        while(editor->Cursor&&editor->Text[editor->Cursor-1]!='\n')editor->Cursor--;
+    else if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x4f))
+        while(editor->Cursor<editor->Length&&editor->Text[editor->Cursor]!='\n')
+            editor->Cursor++;
     else if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x53))bob64_editor_delete(editor);
     else if(event->Character=='\b')bob64_editor_backspace(editor);
     else if(event->Character=='\n')bob64_editor_insert(editor,'\n');

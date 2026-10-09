@@ -62,6 +62,48 @@ static unsigned char *read_file(const char *path,size_t *length) {
     }
     *length=(size_t)size;return bytes;
 }
+
+/* Put a trailing zero-fill section after PE's final file-backed sections. */
+static int bss_layout_arguments(const unsigned char *pe,size_t pe_size,
+        char *arguments,size_t capacity) {
+    uint32_t pe_offset,alignment,bss_rva=0,bss_size=0,bss_raw=0;
+    uint32_t idata_rva=0,idata_size=0,idata_raw=0;
+    uint16_t section_count,optional_size;
+    uint64_t image_base,idata_address,bss_address;
+    size_t section_table;
+    if(!pe||!arguments||!capacity||pe_size<64||pe[0]!='M'||pe[1]!='Z')return -1;
+    arguments[0]=0;pe_offset=read32(pe+0x3c);
+    if((uint64_t)pe_offset+24>pe_size||memcmp(pe+pe_offset,"PE\0\0",4))return -1;
+    const unsigned char *coff=pe+pe_offset+4;
+    section_count=read16(coff+2);optional_size=read16(coff+16);
+    if(!section_count||section_count>32||optional_size<112||
+       (uint64_t)pe_offset+24+optional_size>pe_size)return -1;
+    const unsigned char *optional=coff+20;
+    image_base=read64(optional+24);alignment=read32(optional+32);
+    if(read16(optional)!=0x20b||!alignment||
+       (uint64_t)pe_offset+24+optional_size>pe_size)return -1;
+    section_table=(size_t)pe_offset+24+optional_size;
+    if(section_count>(pe_size-section_table)/40)return -1;
+    for(uint16_t i=0;i<section_count;i++) {
+        const unsigned char *section=pe+section_table+(size_t)i*40;
+        uint32_t virtual_size=read32(section+8),rva=read32(section+12);
+        uint32_t raw_size=read32(section+16);
+        if(!memcmp(section,".bss",4)) {
+            bss_rva=rva;bss_size=virtual_size;bss_raw=raw_size;
+        } else if(!memcmp(section,".idata",6)) {
+            idata_rva=rva;idata_size=virtual_size;idata_raw=raw_size;
+        }
+    }
+    if(!bss_size||bss_raw||!idata_size||idata_rva<=bss_rva)return 0;
+    if((idata_size>alignment?idata_size:idata_raw)>alignment||
+       image_base>UINT64_MAX-bss_rva-alignment)return -1;
+    idata_address=image_base+bss_rva;
+    bss_address=idata_address+alignment;
+    int length=snprintf(arguments,capacity,
+        "-Wl,--section-start,.idata=0x%llx -Wl,--section-start,.bss=0x%llx",
+        (unsigned long long)idata_address,(unsigned long long)bss_address);
+    return length<0||(size_t)length>=capacity?-1:1;
+}
 static int write_b64e(const char *path,const unsigned char *pe,size_t pe_size,
                       const unsigned char *payload,size_t payload_size) {
     uint32_t pe_offset,entry_rva,section_alignment,size_of_image;
@@ -148,7 +190,7 @@ static int quote(char *out,size_t capacity,const char *value) {
 int main(int argc,char **argv) {
     const char *compiler=getenv("BOB64_CC"),*objcopy=getenv("BOB64_OBJCOPY");
     char q_source[4096],q_output[4096];
-    char command[16384],exe_path[256],bin_path[256];
+    char command[16384],section_arguments[192],exe_path[256],bin_path[256];
     size_t pe_size=0,payload_size=0;
     unsigned char *pe=NULL,*payload=NULL;
     int result=1;
@@ -174,17 +216,35 @@ int main(int argc,char **argv) {
        quote(q_entry,sizeof(q_entry),"bob64/app_entry.S")) {
         fprintf(stderr,"bob64cc: temporary path too long\n");return 2;
     }
+    section_arguments[0]=0;
     snprintf(command,sizeof(command),
         "%s -I. -DBOB64_UEFI_ABI -std=c11 -O2 -Wall -Wextra -Werror -ffreestanding "
         "-fno-builtin -fno-stack-protector -fno-stack-check -fno-unwind-tables "
         "-fno-asynchronous-unwind-tables -fPIC -mno-red-zone -nostdlib bob64/libc.c %s %s "
-        "-Wl,--image-base,0x3ffffff000 -Wl,--disable-dynamicbase "
+        "%s -Wl,--image-base,0x3ffffff000 -Wl,--disable-dynamicbase "
         "-Wl,--disable-reloc-section -Wl,-e,bob64_app_entry -o %s",
-        compiler,q_entry,q_source,q_exe);
+        compiler,q_entry,q_source,section_arguments,q_exe);
     if(system(command)!=0)goto done;
+    pe=read_file(exe_path,&pe_size);
+    int layout_result=pe?bss_layout_arguments(pe,pe_size,section_arguments,
+                                             sizeof(section_arguments)):-1;
+    if(layout_result<0)goto done;
+    if(layout_result>0) {
+        free(pe);pe=NULL;
+        snprintf(command,sizeof(command),
+            "%s -I. -DBOB64_UEFI_ABI -std=c11 -O2 -Wall -Wextra -Werror -ffreestanding "
+            "-fno-builtin -fno-stack-protector -fno-stack-check -fno-unwind-tables "
+            "-fno-asynchronous-unwind-tables -fPIC -mno-red-zone -nostdlib bob64/libc.c %s %s "
+            "%s -Wl,--image-base,0x3ffffff000 -Wl,--disable-dynamicbase "
+            "-Wl,--disable-reloc-section -Wl,-e,bob64_app_entry -o %s",
+            compiler,q_entry,q_source,section_arguments,q_exe);
+        if(system(command)!=0)goto done;
+        pe=read_file(exe_path,&pe_size);
+        if(!pe)goto done;
+    }
     snprintf(command,sizeof(command),"%s -O binary %s %s",objcopy,q_exe,q_bin);
     if(system(command)!=0)goto done;
-    pe=read_file(exe_path,&pe_size);payload=read_file(bin_path,&payload_size);
+    payload=read_file(bin_path,&payload_size);
     if(!pe||!payload||write_b64e(argv[2],pe,pe_size,payload,payload_size))goto done;
     result=0;
 done:

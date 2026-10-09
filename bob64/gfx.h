@@ -10,10 +10,14 @@ typedef struct {
     usize Capacity;
 } BOB64_GFX;
 
+#define BOB64_GFX_MAX_WIDTH 1280u
+#define BOB64_GFX_MAX_HEIGHT 800u
+
 static inline int bob64_gfx_init(BOB64_GFX *graphics,u32 *pixels,usize capacity) {
     u32 width,height;
     if(!graphics||!pixels||bob64_app_get_display(&width,&height)||!width||!height||
-       (u64)width*height>capacity||width>1024||height>768)return -1;
+       (u64)width*height>capacity||width>BOB64_GFX_MAX_WIDTH||
+       height>BOB64_GFX_MAX_HEIGHT)return -1;
     graphics->Pixels=pixels;graphics->Width=width;graphics->Height=height;
     graphics->Capacity=capacity;
     return 0;

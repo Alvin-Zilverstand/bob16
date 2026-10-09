@@ -12,6 +12,7 @@
 #define BOB64_HANDOFF_BOOT_PATH "build\\bob64-handoff\\EFI\\BOOT\\BOOTX64.EFI"
 #define BOB_COMMAND "bob.exe"
 #define BOB32_COMMAND "bob32.exe"
+#define BOB64_TEST_THREAD_FLAGS ""
 #else
 #define EXE ""
 #define BUILD_DIR "./build/"
@@ -19,6 +20,7 @@
 #define BOB64_HANDOFF_BOOT_PATH "build/bob64-handoff/EFI/BOOT/BOOTX64.EFI"
 #define BOB_COMMAND "./bob"
 #define BOB32_COMMAND "./bob32"
+#define BOB64_TEST_THREAD_FLAGS "-pthread "
 #endif
 
 static void run(const char *command) {
@@ -42,6 +44,14 @@ static void build_bob64(int handoff) {
     run(BUILD_DIR "bob64cc" EXE " apps/bob64_smoke.c build/bob64-app/smoke.b64e");
     run(BUILD_DIR "bob64cc" EXE " apps/bob64_display.c build/bob64-app/display.b64e");
     run(BUILD_DIR "bob64cc" EXE " apps/bob64_gui.c build/bob64-app/gui.b64e");
+    run(BUILD_DIR "bob64cc" EXE " apps/bob64_nested_smoke.c build/bob64-app/nested-smoke.b64e");
+    run(BUILD_DIR "bob64cc" EXE " apps/bob64_echo.c build/bob64-app/echo.b64e");
+    run(BUILD_DIR "bob64cc" EXE " apps/bob64_ls.c build/bob64-app/ls.b64e");
+    run(BUILD_DIR "bob64cc" EXE " apps/bob64_cat.c build/bob64-app/cat.b64e");
+    run(BUILD_DIR "bob64cc" EXE " apps/bob64_notes.c build/bob64-app/notes.b64e");
+    run(BUILD_DIR "bob64cc" EXE " apps/bob64_info.c build/bob64-app/info.b64e");
+    run(BUILD_DIR "bob64cc" EXE " apps/bob64_mouse_smoke.c build/bob64-app/mouse-smoke.b64e");
+    run(BUILD_DIR "bob64cc" EXE " apps/bob64_launcher.c build/bob64-app/launcher.b64e");
     ensure_directory(handoff?"build/bob64-handoff":"build/bob64");
     if(handoff) {
         ensure_directory("build/bob64-handoff/EFI");
@@ -57,7 +67,7 @@ static void build_bob64(int handoff) {
         compiler="x86_64-w64-mingw32-gcc";
 #endif
     }
-    if(snprintf(command,sizeof(command),"%s -std=c11 -O2 -Wall -Wextra -Werror -DBOB64_UEFI_ABI %s-ffreestanding -fno-stack-protector -fno-stack-check -fshort-wchar -mno-red-zone -nostdlib -Wl,--subsystem,10 -Wl,-e,efi_main -Wl,--image-base,0x100000 -Wl,--enable-reloc-section -Wl,--dynamicbase -Wl,--file-alignment,0x200 -Wl,--section-alignment,0x1000 bob64/boot.c bob64/memory.c bob64/paging.c bob64/cpu.c bob64/descriptors.c bob64/interrupts.c bob64/interrupts.S bob64/syscall.c bob64/window_server.c bob64/bootstrap.c bob64/kernel.c bob64/console.c bob64/heap.c bob64/keyboard.c bob64/mouse.c bob64/shell.c bob64/filesystem.c bob64/snapshot.c bob64/exec.c bob64/process.c bob64/compiler.c bob64/embedded_app.S bob64/handoff.S -o %s",compiler,handoff_define,output_path)>=(int)sizeof(command)) {
+    if(snprintf(command,sizeof(command),"%s -std=c11 -O2 -Wall -Wextra -Werror -DBOB64_UEFI_ABI %s-ffreestanding -fno-stack-protector -fno-stack-check -fshort-wchar -mno-red-zone -nostdlib -Wl,--subsystem,10 -Wl,-e,efi_main -Wl,--image-base,0x100000 -Wl,--enable-reloc-section -Wl,--dynamicbase -Wl,--file-alignment,0x200 -Wl,--section-alignment,0x1000 bob64/boot.c bob64/memory.c bob64/paging.c bob64/cpu.c bob64/descriptors.c bob64/interrupts.c bob64/interrupts.S bob64/syscall.c bob64/window_server.c bob64/bootstrap.c bob64/kernel.c bob64/console.c bob64/heap.c bob64/keyboard.c bob64/mouse.c bob64/shell.c bob64/filesystem.c bob64/snapshot.c bob64/lz4.c bob64/firmware_store.c bob64/exec.c bob64/process.c bob64/compiler.c bob64/embedded_app.S bob64/handoff.S -o %s",compiler,handoff_define,output_path)>=(int)sizeof(command)) {
         fprintf(stderr,"bob64 compiler command is too long\n");exit(1);
     }
     run(command);
@@ -88,9 +98,9 @@ int main(int argc,char **argv) {
     if(bob64Only) {
         build_bob64(bob64Handoff);
         if(bob64Test) {
-            run("gcc -std=c11 -O2 -Wall -Wextra -Werror tests/test_bob64.c bob64/libc.c bob64/compiler.c bob64/memory.c bob64/paging.c bob64/cpu.c bob64/descriptors.c bob64/interrupts.c bob64/interrupts.S bob64/syscall.c bob64/window_server.c bob64/bootstrap.c bob64/console.c bob64/heap.c bob64/keyboard.c bob64/mouse.c bob64/shell.c bob64/filesystem.c bob64/snapshot.c bob64/exec.c bob64/process.c -o build/test_bob64" EXE);
-            if(bob64Handoff) run(BUILD_DIR "test_bob64" EXE " " BOB64_HANDOFF_BOOT_PATH " build/bob64-app/smoke.b64e build/bob64-app/display.b64e build/bob64-app/gui.b64e");
-            else run(BUILD_DIR "test_bob64" EXE " " BOB64_BOOT_PATH " build/bob64-app/smoke.b64e build/bob64-app/display.b64e build/bob64-app/gui.b64e");
+            run("gcc -std=c11 -O2 -Wall -Wextra -Werror " BOB64_TEST_THREAD_FLAGS "tests/test_bob64.c bob64/libc.c bob64/compiler.c bob64/memory.c bob64/paging.c bob64/cpu.c bob64/descriptors.c bob64/interrupts.c bob64/interrupts.S bob64/syscall.c bob64/window_server.c bob64/bootstrap.c bob64/console.c bob64/lz4.c bob64/firmware_store.c bob64/heap.c bob64/keyboard.c bob64/mouse.c bob64/shell.c bob64/filesystem.c bob64/snapshot.c bob64/exec.c bob64/process.c -o build/test_bob64" EXE);
+            if(bob64Handoff) run(BUILD_DIR "test_bob64" EXE " " BOB64_HANDOFF_BOOT_PATH " build/bob64-app/smoke.b64e build/bob64-app/display.b64e build/bob64-app/gui.b64e build/bob64-app/nested-smoke.b64e build/bob64-app/echo.b64e build/bob64-app/ls.b64e build/bob64-app/cat.b64e build/bob64-app/notes.b64e build/bob64-app/info.b64e build/bob64-app/mouse-smoke.b64e build/bob64-app/launcher.b64e");
+            else run(BUILD_DIR "test_bob64" EXE " " BOB64_BOOT_PATH " build/bob64-app/smoke.b64e build/bob64-app/display.b64e build/bob64-app/gui.b64e build/bob64-app/nested-smoke.b64e build/bob64-app/echo.b64e build/bob64-app/ls.b64e build/bob64-app/cat.b64e build/bob64-app/notes.b64e build/bob64-app/info.b64e build/bob64-app/mouse-smoke.b64e build/bob64-app/launcher.b64e");
         }
         return 0;
     }

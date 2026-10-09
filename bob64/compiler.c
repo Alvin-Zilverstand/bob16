@@ -6,6 +6,9 @@
 #define COMPILER_GLOBAL_LIMIT 16u
 #define COMPILER_STRUCT_LIMIT 8u
 #define COMPILER_FIELD_LIMIT 16u
+#define COMPILER_TYPEDEF_LIMIT 32u
+#define COMPILER_LOCAL_LIMIT 64u
+#define COMPILER_LOCAL_FRAME_SIZE 1024u
 
 typedef struct {
     char Name[32];
@@ -49,24 +52,31 @@ typedef struct {
 } BOB64_C_STRUCT;
 
 typedef struct {
+    char Name[32];
+    u8 Type;
+} BOB64_C_TYPEDEF;
+
+typedef struct {
     const char *Source;
     usize Length,Position,ErrorOffset;
-    u8 Code[BOB64_PAGE_SIZE];
-    u8 Data[BOB64_PAGE_SIZE];
+    u8 Code[BOB64_COMPILER_CODE_CAPACITY];
+    u8 Data[BOB64_COMPILER_DATA_CAPACITY];
     usize CodePosition,DataLength;
-    char VariableNames[16][32];
-    s16 VariableDisplacement[16];
-    u8 VariableType[16],VariableArrayLength[16],VariableCount;
+    char VariableNames[COMPILER_LOCAL_LIMIT][32];
+    s16 VariableDisplacement[COMPILER_LOCAL_LIMIT];
+    u8 VariableType[COMPILER_LOCAL_LIMIT],VariableCount;
+    u16 VariableArrayLength[COMPILER_LOCAL_LIMIT];
     u16 LocalBytes,StackBytes;
     BOB64_C_FUNCTION Functions[COMPILER_FUNCTION_LIMIT];
     BOB64_C_GLOBAL Globals[COMPILER_GLOBAL_LIMIT];
     BOB64_C_STRUCT Structs[COMPILER_STRUCT_LIMIT];
+    BOB64_C_TYPEDEF Typedefs[COMPILER_TYPEDEF_LIMIT];
     BOB64_C_CALL Calls[COMPILER_CALL_LIMIT];
     BOB64_C_LOOP Loops[16];
     BOB64_C_SCOPE Scopes[32];
     u16 FunctionSourceStart[COMPILER_FUNCTION_LIMIT];
     u16 FunctionSourceEnd[COMPILER_FUNCTION_LIMIT];
-    u8 FunctionCount,GlobalCount,StructCount,CallCount,LoopDepth;
+    u8 FunctionCount,GlobalCount,StructCount,TypedefCount,CallCount,LoopDepth;
     u8 FunctionSourceCount,ScopeDepth;
     u64 IntegerValue;
     u8 ExpressionType,IntegerType;
@@ -237,29 +247,67 @@ static int compiler_identifier(BOB64_C_COMPILER *compiler,char *name,usize capac
 }
 
 static int compiler_struct_find(BOB64_C_COMPILER *compiler,const char *name);
+static int compiler_type_is_struct(u8 type);
+
+static int compiler_typedef_find(BOB64_C_COMPILER *compiler,const char *name) {
+    for(u32 i=0;i<compiler->TypedefCount;i++) {
+        usize position=0;
+        while(compiler->Typedefs[i].Name[position]&&
+              compiler->Typedefs[i].Name[position]==name[position])position++;
+        if(!compiler->Typedefs[i].Name[position]&&!name[position])return (int)i;
+    }
+    return -1;
+}
+
+static u8 compiler_type_specifier(BOB64_C_COMPILER *compiler) {
+    if(compiler_word(compiler,"char"))return COMPILER_TYPE_CHAR;
+    if(compiler_word(compiler,"void"))return COMPILER_TYPE_VOID;
+    if(compiler_word(compiler,"struct")) {
+        char name[32];
+        if(!compiler_identifier(compiler,name,sizeof(name)))return 0;
+        int structure=compiler_struct_find(compiler,name);
+        return structure<0?0:(u8)(COMPILER_TYPE_STRUCT_BASE+(u32)structure);
+    }
+    u8 type=compiler_integer_type(compiler);
+    if(type)return type;
+    usize saved=compiler->Position;
+    char name[32];
+    if(!compiler_identifier(compiler,name,sizeof(name)))return 0;
+    int alias=compiler_typedef_find(compiler,name);
+    if(alias<0) {compiler->Position=saved;return 0;}
+    return compiler->Typedefs[alias].Type;
+}
+
+static u8 compiler_pointer_to(BOB64_C_COMPILER *compiler,u8 type) {
+    (void)compiler;
+    if(compiler_type_is_struct(type))
+        return (u8)(COMPILER_TYPE_STRUCT_POINTER_BASE+type-COMPILER_TYPE_STRUCT_BASE);
+    if(!type||type==COMPILER_TYPE_VOID||compiler_is_pointer(type))return 0;
+    return compiler_pointer_type(type);
+}
+
+static u8 compiler_array_type(u8 type) {
+    if(type==COMPILER_TYPE_CHAR)return COMPILER_TYPE_CHAR_ARRAY;
+    if(type==COMPILER_TYPE_SHORT)return COMPILER_TYPE_SHORT_ARRAY;
+    if(type==COMPILER_TYPE_LONG_LONG)return COMPILER_TYPE_LONG_LONG_ARRAY;
+    if(type==COMPILER_TYPE_USIZE)return COMPILER_TYPE_USIZE_ARRAY;
+    if(type==COMPILER_TYPE_INT)return COMPILER_TYPE_INT_ARRAY;
+    return 0;
+}
 
 static int compiler_function_signature(BOB64_C_COMPILER *compiler,char *name,
         usize name_capacity,u8 *return_type,u8 *argument_count,
         u8 argument_types[COMPILER_ARGUMENT_LIMIT],
         char parameter_names[COMPILER_ARGUMENT_LIMIT][32],int require_names) {
     u32 count=0;
-    int void_type=compiler_word(compiler,"void");
-    int character_type=!void_type&&compiler_word(compiler,"char");
-    int struct_type=-1;
-    u8 value_type=void_type?COMPILER_TYPE_VOID:
-                  (character_type?COMPILER_TYPE_CHAR:compiler_integer_type(compiler));
-    if(!void_type&&!character_type&&!value_type) {
-        if(!compiler_word(compiler,"struct"))return 0;
-        char struct_name[32];
-        if(!compiler_identifier(compiler,struct_name,sizeof(struct_name)))return 0;
-        struct_type=compiler_struct_find(compiler,struct_name);
-        if(struct_type<0)return 0;
-    }
+    u8 value_type=compiler_type_specifier(compiler);
+    int struct_type=compiler_type_is_struct(value_type)?
+                    (int)(value_type-COMPILER_TYPE_STRUCT_BASE):-1;
+    int void_type=value_type==COMPILER_TYPE_VOID;
+    if(!value_type)return 0;
     int return_pointer=compiler_take(compiler,'*');
     if((struct_type>=0&&!return_pointer)||(void_type&&return_pointer))return 0;
-    *return_type=struct_type>=0?
-        (u8)(COMPILER_TYPE_STRUCT_POINTER_BASE+(u32)struct_type):
-        (return_pointer?compiler_pointer_type(value_type):value_type);
+    *return_type=return_pointer?compiler_pointer_to(compiler,value_type):value_type;
     if(!*return_type)return 0;
     if(!compiler_identifier(compiler,name,name_capacity)||!compiler_take(compiler,'('))return 0;
     if(!compiler_take(compiler,')')) {
@@ -269,17 +317,10 @@ static int compiler_function_signature(BOB64_C_COMPILER *compiler,char *name,
             for(;;) {
                 int pointer,has_name;
                 if(count>=COMPILER_ARGUMENT_LIMIT)return 0;
-                int character_type=compiler_word(compiler,"char");
-                u8 value_type=character_type?COMPILER_TYPE_CHAR:
-                              compiler_integer_type(compiler);
-                int struct_type=-1;
-                if(!character_type&&!value_type) {
-                    if(!compiler_word(compiler,"struct"))return 0;
-                    char struct_name[32];
-                    if(!compiler_identifier(compiler,struct_name,sizeof(struct_name)))return 0;
-                    struct_type=compiler_struct_find(compiler,struct_name);
-                    if(struct_type<0)return 0;
-                }
+                u8 value_type=compiler_type_specifier(compiler);
+                int struct_type=compiler_type_is_struct(value_type)?
+                    (int)(value_type-COMPILER_TYPE_STRUCT_BASE):-1;
+                if(!value_type||value_type==COMPILER_TYPE_VOID)return 0;
                 pointer=compiler_take(compiler,'*');
                 if(struct_type>=0&&!pointer)return 0;
                 compiler_skip(compiler);
@@ -291,9 +332,10 @@ static int compiler_function_signature(BOB64_C_COMPILER *compiler,char *name,
                     if(pointer||!compiler_take(compiler,']'))return 0;
                     pointer=1;
                 }
-                argument_types[count++]=struct_type>=0?
-                    (u8)(COMPILER_TYPE_STRUCT_POINTER_BASE+(u32)struct_type):
-                     (pointer?compiler_pointer_type(value_type):value_type);
+                argument_types[count]=pointer?
+                    compiler_pointer_to(compiler,value_type):value_type;
+                if(!argument_types[count])return 0;
+                count++;
                 if(compiler_take(compiler,')'))break;
                 if(!compiler_take(compiler,','))return 0;
             }
@@ -387,6 +429,16 @@ static int compiler_variable_is_global(u32 variable) {
     return (variable&0x8000u)!=0;
 }
 
+static int compiler_emit_rbp_operand(BOB64_C_COMPILER *compiler,
+                                     u8 disp8_modrm,s16 displacement) {
+    if(displacement>=-128&&displacement<=127)
+        return compiler_emit(compiler,disp8_modrm)&&
+               compiler_emit(compiler,(u8)(s8)displacement);
+    u8 disp32_modrm=(u8)((disp8_modrm&0x3fu)|0x80u);
+    return compiler_emit(compiler,disp32_modrm)&&
+           compiler_emit_u32(compiler,(u32)(s32)displacement);
+}
+
 static u8 compiler_variable_type(BOB64_C_COMPILER *compiler,u32 variable) {
     return compiler_variable_is_global(variable)?
         compiler->Globals[variable&0x7fffu].Type:compiler->VariableType[variable];
@@ -400,14 +452,14 @@ static u32 compiler_variable_array_length(BOB64_C_COMPILER *compiler,u32 variabl
 
 static int compiler_emit_global_displacement(BOB64_C_COMPILER *compiler,u32 variable) {
     BOB64_C_GLOBAL *global=&compiler->Globals[variable&0x7fffu];
-    s64 displacement=(s64)(BOB64_PAGE_SIZE+global->DataOffset)-
+    s64 displacement=(s64)(BOB64_COMPILER_CODE_CAPACITY+global->DataOffset)-
                      (s64)(compiler->CodePosition+4u);
     if(displacement<(-2147483647LL-1)||displacement>2147483647)return 0;
     return compiler_emit_u32(compiler,(u32)(s32)displacement);
 }
 
 static int compiler_emit_data_displacement(BOB64_C_COMPILER *compiler,u16 data_offset) {
-    s64 displacement=(s64)(BOB64_PAGE_SIZE+data_offset)-
+    s64 displacement=(s64)(BOB64_COMPILER_CODE_CAPACITY+data_offset)-
                      (s64)(compiler->CodePosition+4u);
     if(displacement<(-2147483647LL-1)||displacement>2147483647)return 0;
     return compiler_emit_u32(compiler,(u32)(s32)displacement);
@@ -491,22 +543,22 @@ static int compiler_variable_load(BOB64_C_COMPILER *compiler,u32 variable) {
                compiler_emit(compiler,0x05)&&
                compiler_emit_global_displacement(compiler,variable);
     }
-    s8 displacement=(s8)compiler->VariableDisplacement[variable];
+    s16 displacement=compiler->VariableDisplacement[variable];
     if(compiler->VariableType[variable]==COMPILER_TYPE_CHAR)
         return compiler_emit(compiler,0x48)&&compiler_emit(compiler,0x0f)&&
-               compiler_emit(compiler,0xbe)&&compiler_emit(compiler,0x45)&&
-               compiler_emit(compiler,(u8)displacement);
+               compiler_emit(compiler,0xbe)&&
+               compiler_emit_rbp_operand(compiler,0x45,displacement);
     if(compiler->VariableType[variable]==COMPILER_TYPE_SHORT)
         return compiler_emit(compiler,0x48)&&compiler_emit(compiler,0x0f)&&
-               compiler_emit(compiler,0xbf)&&compiler_emit(compiler,0x45)&&
-               compiler_emit(compiler,(u8)displacement);
+               compiler_emit(compiler,0xbf)&&
+               compiler_emit_rbp_operand(compiler,0x45,displacement);
     if(compiler->VariableType[variable]==COMPILER_TYPE_LONG_LONG||
        compiler->VariableType[variable]==COMPILER_TYPE_USIZE||
        compiler_is_pointer(compiler->VariableType[variable]))
         return compiler_emit(compiler,0x48)&&compiler_emit(compiler,0x8b)&&
-               compiler_emit(compiler,0x45)&&compiler_emit(compiler,(u8)displacement);
+               compiler_emit_rbp_operand(compiler,0x45,displacement);
     return compiler_emit(compiler,0x48)&&compiler_emit(compiler,0x63)&&
-           compiler_emit(compiler,0x45)&&compiler_emit(compiler,(u8)displacement);
+           compiler_emit_rbp_operand(compiler,0x45,displacement);
 }
 
 static int compiler_variable_store(BOB64_C_COMPILER *compiler,u32 variable) {
@@ -527,20 +579,20 @@ static int compiler_variable_store(BOB64_C_COMPILER *compiler,u32 variable) {
         return compiler_emit(compiler,0x89)&&compiler_emit(compiler,0x05)&&
                compiler_emit_global_displacement(compiler,variable);
     }
-    s8 displacement=(s8)compiler->VariableDisplacement[variable];
+    s16 displacement=compiler->VariableDisplacement[variable];
     if(compiler->VariableType[variable]==COMPILER_TYPE_CHAR)
-        return compiler_emit(compiler,0x88)&&compiler_emit(compiler,0x45)&&
-               compiler_emit(compiler,(u8)displacement);
+        return compiler_emit(compiler,0x88)&&
+               compiler_emit_rbp_operand(compiler,0x45,displacement);
     if(compiler->VariableType[variable]==COMPILER_TYPE_SHORT)
         return compiler_emit(compiler,0x66)&&compiler_emit(compiler,0x89)&&
-               compiler_emit(compiler,0x45)&&compiler_emit(compiler,(u8)displacement);
+               compiler_emit_rbp_operand(compiler,0x45,displacement);
     if(compiler->VariableType[variable]==COMPILER_TYPE_LONG_LONG||
        compiler->VariableType[variable]==COMPILER_TYPE_USIZE||
        compiler_is_pointer(compiler->VariableType[variable]))
         return compiler_emit(compiler,0x48)&&compiler_emit(compiler,0x89)&&
-               compiler_emit(compiler,0x45)&&compiler_emit(compiler,(u8)displacement);
-    return compiler_emit(compiler,0x89)&&compiler_emit(compiler,0x45)&&
-           compiler_emit(compiler,(u8)displacement);
+               compiler_emit_rbp_operand(compiler,0x45,displacement);
+    return compiler_emit(compiler,0x89)&&
+           compiler_emit_rbp_operand(compiler,0x45,displacement);
 }
 
 static int compiler_variable_address(BOB64_C_COMPILER *compiler,u32 variable,
@@ -549,10 +601,10 @@ static int compiler_variable_address(BOB64_C_COMPILER *compiler,u32 variable,
         return compiler_emit(compiler,0x48)&&compiler_emit(compiler,0x8d)&&
                compiler_emit(compiler,(u8)(0x05u|(destination_register<<3)))&&
                compiler_emit_global_displacement(compiler,variable);
-    s8 displacement=(s8)compiler->VariableDisplacement[variable];
+    s16 displacement=compiler->VariableDisplacement[variable];
     return compiler_emit(compiler,0x48)&&compiler_emit(compiler,0x8d)&&
-           compiler_emit(compiler,(u8)(0x45u|(destination_register<<3)))&&
-           compiler_emit(compiler,(u8)displacement);
+           compiler_emit_rbp_operand(compiler,
+               (u8)(0x45u|(destination_register<<3)),displacement);
 }
 
 static int compiler_member_address(BOB64_C_COMPILER *compiler,u32 variable,
@@ -601,20 +653,20 @@ static int compiler_add_variable(BOB64_C_COMPILER *compiler,const char *name,
               compiler->VariableNames[i][position]==name[position])position++;
         if(!compiler->VariableNames[i][position]&&!name[position])return 0;
     }
-    if(compiler->VariableCount>=16)return 0;
+    if(compiler->VariableCount>=COMPILER_LOCAL_LIMIT)return 0;
     if(type==COMPILER_TYPE_INT_ARRAY) {
-        if(!array_length||array_length>32)return 0;
+        if(!array_length||array_length>COMPILER_LOCAL_FRAME_SIZE/4u)return 0;
         bytes=array_length*4;
         compiler->LocalBytes=(u16)((compiler->LocalBytes+3u)&~3u);
     } else if(type==COMPILER_TYPE_SHORT_ARRAY) {
-        if(!array_length||array_length>64)return 0;
+        if(!array_length||array_length>COMPILER_LOCAL_FRAME_SIZE/2u)return 0;
         bytes=array_length*2;
         compiler->LocalBytes=(u16)((compiler->LocalBytes+1u)&~1u);
     } else if(type==COMPILER_TYPE_CHAR_ARRAY) {
-        if(!array_length||array_length>128)return 0;
+        if(!array_length||array_length>COMPILER_LOCAL_FRAME_SIZE)return 0;
         bytes=array_length;
     } else if(type==COMPILER_TYPE_LONG_LONG_ARRAY||type==COMPILER_TYPE_USIZE_ARRAY) {
-        if(!array_length||array_length>16)return 0;
+        if(!array_length||array_length>COMPILER_LOCAL_FRAME_SIZE/8u)return 0;
         bytes=array_length*8u;
         compiler->LocalBytes=(u16)((compiler->LocalBytes+7u)&~7u);
     } else if(compiler_type_is_struct(type)) {
@@ -625,13 +677,14 @@ static int compiler_add_variable(BOB64_C_COMPILER *compiler,const char *name,
         bytes=8;
         compiler->LocalBytes=(u16)((compiler->LocalBytes+7u)&~7u);
     }
-    if(bytes>128u-compiler->LocalBytes)return 0;
+    if(compiler->LocalBytes>COMPILER_LOCAL_FRAME_SIZE||
+       bytes>COMPILER_LOCAL_FRAME_SIZE-compiler->LocalBytes)return 0;
     compiler->LocalBytes=(u16)(compiler->LocalBytes+bytes);
     u32 variable=compiler->VariableCount++;
     while(name[length])length++;
     for(usize i=0;i<=length;i++)compiler->VariableNames[variable][i]=name[i];
     compiler->VariableType[variable]=type;
-    compiler->VariableArrayLength[variable]=(u8)array_length;
+    compiler->VariableArrayLength[variable]=(u16)array_length;
     compiler->VariableDisplacement[variable]=-(s16)compiler->LocalBytes;
     if(variable_out)*variable_out=variable;
     return 1;
@@ -672,7 +725,8 @@ static int compiler_integer(BOB64_C_COMPILER *compiler,u64 *value) {
     }
     *value=number;
     compiler->IntegerType=has_unsigned?COMPILER_TYPE_USIZE:
-        ((long_count||number>0x7fffffffu)?COMPILER_TYPE_LONG_LONG:COMPILER_TYPE_INT);
+        ((long_count>=2||number>0x7fffffffu)?COMPILER_TYPE_LONG_LONG:
+                                             COMPILER_TYPE_INT);
     return 1;
 }
 
@@ -741,6 +795,12 @@ static int compiler_emit_integer(BOB64_C_COMPILER *compiler,u64 value) {
 }
 
 static int compiler_expression(BOB64_C_COMPILER *compiler);
+static int compiler_shift(BOB64_C_COMPILER *compiler);
+static int compiler_relational(BOB64_C_COMPILER *compiler);
+static int compiler_equality(BOB64_C_COMPILER *compiler);
+static int compiler_bitwise_and(BOB64_C_COMPILER *compiler);
+static int compiler_bitwise_xor(BOB64_C_COMPILER *compiler);
+static int compiler_bitwise_or(BOB64_C_COMPILER *compiler);
 static int compiler_emit_branch(BOB64_C_COMPILER *compiler,u8 opcode,
                                 u16 *displacement_offset);
 static int compiler_patch_branch(BOB64_C_COMPILER *compiler,u16 displacement_offset,
@@ -866,7 +926,7 @@ static int compiler_primary(BOB64_C_COMPILER *compiler) {
     usize string_offset,string_length;
     if(compiler_string(compiler,&string_offset,&string_length)) {
         (void)string_length;
-        s64 displacement=(s64)(BOB64_PAGE_SIZE+string_offset)-
+        s64 displacement=(s64)(BOB64_COMPILER_CODE_CAPACITY+string_offset)-
                          (s64)(compiler->CodePosition+7);
         if(displacement<(-2147483647LL-1)||displacement>2147483647||
            !compiler_emit(compiler,0x48)||!compiler_emit(compiler,0x8d)||
@@ -1004,6 +1064,12 @@ static int compiler_unary(BOB64_C_COMPILER *compiler) {
         compiler->ExpressionType=COMPILER_TYPE_INT;
         return 1;
     }
+    if(compiler_take(compiler,'~')) {
+        if(!compiler_unary(compiler)||compiler_is_pointer(compiler->ExpressionType)||
+           !compiler_emit(compiler,0x48)||!compiler_emit(compiler,0xf7)||
+           !compiler_emit(compiler,0xd0))return 0;
+        return 1;
+    }
     if(compiler_take(compiler,'-')) {
         if(!compiler_unary(compiler)||compiler_is_pointer(compiler->ExpressionType)||
            !compiler_emit(compiler,0x48)||!compiler_emit(compiler,0xf7)||
@@ -1019,23 +1085,45 @@ static int compiler_term(BOB64_C_COMPILER *compiler) {
     if(!compiler_unary(compiler))return 0;
     for(;;) {
         u8 left_type=compiler->ExpressionType;
+        char operation;
         compiler_skip(compiler);
-        if(compiler->Position>=compiler->Length||compiler->Source[compiler->Position]!='*')return 1;
+        if(compiler->Position>=compiler->Length)return 1;
+        operation=compiler->Source[compiler->Position];
+        if(operation!='*'&&operation!='/'&&operation!='%')return 1;
         compiler->Position++;
         if(compiler_is_pointer(compiler->ExpressionType)||
            !compiler_emit(compiler,0x50))return 0;
         compiler->StackBytes+=8;
         if(!compiler_unary(compiler)||
-           compiler_is_pointer(compiler->ExpressionType)||
-           !compiler_emit(compiler,0x59)||!compiler_emit(compiler,0x48)||
-           !compiler_emit(compiler,0x0f)||!compiler_emit(compiler,0xaf)||
-           !compiler_emit(compiler,0xc1))return 0;
-        compiler->StackBytes-=8;
+           compiler_is_pointer(compiler->ExpressionType))return 0;
+        u8 right_type=compiler->ExpressionType;
+        if(operation=='*') {
+            if(!compiler_emit(compiler,0x59)||!compiler_emit(compiler,0x48)||
+               !compiler_emit(compiler,0x0f)||
+               !compiler_emit(compiler,0xaf)||!compiler_emit(compiler,0xc1))return 0;
+            compiler->StackBytes-=8;
+        } else {
+            int unsigned_operation=left_type==COMPILER_TYPE_USIZE||
+                                   right_type==COMPILER_TYPE_USIZE;
+            if(!compiler_emit(compiler,0x48)||!compiler_emit(compiler,0x89)||
+               !compiler_emit(compiler,0xc1)||!compiler_emit(compiler,0x58))return 0;
+            compiler->StackBytes-=8;
+            if(unsigned_operation) {
+                if(!compiler_emit(compiler,0x31)||!compiler_emit(compiler,0xd2)||
+                   !compiler_emit(compiler,0x48)||!compiler_emit(compiler,0xf7)||
+                   !compiler_emit(compiler,0xf1))return 0;
+            } else if(!compiler_emit(compiler,0x48)||!compiler_emit(compiler,0x99)||
+                      !compiler_emit(compiler,0x48)||!compiler_emit(compiler,0xf7)||
+                      !compiler_emit(compiler,0xf9))return 0;
+            if(operation=='%'&&
+               (!compiler_emit(compiler,0x48)||!compiler_emit(compiler,0x89)||
+                !compiler_emit(compiler,0xd0)))return 0;
+        }
         compiler->ExpressionType=left_type==COMPILER_TYPE_USIZE||
-            compiler->ExpressionType==COMPILER_TYPE_USIZE?
+            right_type==COMPILER_TYPE_USIZE?
             COMPILER_TYPE_USIZE:
             (left_type==COMPILER_TYPE_LONG_LONG||
-             compiler->ExpressionType==COMPILER_TYPE_LONG_LONG?
+             right_type==COMPILER_TYPE_LONG_LONG?
              COMPILER_TYPE_LONG_LONG:COMPILER_TYPE_INT);
     }
 }
@@ -1103,20 +1191,56 @@ static int compiler_additive(BOB64_C_COMPILER *compiler) {
     }
 }
 
-static int compiler_comparison(BOB64_C_COMPILER *compiler) {
-    typedef struct { char First,Second;u8 Length,SetCondition; } COMPILER_COMPARISON;
-    static const COMPILER_COMPARISON operations[]={
-        {'=', '=',2,0x94},{'!', '=',2,0x95},
-        {'<', '=',2,0x9e},{'>', '=',2,0x9d},
-        {'<', 0,1,0x9c},{'>', 0,1,0x9f}
-    };
+typedef int (*COMPILER_EXPRESSION_PARSER)(BOB64_C_COMPILER *compiler);
+
+static int compiler_shift(BOB64_C_COMPILER *compiler) {
     if(!compiler_additive(compiler))return 0;
+    for(;;) {
+        compiler_skip(compiler);
+        if(compiler->Position+1>=compiler->Length||
+           (compiler->Source[compiler->Position]!='<'&&
+            compiler->Source[compiler->Position]!='>')||
+           compiler->Source[compiler->Position+1]!=compiler->Source[compiler->Position])
+            return 1;
+        char operation=compiler->Source[compiler->Position];
+        u8 left_type=compiler->ExpressionType;
+        compiler->Position+=2;
+        if(compiler_is_pointer(left_type)||!compiler_emit(compiler,0x50))return 0;
+        compiler->StackBytes+=8;
+        if(!compiler_additive(compiler)||compiler_is_pointer(compiler->ExpressionType))return 0;
+        u8 right_type=compiler->ExpressionType;
+        if(!compiler_emit(compiler,0x48)||!compiler_emit(compiler,0x89)||
+           !compiler_emit(compiler,0xc1)||!compiler_emit(compiler,0x58))return 0;
+        compiler->StackBytes-=8;
+        if(!compiler_emit(compiler,0x48)||!compiler_emit(compiler,0xd3)||
+           !compiler_emit(compiler,operation=='<'?0xe0:
+               (left_type==COMPILER_TYPE_USIZE?0xe8:0xf8)))return 0;
+        compiler->ExpressionType=left_type==COMPILER_TYPE_USIZE||
+            right_type==COMPILER_TYPE_USIZE?COMPILER_TYPE_USIZE:
+            (left_type==COMPILER_TYPE_LONG_LONG||right_type==COMPILER_TYPE_LONG_LONG?
+             COMPILER_TYPE_LONG_LONG:COMPILER_TYPE_INT);
+    }
+}
+
+static int compiler_compare_level(BOB64_C_COMPILER *compiler,
+        COMPILER_EXPRESSION_PARSER lower,int equality) {
+    typedef struct { char First,Second;u8 Length,SetCondition,UnsignedCondition; } OP;
+    static const OP equal_ops[]={
+        {'=', '=',2,0x94,0x94},{'!', '=',2,0x95,0x95}
+    };
+    static const OP relational_ops[]={
+        {'<', '=',2,0x9e,0x96},{'>', '=',2,0x9d,0x93},
+        {'<', 0,1,0x9c,0x92},{'>', 0,1,0x9f,0x97}
+    };
+    const OP *operations=equality?equal_ops:relational_ops;
+    u32 count=equality?2:4;
+    if(!lower(compiler))return 0;
     for(;;) {
         compiler_skip(compiler);
         if(compiler->Position>=compiler->Length)return 1;
         int operation=-1;
-        for(u32 i=0;i<sizeof(operations)/sizeof(operations[0]);i++) {
-            const COMPILER_COMPARISON *candidate=&operations[i];
+        for(u32 i=0;i<count;i++) {
+            const OP *candidate=&operations[i];
             if(compiler->Source[compiler->Position]!=candidate->First)continue;
             if(candidate->Length==2) {
                 if(compiler->Position+1>=compiler->Length||
@@ -1130,22 +1254,17 @@ static int compiler_comparison(BOB64_C_COMPILER *compiler) {
         compiler->Position+=operations[operation].Length;
         if(!compiler_emit(compiler,0x50))return 0;
         compiler->StackBytes+=8;
-        if(!compiler_additive(compiler))return 0;
+        if(!lower(compiler))return 0;
         u8 right_type=compiler->ExpressionType;
         int pointer_comparison=compiler_is_pointer(left_type)||
                                compiler_is_pointer(right_type);
-        if(pointer_comparison&&
-           (left_type!=right_type||!compiler_is_pointer(left_type)||
-            operation>1))return 0;
-        u8 condition=operations[operation].SetCondition;
-        if(left_type==COMPILER_TYPE_USIZE||right_type==COMPILER_TYPE_USIZE) {
-            static const u8 unsigned_conditions[6]={0x94,0x95,0x96,0x93,0x92,0x97};
-            condition=unsigned_conditions[operation];
-        }
+        if(pointer_comparison&&(left_type!=right_type||
+           !compiler_is_pointer(left_type)||!equality))return 0;
+        u8 condition=left_type==COMPILER_TYPE_USIZE||right_type==COMPILER_TYPE_USIZE?
+            operations[operation].UnsignedCondition:operations[operation].SetCondition;
         if(!compiler_emit(compiler,0x59)||!compiler_emit(compiler,0x48)||
            !compiler_emit(compiler,0x39)||!compiler_emit(compiler,0xc1)||
-           !compiler_emit(compiler,0x0f)||
-           !compiler_emit(compiler,condition)||
+           !compiler_emit(compiler,0x0f)||!compiler_emit(compiler,condition)||
            !compiler_emit(compiler,0xc0)||!compiler_emit(compiler,0x0f)||
            !compiler_emit(compiler,0xb6)||!compiler_emit(compiler,0xc0))return 0;
         compiler->StackBytes-=8;
@@ -1153,8 +1272,55 @@ static int compiler_comparison(BOB64_C_COMPILER *compiler) {
     }
 }
 
+static int compiler_relational(BOB64_C_COMPILER *compiler) {
+    return compiler_compare_level(compiler,compiler_shift,0);
+}
+
+static int compiler_equality(BOB64_C_COMPILER *compiler) {
+    return compiler_compare_level(compiler,compiler_relational,1);
+}
+
+static int compiler_bitwise_level(BOB64_C_COMPILER *compiler,
+        COMPILER_EXPRESSION_PARSER lower,char operation,u8 opcode) {
+    if(!lower(compiler))return 0;
+    for(;;) {
+        compiler_skip(compiler);
+        if(compiler->Position>=compiler->Length||
+           compiler->Source[compiler->Position]!=operation)return 1;
+        if((operation=='&'||operation=='|')&&
+           compiler->Position+1<compiler->Length&&
+           compiler->Source[compiler->Position+1]==operation)return 1;
+        u8 left_type=compiler->ExpressionType;
+        if(compiler_is_pointer(left_type))return 0;
+        compiler->Position++;
+        if(!compiler_emit(compiler,0x50))return 0;
+        compiler->StackBytes+=8;
+        if(!lower(compiler)||compiler_is_pointer(compiler->ExpressionType))return 0;
+        u8 right_type=compiler->ExpressionType;
+        if(!compiler_emit(compiler,0x59)||!compiler_emit(compiler,0x48)||
+           !compiler_emit(compiler,opcode)||!compiler_emit(compiler,0xc8))return 0;
+        compiler->StackBytes-=8;
+        compiler->ExpressionType=left_type==COMPILER_TYPE_USIZE||
+            right_type==COMPILER_TYPE_USIZE?COMPILER_TYPE_USIZE:
+            (left_type==COMPILER_TYPE_LONG_LONG||right_type==COMPILER_TYPE_LONG_LONG?
+             COMPILER_TYPE_LONG_LONG:COMPILER_TYPE_INT);
+    }
+}
+
+static int compiler_bitwise_and(BOB64_C_COMPILER *compiler) {
+    return compiler_bitwise_level(compiler,compiler_equality,'&',0x21);
+}
+
+static int compiler_bitwise_xor(BOB64_C_COMPILER *compiler) {
+    return compiler_bitwise_level(compiler,compiler_bitwise_and,'^',0x31);
+}
+
+static int compiler_bitwise_or(BOB64_C_COMPILER *compiler) {
+    return compiler_bitwise_level(compiler,compiler_bitwise_xor,'|',0x09);
+}
+
 static int compiler_logical_and(BOB64_C_COMPILER *compiler) {
-    if(!compiler_comparison(compiler))return 0;
+    if(!compiler_bitwise_or(compiler))return 0;
     for(;;) {
         u16 false_branch,end_branch;
         compiler_skip(compiler);
@@ -1165,7 +1331,7 @@ static int compiler_logical_and(BOB64_C_COMPILER *compiler) {
         if(!compiler_emit(compiler,0x48)||!compiler_emit(compiler,0x85)||
            !compiler_emit(compiler,0xc0)||!compiler_emit(compiler,0x0f)||
            !compiler_emit_branch(compiler,0x84,&false_branch)||
-           !compiler_comparison(compiler)||
+           !compiler_bitwise_or(compiler)||
            !compiler_emit(compiler,0x48)||!compiler_emit(compiler,0x85)||
            !compiler_emit(compiler,0xc0)||!compiler_emit(compiler,0x0f)||
            !compiler_emit(compiler,0x95)||!compiler_emit(compiler,0xc0)||
@@ -1210,10 +1376,9 @@ static int compiler_array_element_address(BOB64_C_COMPILER *compiler,
     u32 type=compiler->VariableType[variable];
     u32 scale=compiler_array_element_size((u8)type);
     s16 displacement=(s16)(compiler->VariableDisplacement[variable]+(s16)(element*scale));
-    if(element>=compiler->VariableArrayLength[variable]||
-       displacement< -128||displacement>127)return 0;
+    if(element>=compiler->VariableArrayLength[variable])return 0;
     return compiler_emit(compiler,0x48)&&compiler_emit(compiler,0x8d)&&
-           compiler_emit(compiler,0x45)&&compiler_emit(compiler,(u8)(s8)displacement);
+           compiler_emit_rbp_operand(compiler,0x45,displacement);
 }
 
 static int compiler_array_initializer(BOB64_C_COMPILER *compiler,u32 variable) {
@@ -1226,8 +1391,9 @@ static int compiler_array_initializer(BOB64_C_COMPILER *compiler,u32 variable) {
             for(u32 i=0;i<array_length;i++) {
                 u8 value=i<length?compiler->Data[offset+i]:0;
                 if(!compiler_array_element_address(compiler,variable,i)||
-                   !compiler_emit(compiler,0xc6)||!compiler_emit(compiler,0x45)||
-                   !compiler_emit(compiler,(u8)(s8)(compiler->VariableDisplacement[variable]+(s16)i))||
+                   !compiler_emit(compiler,0xc6)||
+                   !compiler_emit_rbp_operand(compiler,0x45,
+                       (s16)(compiler->VariableDisplacement[variable]+(s16)i))||
                    !compiler_emit(compiler,value))return 0;
             }
             return compiler_take(compiler,';');
@@ -1283,20 +1449,9 @@ static int compiler_array_initializer(BOB64_C_COMPILER *compiler,u32 variable) {
 static int compiler_local_statement(BOB64_C_COMPILER *compiler) {
     usize saved=compiler->Position;
     char name[32];
-    u8 long_type=0;
-    int is_char=0,is_short=0,is_pointer=0,is_struct=0,is_struct_pointer=0,variable;
-    u8 declared_type=0;
-    if(compiler_word(compiler,"struct")) {
-        char struct_name[32];
-        if(!compiler_identifier(compiler,struct_name,sizeof(struct_name)))return -1;
-        int structure=compiler_struct_find(compiler,struct_name);
-        if(structure<0)return -1;
-        declared_type=(u8)(COMPILER_TYPE_STRUCT_BASE+(u32)structure);
-        is_struct=1;
-    } else if(compiler_word(compiler,"char"))is_char=1;
-    else if((long_type=compiler_integer_type(compiler))!=0) {
-        is_short=long_type==COMPILER_TYPE_SHORT;
-    } else {
+    u8 declared_type=compiler_type_specifier(compiler);
+    int is_char=0,is_short=0,is_pointer=0,is_struct=0,variable;
+    if(!declared_type) {
         compiler->Position=saved;
         if(compiler_take(compiler,'*')) {
             if(!compiler_identifier(compiler,name,sizeof(name))) {
@@ -1402,12 +1557,15 @@ static int compiler_local_statement(BOB64_C_COMPILER *compiler) {
            !compiler_variable_store(compiler,(u32)variable))return -1;
         return 1;
     }
-    is_pointer=compiler_take(compiler,'*');
-    if(is_struct&&is_pointer) {
-        declared_type=(u8)(COMPILER_TYPE_STRUCT_POINTER_BASE+
-                           declared_type-COMPILER_TYPE_STRUCT_BASE);
-        is_struct=0;is_struct_pointer=1;
+    if(declared_type==COMPILER_TYPE_VOID)return -1;
+    if(compiler_take(compiler,'*')) {
+        declared_type=compiler_pointer_to(compiler,declared_type);
+        if(!declared_type)return -1;
     }
+    is_struct=compiler_type_is_struct(declared_type);
+    is_pointer=compiler_is_pointer(declared_type);
+    is_char=declared_type==COMPILER_TYPE_CHAR;
+    is_short=declared_type==COMPILER_TYPE_SHORT;
     if(!compiler_identifier(compiler,name,sizeof(name)))return -1;
     if(is_struct) {
         if(!compiler_take(compiler,';')||
@@ -1416,13 +1574,13 @@ static int compiler_local_statement(BOB64_C_COMPILER *compiler) {
     }
     if(compiler_take(compiler,'[')) {
         u64 array_length;
-        u8 array_type=long_type==COMPILER_TYPE_USIZE?COMPILER_TYPE_USIZE_ARRAY:
-                      (long_type==COMPILER_TYPE_LONG_LONG?COMPILER_TYPE_LONG_LONG_ARRAY:
-                       (is_char?COMPILER_TYPE_CHAR_ARRAY:
-                        (is_short?COMPILER_TYPE_SHORT_ARRAY:COMPILER_TYPE_INT_ARRAY)));
-        u32 array_limit=(array_type==COMPILER_TYPE_LONG_LONG_ARRAY||
-                         array_type==COMPILER_TYPE_USIZE_ARRAY)?16u:
-                        (is_char?128u:(is_short?64u:32u));
+        u8 array_type=compiler_array_type(declared_type);
+        if(!array_type)return -1;
+        u32 array_limit=is_char?COMPILER_LOCAL_FRAME_SIZE:
+            (is_short?COMPILER_LOCAL_FRAME_SIZE/2u:
+             ((array_type==COMPILER_TYPE_LONG_LONG_ARRAY||
+               array_type==COMPILER_TYPE_USIZE_ARRAY)?
+              COMPILER_LOCAL_FRAME_SIZE/8u:COMPILER_LOCAL_FRAME_SIZE/4u));
         if(is_pointer||!compiler_integer(compiler,&array_length)||
            array_length>array_limit||!compiler_take(compiler,']')||
            !compiler_add_variable(compiler,name,array_type,
@@ -1434,9 +1592,7 @@ static int compiler_local_statement(BOB64_C_COMPILER *compiler) {
         return 1;
     }
     if(!compiler_take(compiler,'='))return -1;
-    u8 type=is_struct_pointer?declared_type:
-            (is_pointer?compiler_pointer_type(is_char?COMPILER_TYPE_CHAR:long_type):
-             (is_char?COMPILER_TYPE_CHAR:long_type));
+    u8 type=declared_type;
     if(!compiler_add_variable(compiler,name,type,0,0))return -1;
     variable=compiler_variable_find(compiler,name);
     if(!compiler_expression(compiler)||
@@ -1447,23 +1603,12 @@ static int compiler_local_statement(BOB64_C_COMPILER *compiler) {
     return 1;
 }
 
-static int compiler_emit_write(BOB64_C_COMPILER *compiler,usize data_offset,
-                               usize data_length) {
-    s64 displacement=(s64)(BOB64_PAGE_SIZE+data_offset)-
-                     (s64)(compiler->CodePosition+7);
-    if(displacement<(-2147483647LL-1)||displacement>2147483647)return 0;
-    return compiler_emit(compiler,0x48)&&compiler_emit(compiler,0x8d)&&
-       compiler_emit(compiler,0x0d)&&compiler_emit_u32(compiler,(u32)(s32)displacement)&&
-       compiler_emit(compiler,0xba)&&compiler_emit_u32(compiler,(u32)data_length)&&
-       compiler_emit(compiler,0xb8)&&compiler_emit_u32(compiler,BOB64_SYSCALL_WRITE_BUFFER)&&
-       compiler_emit(compiler,0xcd)&&compiler_emit(compiler,0x80);
-}
-
 static int compiler_function_prologue(BOB64_C_COMPILER *compiler) {
     return compiler_emit(compiler,0x55)&&compiler_emit(compiler,0x48)&&
        compiler_emit(compiler,0x89)&&compiler_emit(compiler,0xe5)&&
        compiler_emit(compiler,0x48)&&compiler_emit(compiler,0x81)&&
-       compiler_emit(compiler,0xec)&&compiler_emit_u32(compiler,128);
+       compiler_emit(compiler,0xec)&&
+       compiler_emit_u32(compiler,COMPILER_LOCAL_FRAME_SIZE);
 }
 
 static int compiler_function_epilogue(BOB64_C_COMPILER *compiler) {
@@ -1668,13 +1813,19 @@ static int compiler_statement(BOB64_C_COMPILER *compiler) {
     }
     compiler->Position=saved;
     if(compiler_word(compiler,"bob64_app_write")) {
-        usize string_offset,string_length;
-        if(!compiler_take(compiler,'(')||
-           !compiler_string(compiler,&string_offset,&string_length)||
-           !compiler_take(compiler,',')||!compiler_integer(compiler,&compiler->IntegerValue)||
-           compiler->IntegerValue!=string_length||
+        if(!compiler_take(compiler,'(')||!compiler_expression(compiler)||
+           compiler->ExpressionType!=COMPILER_TYPE_CHAR_POINTER||
+           !compiler_take(compiler,',')||!compiler_emit(compiler,0x50))return -1;
+        compiler->StackBytes+=8;
+        if(!compiler_expression(compiler)||
+           compiler_is_pointer(compiler->ExpressionType)||
            !compiler_take(compiler,')')||!compiler_take(compiler,';')||
-           !compiler_emit_write(compiler,string_offset,string_length))return -1;
+           !compiler_emit(compiler,0x48)||!compiler_emit(compiler,0x89)||
+           !compiler_emit(compiler,0xc2)||!compiler_emit(compiler,0x59)||
+           !compiler_emit(compiler,0xb8)||
+           !compiler_emit_u32(compiler,BOB64_SYSCALL_WRITE_BUFFER)||
+           !compiler_emit(compiler,0xcd)||!compiler_emit(compiler,0x80))return -1;
+        compiler->StackBytes-=8;
         return 1;
     }
     compiler->Position=saved;
@@ -1726,59 +1877,52 @@ static int compiler_function_body(BOB64_C_COMPILER *compiler) {
 
 static int compiler_store_parameter(BOB64_C_COMPILER *compiler,u32 variable,
                                     u32 argument) {
-    s8 displacement=(s8)compiler->VariableDisplacement[variable];
+    s16 displacement=compiler->VariableDisplacement[variable];
     u8 type=compiler->VariableType[variable];
     if(argument>=4) {
         u32 incoming=16u+argument*8u;
         u8 load_modrm=incoming<=127u?0x45:0x85;
         if(type==COMPILER_TYPE_SHORT)
             return compiler_emit(compiler,0x0f)&&compiler_emit(compiler,0xbf)&&
-                   compiler_emit(compiler,load_modrm)&&
-                   (incoming<=127u?compiler_emit(compiler,(u8)incoming):
-                    compiler_emit_u32(compiler,incoming))&&
+                   compiler_emit_rbp_operand(compiler,load_modrm,(s16)incoming)&&
                    compiler_emit(compiler,0x66)&&compiler_emit(compiler,0x89)&&
-                   compiler_emit(compiler,0x45)&&compiler_emit(compiler,(u8)displacement);
+                   compiler_emit_rbp_operand(compiler,0x45,displacement);
         if(type==COMPILER_TYPE_CHAR)
             return compiler_emit(compiler,0x0f)&&compiler_emit(compiler,0xbe)&&
-                   compiler_emit(compiler,load_modrm)&&
-                   (incoming<=127u?compiler_emit(compiler,(u8)incoming):
-                    compiler_emit_u32(compiler,incoming))&&
-                   compiler_emit(compiler,0x88)&&compiler_emit(compiler,0x45)&&
-                   compiler_emit(compiler,(u8)displacement);
+                   compiler_emit_rbp_operand(compiler,load_modrm,(s16)incoming)&&
+                   compiler_emit(compiler,0x88)&&
+                   compiler_emit_rbp_operand(compiler,0x45,displacement);
         if(compiler_is_pointer(type)||type==COMPILER_TYPE_USIZE||
            type==COMPILER_TYPE_LONG_LONG) {
             if(!compiler_emit(compiler,0x48)||!compiler_emit(compiler,0x8b)||
-               !compiler_emit(compiler,load_modrm)||
-               !(incoming<=127u?compiler_emit(compiler,(u8)incoming):
-                 compiler_emit_u32(compiler,incoming)))return 0;
+               !compiler_emit_rbp_operand(compiler,load_modrm,(s16)incoming))return 0;
             return compiler_emit(compiler,0x48)&&compiler_emit(compiler,0x89)&&
-                   compiler_emit(compiler,0x45)&&compiler_emit(compiler,(u8)displacement);
+                   compiler_emit_rbp_operand(compiler,0x45,displacement);
         }
-        if(!compiler_emit(compiler,0x8b)||!compiler_emit(compiler,load_modrm)||
-           !(incoming<=127u?compiler_emit(compiler,(u8)incoming):
-             compiler_emit_u32(compiler,incoming)))return 0;
-        return compiler_emit(compiler,0x89)&&compiler_emit(compiler,0x45)&&
-               compiler_emit(compiler,(u8)displacement);
+        if(!compiler_emit(compiler,0x8b)||
+           !compiler_emit_rbp_operand(compiler,load_modrm,(s16)incoming))return 0;
+        return compiler_emit(compiler,0x89)&&
+               compiler_emit_rbp_operand(compiler,0x45,displacement);
     }
     if(compiler_is_pointer(type)||type==COMPILER_TYPE_USIZE||
        type==COMPILER_TYPE_LONG_LONG) {
         if(argument<2) {
             u8 modrm=argument==0?0x4d:0x55;
             return compiler_emit(compiler,0x48)&&compiler_emit(compiler,0x89)&&
-                   compiler_emit(compiler,modrm)&&compiler_emit(compiler,(u8)displacement);
+                   compiler_emit_rbp_operand(compiler,modrm,displacement);
         }
         return compiler_emit(compiler,0x4c)&&compiler_emit(compiler,0x89)&&
-               compiler_emit(compiler,(u8)(argument==2?0x45:0x4d))&&
-               compiler_emit(compiler,(u8)displacement);
+               compiler_emit_rbp_operand(compiler,
+                   (u8)(argument==2?0x45:0x4d),displacement);
     }
     if(type==COMPILER_TYPE_CHAR) {
-        if(argument==0)return compiler_emit(compiler,0x88)&&compiler_emit(compiler,0x4d)&&
-                               compiler_emit(compiler,(u8)displacement);
-        if(argument==1)return compiler_emit(compiler,0x88)&&compiler_emit(compiler,0x55)&&
-                               compiler_emit(compiler,(u8)displacement);
+        if(argument==0)return compiler_emit(compiler,0x88)&&
+                               compiler_emit_rbp_operand(compiler,0x4d,displacement);
+        if(argument==1)return compiler_emit(compiler,0x88)&&
+                               compiler_emit_rbp_operand(compiler,0x55,displacement);
         return compiler_emit(compiler,0x41)&&compiler_emit(compiler,0x88)&&
-               compiler_emit(compiler,(u8)(argument==2?0x45:0x4d))&&
-               compiler_emit(compiler,(u8)displacement);
+               compiler_emit_rbp_operand(compiler,
+                   (u8)(argument==2?0x45:0x4d),displacement);
     }
     if(type==COMPILER_TYPE_SHORT) {
         static const u8 short_stores[4][4]={
@@ -1787,16 +1931,18 @@ static int compiler_store_parameter(BOB64_C_COMPILER *compiler,u32 variable,
         };
         u32 instruction_bytes=argument<2?3u:4u;
         for(u32 byte=0;byte<instruction_bytes;byte++)
-            if(!compiler_emit(compiler,short_stores[argument][byte]))return 0;
-        return compiler_emit(compiler,(u8)displacement);
+            if(byte+1u<instruction_bytes&&
+               !compiler_emit(compiler,short_stores[argument][byte]))return 0;
+        return compiler_emit_rbp_operand(compiler,
+            short_stores[argument][instruction_bytes-1],displacement);
     }
-    if(argument==0)return compiler_emit(compiler,0x89)&&compiler_emit(compiler,0x4d)&&
-                           compiler_emit(compiler,(u8)displacement);
-    if(argument==1)return compiler_emit(compiler,0x89)&&compiler_emit(compiler,0x55)&&
-                           compiler_emit(compiler,(u8)displacement);
+    if(argument==0)return compiler_emit(compiler,0x89)&&
+                           compiler_emit_rbp_operand(compiler,0x4d,displacement);
+    if(argument==1)return compiler_emit(compiler,0x89)&&
+                           compiler_emit_rbp_operand(compiler,0x55,displacement);
     return compiler_emit(compiler,0x44)&&compiler_emit(compiler,0x89)&&
-           compiler_emit(compiler,(u8)(argument==2?0x45:0x4d))&&
-           compiler_emit(compiler,(u8)displacement);
+           compiler_emit_rbp_operand(compiler,
+               (u8)(argument==2?0x45:0x4d),displacement);
 }
 
 static int compiler_function_definition(BOB64_C_COMPILER *compiler) {
@@ -1948,17 +2094,10 @@ static int compiler_struct_definition(BOB64_C_COMPILER *compiler,const char *nam
     u32 offset=0;
     for(;;) {
         if(compiler_take(compiler,'}'))break;
-        int is_char=compiler_word(compiler,"char"),struct_index=-1;
-        u8 long_type=is_char?COMPILER_TYPE_CHAR:compiler_integer_type(compiler);
-        if(!long_type) {
-            if(compiler_word(compiler,"struct")) {
-                char field_struct_name[32];
-                if(!compiler_identifier(compiler,field_struct_name,
-                                       sizeof(field_struct_name)))return 0;
-                struct_index=compiler_struct_find(compiler,field_struct_name);
-                if(struct_index<0)return 0;
-            } else return 0;
-        }
+        u8 base_type=compiler_type_specifier(compiler);
+        int struct_index=compiler_type_is_struct(base_type)?
+                         (int)(base_type-COMPILER_TYPE_STRUCT_BASE):-1;
+        if(!base_type||base_type==COMPILER_TYPE_VOID)return 0;
         int pointer=compiler_take(compiler,'*');
         if(struct_index>=0&&!pointer)return 0;
         char field_name[32];
@@ -1966,10 +2105,8 @@ static int compiler_struct_definition(BOB64_C_COMPILER *compiler,const char *nam
            !compiler_take(compiler,';')||structure->FieldCount>=COMPILER_FIELD_LIMIT||
            compiler_field_find(compiler,(u8)(COMPILER_TYPE_STRUCT_BASE+index),field_name)>=0)
             return 0;
-        u8 field_type=struct_index>=0?
-                      (u8)(COMPILER_TYPE_STRUCT_POINTER_BASE+(u32)struct_index):
-                      (pointer?compiler_pointer_type(is_char?COMPILER_TYPE_CHAR:long_type):
-                       long_type);
+        u8 field_type=pointer?compiler_pointer_to(compiler,base_type):base_type;
+        if(!field_type)return 0;
         u32 alignment=compiler_type_alignment(compiler,field_type);
         u32 size=compiler_type_size(compiler,field_type);
         offset=(offset+alignment-1u)&~(alignment-1u);
@@ -1988,12 +2125,43 @@ static int compiler_struct_definition(BOB64_C_COMPILER *compiler,const char *nam
     return compiler_take(compiler,';');
 }
 
+static int compiler_typedef_name_reserved(const char *name) {
+    static const char *reserved[]={"void","char","short","int","long",
+        "usize","uintptr_t","isize","intptr_t","struct"};
+    for(u32 i=0;i<sizeof(reserved)/sizeof(reserved[0]);i++) {
+        usize position=0;
+        while(name[position]&&name[position]==reserved[i][position])position++;
+        if(!name[position]&&!reserved[i][position])return 1;
+    }
+    return 0;
+}
+
+static int compiler_typedef_declaration(BOB64_C_COMPILER *compiler) {
+    char name[32];
+    if(!compiler_word(compiler,"typedef"))return 0;
+    u8 type=compiler_type_specifier(compiler);
+    if(!type||type==COMPILER_TYPE_VOID)return 0;
+    if(compiler_take(compiler,'*')) {
+        type=compiler_pointer_to(compiler,type);
+        if(!type)return 0;
+    }
+    if(!compiler_identifier(compiler,name,sizeof(name))||
+       compiler_typedef_name_reserved(name)||
+       compiler_typedef_find(compiler,name)>=0||
+       compiler->TypedefCount>=COMPILER_TYPEDEF_LIMIT||
+       !compiler_take(compiler,';'))return 0;
+    BOB64_C_TYPEDEF *alias=&compiler->Typedefs[compiler->TypedefCount++];
+    usize length=0;
+    while(name[length]) {alias->Name[length]=name[length];length++;}
+    alias->Name[length]=0;alias->Type=type;
+    return 1;
+}
+
 static int compiler_global_declaration(BOB64_C_COMPILER *compiler) {
     char name[32];
-    u8 type;
+    u8 type,base_type;
     u32 array_length=0,bytes,index;
-    int is_char=0,is_short=0,is_pointer=0,is_struct=0,is_struct_pointer=0;
-    u8 long_type=0;
+    int is_pointer,is_struct;
     if(compiler_word(compiler,"static")) { }
     if(compiler_word(compiler,"struct")) {
         char struct_name[32];
@@ -2001,46 +2169,39 @@ static int compiler_global_declaration(BOB64_C_COMPILER *compiler) {
         if(compiler_take(compiler,'{'))return compiler_struct_definition(compiler,struct_name);
         int structure=compiler_struct_find(compiler,struct_name);
         if(structure<0)return 0;
-        type=(u8)(COMPILER_TYPE_STRUCT_BASE+(u32)structure);
-        is_struct=1;
-    } else if(compiler_word(compiler,"char"))is_char=1;
-    else if((long_type=compiler_integer_type(compiler))==0)return 0;
-    is_short=long_type==COMPILER_TYPE_SHORT;
-    is_pointer=compiler_take(compiler,'*');
-    if(is_struct&&is_pointer) {
-        type=(u8)(COMPILER_TYPE_STRUCT_POINTER_BASE+
-                  type-COMPILER_TYPE_STRUCT_BASE);
-        is_struct=0;is_struct_pointer=1;
+        base_type=(u8)(COMPILER_TYPE_STRUCT_BASE+(u32)structure);
+    } else base_type=compiler_type_specifier(compiler);
+    if(!base_type||base_type==COMPILER_TYPE_VOID)return 0;
+    if(compiler_take(compiler,'*')) {
+        base_type=compiler_pointer_to(compiler,base_type);
+        if(!base_type)return 0;
     }
+    type=base_type;
+    is_struct=compiler_type_is_struct(type);
+    is_pointer=compiler_is_pointer(type);
     if(!compiler_identifier(compiler,name,sizeof(name)))return 0;
     int array=compiler_take(compiler,'[');
     if(array) {
         u64 size;
         if(is_pointer||is_struct||!compiler_integer(compiler,&size)||!size||
            !compiler_take(compiler,']'))return 0;
-        type=long_type==COMPILER_TYPE_USIZE?COMPILER_TYPE_USIZE_ARRAY:
-             (long_type==COMPILER_TYPE_LONG_LONG?COMPILER_TYPE_LONG_LONG_ARRAY:
-              (is_char?COMPILER_TYPE_CHAR_ARRAY:
-               (is_short?COMPILER_TYPE_SHORT_ARRAY:COMPILER_TYPE_INT_ARRAY)));
+        type=compiler_array_type(base_type);
+        if(!type)return 0;
         u32 element_size=compiler_array_element_size(type);
         u32 maximum=sizeof(compiler->Data)/element_size;
         if(size>maximum)return 0;
         array_length=(u32)size;
         bytes=array_length*element_size;
-    } else {
-        if(!is_struct&&!is_struct_pointer)
-            type=is_pointer?compiler_pointer_type(is_char?COMPILER_TYPE_CHAR:long_type):
-             (is_char?COMPILER_TYPE_CHAR:long_type);
-        bytes=is_struct?compiler_type_size(compiler,type):
-              (is_pointer?8u:compiler_type_size(compiler,type));
-    }
+    } else bytes=is_struct?compiler_type_size(compiler,type):
+                  (is_pointer?8u:compiler_type_size(compiler,type));
     if(!compiler_global_add(compiler,name,type,array_length,bytes,&index))return 0;
     BOB64_C_GLOBAL *global=&compiler->Globals[index];
     if(compiler_take(compiler,'=')) {
         if(is_struct)return 0;
         if(is_pointer) {
             usize string_offset,string_length;
-            if(is_char&&compiler_string(compiler,&string_offset,&string_length)) {
+            if(type==COMPILER_TYPE_CHAR_POINTER&&
+               compiler_string(compiler,&string_offset,&string_length)) {
                 (void)string_length;
                 global->InitKind=2;
                 global->InitTarget=(u16)string_offset;
@@ -2070,7 +2231,7 @@ static int compiler_global_declaration(BOB64_C_COMPILER *compiler) {
                     if(!compiler_integer(compiler,&value)||value!=0)return 0;
                 }
             }
-        } else if(array&&is_char) {
+        } else if(array&&type==COMPILER_TYPE_CHAR_ARRAY) {
             usize string_offset,string_length;
             if(compiler_string(compiler,&string_offset,&string_length)) {
                 if(string_length>array_length)return 0;
@@ -2128,6 +2289,12 @@ static int compiler_collect_function_sources(BOB64_C_COMPILER *compiler,
         if(compiler->Failed)return 0;
         if(compiler->Position>=compiler->Length)break;
         usize start=compiler->Position;
+        if(compiler_word(compiler,"typedef")) {
+            compiler->Position=start;
+            if(!compiler_typedef_declaration(compiler))return 0;
+            scan=compiler->Position;
+            continue;
+        }
         char name[32],parameter_names[COMPILER_ARGUMENT_LIMIT][32];
         u8 return_type,argument_count,argument_types[COMPILER_ARGUMENT_LIMIT];
         if(!compiler_function_signature(compiler,name,sizeof(name),&return_type,
@@ -2187,7 +2354,8 @@ int bob64_compile_c(const char *source,usize source_length,void *output,
                     usize *error_offset) {
     /* The initial kernel is single-tasked; a later compiler job queue needs per-job state. */
     static BOB64_C_COMPILER compiler;
-    static u8 payload[2*BOB64_PAGE_SIZE];
+    static u8 payload[BOB64_COMPILER_CODE_CAPACITY+
+                      BOB64_COMPILER_DATA_CAPACITY];
     u8 *file=(u8 *)output;
     u32 main_source_index=0;
     if(output_length)*output_length=0;
@@ -2199,6 +2367,7 @@ int bob64_compile_c(const char *source,usize source_length,void *output,
     compiler.IntegerValue=0;compiler.Return64=0;compiler.Failed=0;
     compiler.VariableCount=0;
     compiler.FunctionCount=0;compiler.GlobalCount=0;compiler.StructCount=0;
+    compiler.TypedefCount=0;
     compiler.CallCount=0;compiler.LoopDepth=0;
     compiler.FunctionSourceCount=0;
     for(usize i=0;i<sizeof(compiler.Data);i++)compiler.Data[i]=0;
@@ -2207,7 +2376,8 @@ int bob64_compile_c(const char *source,usize source_length,void *output,
     for(usize i=0;i<sizeof(compiler.VariableDisplacement);i++)
         ((u8 *)compiler.VariableDisplacement)[i]=0;
     for(usize i=0;i<sizeof(compiler.VariableType);i++)compiler.VariableType[i]=0;
-    for(usize i=0;i<sizeof(compiler.VariableArrayLength);i++)
+    for(usize i=0;i<sizeof(compiler.VariableArrayLength)/
+                    sizeof(compiler.VariableArrayLength[0]);i++)
         compiler.VariableArrayLength[i]=0;
     compiler.LocalBytes=0;compiler.StackBytes=0;compiler.ControlDepth=0;
     if(!compiler_collect_function_sources(&compiler,&main_source_index))goto syntax_error;
@@ -2234,7 +2404,8 @@ int bob64_compile_c(const char *source,usize source_length,void *output,
     if(compiler.Failed||!compiler_resolve_calls(&compiler))goto syntax_error;
     for(usize i=0;i<sizeof(compiler.Code);i++)
         payload[i]=i<compiler.CodePosition?compiler.Code[i]:0x90;
-    for(usize i=0;i<sizeof(compiler.Data);i++)payload[BOB64_PAGE_SIZE+i]=compiler.Data[i];
+    for(usize i=0;i<sizeof(compiler.Data);i++)
+        payload[BOB64_COMPILER_CODE_CAPACITY+i]=compiler.Data[i];
     for(usize i=0;i<BOB64_EXEC_HEADER_SIZE;i++)file[i]=0;
     file[0]='B';file[1]='6';file[2]='4';file[3]='E';
     compiler_write16(file+4,BOB64_EXEC_VERSION);
@@ -2243,7 +2414,7 @@ int bob64_compile_c(const char *source,usize source_length,void *output,
     compiler_write64(file+16,sizeof(payload));
     compiler_write64(file+24,sizeof(payload));
     compiler_write64(file+32,0);
-    compiler_write64(file+40,BOB64_PAGE_SIZE);
+    compiler_write64(file+40,BOB64_COMPILER_CODE_CAPACITY);
     compiler_write32(file+48,compiler_crc32(payload,sizeof(payload)));
     for(usize i=0;i<sizeof(payload);i++)file[BOB64_EXEC_HEADER_SIZE+i]=payload[i];
     *output_length=BOB64_COMPILER_IMAGE_LIMIT;

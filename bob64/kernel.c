@@ -12,6 +12,7 @@
 #include "process.h"
 #include "syscall.h"
 #include "compiler.h"
+#include "firmware_store.h"
 
 #define BOB64_KERNEL_HEAP_BASE 0xffff900000000000ULL
 #define BOB64_KERNEL_HEAP_LIMIT (64ULL*1024ULL*1024ULL)
@@ -27,11 +28,24 @@ typedef struct {
 } KERNEL_APP_CONTEXT;
 static KERNEL_APP_CONTEXT kernel_app_context;
 static usize kernel_heap_mapped;
+static usize kernel_heap_high_water;
 static void *kernel_privilege_stack;
-static char kernel_user_output[5];
+static char kernel_user_output[1024];
 static usize kernel_user_output_length;
+static u8 kernel_user_output_truncated;
 static u8 kernel_compiler_output[BOB64_COMPILER_IMAGE_LIMIT];
 static void kernel_write(const char *text);
+static void kernel_hex64(u64 value);
+
+static int kernel_text_contains(const char *text,const char *needle) {
+    if(!text||!needle)return 0;
+    for(usize i=0;text[i];i++) {
+        usize j=0;
+        while(needle[j]&&text[i+j]&&text[i+j]==needle[j])j++;
+        if(!needle[j])return 1;
+    }
+    return 0;
+}
 
 static int kernel_interrupts_enabled(void) {
     u64 flags;
@@ -39,6 +53,13 @@ static int kernel_interrupts_enabled(void) {
     return (flags&0x200)!=0;
 }
 static void kernel_user_write_character(void *context,u8 character);
+static s64 kernel_run_application(void *context,const char *name,
+                                  usize argument_count,
+                                  const char *const *arguments,int *started);
+static int kernel_app_run_application(void *context,const char *name,
+                                      usize argument_count,
+                                      const char *const *arguments,
+                                      s64 *exit_status);
 static int kernel_copy_user_bytes(void *context,u64 address,void *destination,
                                   usize length);
 static int kernel_process_fault_smoke_test(BOB64_PROCESS *process,
@@ -46,10 +67,31 @@ static int kernel_process_fault_smoke_test(BOB64_PROCESS *process,
     const u8 *executable,usize executable_size,u64 expected_rip,u64 error_mask,
     u64 error_value,const char *success_message);
 static int kernel_wait_for_input_event(void *context,BOB64_EVENT *event);
+static int kernel_snapshot_save(void *context,const void *snapshot,
+                                usize snapshot_size);
+static int kernel_snapshot_restore(void *context,BOB64_FILESYSTEM *filesystem);
 extern const u8 bob64_embedded_app[];
 extern const u8 bob64_embedded_app_end[];
+extern const u8 bob64_embedded_display[];
+extern const u8 bob64_embedded_display_end[];
 extern const u8 bob64_embedded_gui[];
 extern const u8 bob64_embedded_gui_end[];
+extern const u8 bob64_embedded_nested_app[];
+extern const u8 bob64_embedded_nested_app_end[];
+extern const u8 bob64_embedded_echo[];
+extern const u8 bob64_embedded_echo_end[];
+extern const u8 bob64_embedded_ls[];
+extern const u8 bob64_embedded_ls_end[];
+extern const u8 bob64_embedded_cat[];
+extern const u8 bob64_embedded_cat_end[];
+extern const u8 bob64_embedded_notes[];
+extern const u8 bob64_embedded_notes_end[];
+extern const u8 bob64_embedded_info[];
+extern const u8 bob64_embedded_info_end[];
+extern const u8 bob64_embedded_mouse_smoke[];
+extern const u8 bob64_embedded_mouse_smoke_end[];
+extern const u8 bob64_embedded_launcher[];
+extern const u8 bob64_embedded_launcher_end[];
 extern const u8 bob64_embedded_source[];
 extern const u8 bob64_embedded_source_end[];
 
@@ -204,10 +246,70 @@ static int kernel_install_bob_application(BOB64_FILESYSTEM *filesystem) {
     return bob64_fs_write(filesystem,"bob.b64e",bob64_embedded_app,length);
 }
 
+static int kernel_install_display_application(BOB64_FILESYSTEM *filesystem) {
+    usize length=(usize)(bob64_embedded_display_end-bob64_embedded_display);
+    if(length<BOB64_EXEC_HEADER_SIZE)return -1;
+    return bob64_fs_write(filesystem,"display.b64e",bob64_embedded_display,length);
+}
+
 static int kernel_install_gui_application(BOB64_FILESYSTEM *filesystem) {
     usize length=(usize)(bob64_embedded_gui_end-bob64_embedded_gui);
     if(!length)return -1;
     return bob64_fs_write(filesystem,"desktop.b64e",bob64_embedded_gui,length);
+}
+
+static int kernel_install_nested_application(BOB64_FILESYSTEM *filesystem) {
+    usize length=(usize)(bob64_embedded_nested_app_end-
+                         bob64_embedded_nested_app);
+    if(length<BOB64_EXEC_HEADER_SIZE)return -1;
+    return bob64_fs_write(filesystem,"nested.b64e",bob64_embedded_nested_app,
+                          length);
+}
+
+static int kernel_install_echo_application(BOB64_FILESYSTEM *filesystem) {
+    usize length=(usize)(bob64_embedded_echo_end-bob64_embedded_echo);
+    if(length<BOB64_EXEC_HEADER_SIZE)return -1;
+    return bob64_fs_write(filesystem,"echo.b64e",bob64_embedded_echo,length);
+}
+
+static int kernel_install_ls_application(BOB64_FILESYSTEM *filesystem) {
+    usize length=(usize)(bob64_embedded_ls_end-bob64_embedded_ls);
+    if(length<BOB64_EXEC_HEADER_SIZE)return -1;
+    return bob64_fs_write(filesystem,"ls.b64e",bob64_embedded_ls,length);
+}
+
+static int kernel_install_cat_application(BOB64_FILESYSTEM *filesystem) {
+    usize length=(usize)(bob64_embedded_cat_end-bob64_embedded_cat);
+    if(length<BOB64_EXEC_HEADER_SIZE)return -1;
+    return bob64_fs_write(filesystem,"cat.b64e",bob64_embedded_cat,length);
+}
+
+static int kernel_install_notes_application(BOB64_FILESYSTEM *filesystem) {
+    usize length=(usize)(bob64_embedded_notes_end-bob64_embedded_notes);
+    if(length<BOB64_EXEC_HEADER_SIZE)return -1;
+    return bob64_fs_write(filesystem,"notes.b64e",bob64_embedded_notes,length);
+}
+
+static int kernel_install_info_application(BOB64_FILESYSTEM *filesystem) {
+    usize length=(usize)(bob64_embedded_info_end-bob64_embedded_info);
+    if(length<BOB64_EXEC_HEADER_SIZE)return -1;
+    return bob64_fs_write(filesystem,"info.b64e",bob64_embedded_info,length);
+}
+
+static int kernel_install_mouse_smoke_application(BOB64_FILESYSTEM *filesystem) {
+    usize length=(usize)(bob64_embedded_mouse_smoke_end-
+                         bob64_embedded_mouse_smoke);
+    if(length<BOB64_EXEC_HEADER_SIZE)return -1;
+    return bob64_fs_write(filesystem,"mousesmoke.b64e",
+                          bob64_embedded_mouse_smoke,length);
+}
+
+static int kernel_install_launcher_application(BOB64_FILESYSTEM *filesystem) {
+    usize length=(usize)(bob64_embedded_launcher_end-
+                         bob64_embedded_launcher);
+    if(length<BOB64_EXEC_HEADER_SIZE)return -1;
+    return bob64_fs_write(filesystem,"launcher.b64e",bob64_embedded_launcher,
+                          length);
 }
 
 static int kernel_install_bob_source(BOB64_FILESYSTEM *filesystem) {
@@ -227,13 +329,14 @@ static int kernel_process_smoke_test(const BOB64_KERNEL_BOOT_INFO *info) {
     BOB64_PROCESS_PAGE *pages;
     BOB64_APP_STARTUP *startup;
     u64 physical,flags,kernel_root,table_checkpoint;
-    usize allocated_before;
+    usize allocated_before,heap_checkpoint;
     if(!info->NxSupported)return 1;
     pages=(BOB64_PROCESS_PAGE *)bob64_heap_calloc(&kernel_heap,
           (usize)BOB64_PROCESS_PAGE_LIMIT,sizeof(*pages));
     if(!pages)return -1;
     kernel_root=read_cr3();
     table_checkpoint=bob64_bootstrap_space.TablePoolUsed;
+    heap_checkpoint=kernel_heap_high_water;
     allocated_before=bob64_boot_page_allocator.AllocatedCount;
     operations.NxSupported=info->NxSupported;
     if(bob64_process_init(&process,pages,(usize)BOB64_PROCESS_PAGE_LIMIT,&operations)) {
@@ -244,7 +347,8 @@ static int kernel_process_smoke_test(const BOB64_KERNEL_BOOT_INFO *info) {
        bob64_bootstrap_space.PageTable.Context)||
        bob64_page_table_clone_isolated(&process_table,&bob64_bootstrap_space.PageTable,
        BOB64_PROCESS_IMAGE_BASE,BOB64_PROCESS_ISOLATED_SIZE)) {
-        bob64_bootstrap_space.TablePoolUsed=table_checkpoint;
+        if(kernel_heap_high_water==heap_checkpoint)
+            bob64_bootstrap_space.TablePoolUsed=table_checkpoint;
         bob64_heap_free(&kernel_heap,pages);return -1;
     }
     __asm__ volatile("mov %0,%%cr3"::"r"(process_table.RootPhysical):"memory");
@@ -253,7 +357,8 @@ static int kernel_process_smoke_test(const BOB64_KERNEL_BOOT_INFO *info) {
     if(result) {
         bob64_process_unload(&process);
         __asm__ volatile("mov %0,%%cr3"::"r"(kernel_root):"memory");
-        bob64_bootstrap_space.TablePoolUsed=table_checkpoint;
+        if(kernel_heap_high_water==heap_checkpoint)
+            bob64_bootstrap_space.TablePoolUsed=table_checkpoint;
         bob64_heap_free(&kernel_heap,pages);return -1;
     }
     startup=(BOB64_APP_STARTUP *)(uintptr_t)process.StartupAddress;
@@ -270,6 +375,7 @@ static int kernel_process_smoke_test(const BOB64_KERNEL_BOOT_INFO *info) {
              BOB64_PROCESS_STACK_GUARD,&physical,&flags)==0;
     if(result) {
         kernel_user_output_length=0;
+        kernel_user_output_truncated=0;
         bob64_syscall_set_address_space(&process_table);
         bob64_syscall_set_read_user(kernel_copy_user_bytes,0);
         bob64_syscall_set_write(kernel_user_write_character,0);
@@ -281,7 +387,8 @@ static int kernel_process_smoke_test(const BOB64_KERNEL_BOOT_INFO *info) {
         bob64_syscall_set_read_user(0,0);
         bob64_syscall_set_address_space(0);
         kernel_user_output[kernel_user_output_length]=0;
-        if(app_status||kernel_user_output_length!=sizeof(kernel_user_output)-1||
+        if(app_status||kernel_user_output_truncated||
+           kernel_user_output_length!=4||
            !kernel_bytes_equal(kernel_user_output,"bob!"))result=0;
         else kernel_write("\r\n");
     }
@@ -303,7 +410,8 @@ static int kernel_process_smoke_test(const BOB64_KERNEL_BOOT_INFO *info) {
            "bob64 kernel: non-executable data protection passed\r\n"))result=-1;
     }
     __asm__ volatile("mov %0,%%cr3"::"r"(kernel_root):"memory");
-    bob64_bootstrap_space.TablePoolUsed=table_checkpoint;
+    if(kernel_heap_high_water==heap_checkpoint)
+        bob64_bootstrap_space.TablePoolUsed=table_checkpoint;
     if(bob64_boot_page_allocator.AllocatedCount!=allocated_before)result=-1;
     if(bob64_heap_free(&kernel_heap,pages))result=-1;
     return result;
@@ -330,6 +438,7 @@ static void kernel_user_write_character(void *context,u8 character) {
     (void)context;
     if(kernel_user_output_length+1<sizeof(kernel_user_output))
         kernel_user_output[kernel_user_output_length++]=(char)character;
+    else kernel_user_output_truncated=1;
     kernel_write(text);
 }
 
@@ -358,6 +467,7 @@ static int kernel_process_fault_smoke_test(BOB64_PROCESS *process,
         return -1;
     }
     kernel_user_output_length=0;
+    kernel_user_output_truncated=0;
     bob64_user_exception_vector=~(u64)0;
     bob64_user_exception_error=~(u64)0;
     bob64_user_exception_rip=~(u64)0;
@@ -377,7 +487,7 @@ static int kernel_process_fault_smoke_test(BOB64_PROCESS *process,
     passed=status==-142&&bob64_user_exception_vector==14&&
         bob64_user_exception_rip==expected_rip&&
         (bob64_user_exception_error&error_mask)==error_value&&
-        kernel_user_output_length==sizeof(kernel_user_output)-1&&
+        !kernel_user_output_truncated&&kernel_user_output_length==4&&
         kernel_bytes_equal(kernel_user_output,"bob!");
     if(bob64_process_unload(process))return -1;
     if(!passed)return -1;
@@ -388,10 +498,15 @@ static int kernel_process_fault_smoke_test(BOB64_PROCESS *process,
 static int kernel_wait_for_input_event(void *context,BOB64_EVENT *event) {
     (void)context;
     if(!event)return -1;
+    /* int 0x80 enters through an interrupt gate, which clears IF. */
+    __asm__ volatile("sti":::"memory");
     for(;;) {
-        if(!bob64_mouse_poll_event(event)||!bob64_keyboard_poll_event(event))return 0;
+        if(!bob64_mouse_poll_event(event)||!bob64_keyboard_poll_event(event))break;
         __asm__ volatile("pause");
     }
+    /* Keep the syscall handler's state until iretq restores the user flags. */
+    __asm__ volatile("cli":::"memory");
+    return 0;
 }
 
 static int kernel_write_user_bytes(void *context,u64 address,const void *source,
@@ -504,6 +619,7 @@ static s64 kernel_run_application(void *context,const char *name,usize argument_
     const char *image;
     usize image_size;
     u64 kernel_root,table_checkpoint;
+    usize heap_checkpoint;
     s64 status=-1;
     KERNEL_APP_CONTEXT *app=(KERNEL_APP_CONTEXT *)context;
     void *application_privilege_stack=0;
@@ -515,6 +631,7 @@ static s64 kernel_run_application(void *context,const char *name,usize argument_
     if(started)*started=0;
     if(!app||!app->Filesystem||!app->NxSupported||!started||
        !app->PhysicalAddressBits||
+       bob64_user_depth>=BOB64_USER_ENTRY_MAX_DEPTH||
        bob64_fs_read(app->Filesystem,name,&image,&image_size))return -1;
     operations=(BOB64_PROCESS_OPERATIONS){process_allocate_page,process_free_page,
         process_map_page,process_protect_page,process_unmap_page,&process_context,
@@ -524,6 +641,7 @@ static s64 kernel_run_application(void *context,const char *name,usize argument_
     if(!pages)return -1;
     kernel_root=read_cr3();
     table_checkpoint=bob64_bootstrap_space.TablePoolUsed;
+    heap_checkpoint=kernel_heap_high_water;
     if(bob64_process_init(&process,pages,(usize)BOB64_PROCESS_PAGE_LIMIT,&operations))
         goto done;
     if(bob64_page_table_init(&process_table,app->PhysicalAddressBits,
@@ -554,6 +672,7 @@ static s64 kernel_run_application(void *context,const char *name,usize argument_
     }
     syscall_context_saved=1;
     kernel_user_output_length=0;
+    kernel_user_output_truncated=0;
     u32 display_width,display_height;
     if(!bob64_framebuffer_resolution(&display_width,&display_height)) {
         window_owner=kernel_next_window_owner++;
@@ -575,6 +694,7 @@ static s64 kernel_run_application(void *context,const char *name,usize argument_
     bob64_syscall_set_file_stream(kernel_app_open_stream,kernel_app_read_stream,
                                   kernel_app_write_stream,app);
     bob64_syscall_set_file_manager(kernel_app_list_files,kernel_app_delete_file,app);
+    bob64_syscall_set_app_runner(kernel_app_run_application,app);
     bob64_syscall_set_write(kernel_user_write_character,0);
     bob64_syscall_set_wait_event(kernel_wait_for_input_event,0);
     bob64_syscall_set_window_server(window_server_ready?window_server:0,
@@ -582,6 +702,7 @@ static s64 kernel_run_application(void *context,const char *name,usize argument_
     *started=1;entered=1;
     status=bob64_enter_user(process.EntryAddress,process.StartupAddress,
                              process.InitialStackPointer);
+    kernel_user_output[kernel_user_output_length]=0;
     if(bob64_tss_set_rsp0(&bob64_kernel_tss,previous_privilege_stack)||
        bob64_kernel_tss.Rsp0!=previous_privilege_stack)cleanup_error=1;
     if(bob64_heap_free(&kernel_heap,application_privilege_stack))cleanup_error=1;
@@ -600,10 +721,26 @@ restore:
     }
     __asm__ volatile("mov %0,%%cr3"::"r"(kernel_root):"memory");
 done:
-    bob64_bootstrap_space.TablePoolUsed=table_checkpoint;
+    /* A heap peak can leave shared page-table levels mapped after the heap
+       later shrinks. Preserve those table pages across this address space. */
+    if(kernel_heap_high_water==heap_checkpoint)
+        bob64_bootstrap_space.TablePoolUsed=table_checkpoint;
     if(bob64_heap_free(&kernel_heap,pages)||cleanup_error)status=-1;
     if(!entered)*started=0;
     return status;
+}
+
+static int kernel_app_run_application(void *context,const char *name,
+                                      usize argument_count,
+                                      const char *const *arguments,
+                                      s64 *exit_status) {
+    int started=0;
+    s64 status;
+    if(!exit_status)return -22;
+    status=kernel_run_application(context,name,argument_count,arguments,&started);
+    if(!started)return -2;
+    *exit_status=status;
+    return 0;
 }
 
 static int kernel_compile_application(void *context,const char *source_name,
@@ -633,13 +770,23 @@ static void kernel_hex64(u64 value) {
 static int kernel_heap_grow(void *context,void **region,usize *region_size) {
     const BOB64_KERNEL_BOOT_INFO *info=(const BOB64_KERNEL_BOOT_INFO *)context;
     u64 physical,virtual_address;
+    int map_result;
     if(!info||!region||!region_size||kernel_heap_mapped>=BOB64_KERNEL_HEAP_LIMIT)
         return 0;
     physical=bob64_page_alloc(&bob64_boot_page_allocator,1);
-    if(!physical)return 0;
+    if(!physical) {
+        kernel_write("bob64 kernel: heap physical page allocation failed\r\n");
+        return 0;
+    }
     virtual_address=BOB64_KERNEL_HEAP_BASE+kernel_heap_mapped;
-    if(bob64_page_map(&bob64_bootstrap_space.PageTable,virtual_address,physical,
-       BOB64_PAGE_WRITE|(info->NxSupported?BOB64_PAGE_NX:0))) {
+    map_result=bob64_page_map(&bob64_bootstrap_space.PageTable,virtual_address,
+       physical,BOB64_PAGE_WRITE|(info->NxSupported?BOB64_PAGE_NX:0));
+    if(map_result) {
+        kernel_write("bob64 kernel: heap page-table mapping failed (result=0x");
+        kernel_hex64((u64)(s64)map_result);
+        kernel_write(" tables=0x");kernel_hex64(bob64_bootstrap_space.TablePoolUsed);
+        kernel_write("/0x");kernel_hex64(bob64_bootstrap_space.TablePoolPages);
+        kernel_write(")\r\n");
         bob64_page_free(&bob64_boot_page_allocator,physical,1);
         return 0;
     }
@@ -647,15 +794,49 @@ static int kernel_heap_grow(void *context,void **region,usize *region_size) {
     volatile u64 *words=(volatile u64 *)(uintptr_t)virtual_address;
     for(usize i=0;i<EFI_PAGE_SIZE/sizeof(u64);i++)words[i]=0;
     kernel_heap_mapped+=(usize)EFI_PAGE_SIZE;
+    if(kernel_heap_mapped>kernel_heap_high_water)
+        kernel_heap_high_water=kernel_heap_mapped;
     *region=(void *)(uintptr_t)virtual_address;
     *region_size=(usize)EFI_PAGE_SIZE;
     return 1;
+}
+
+static int kernel_heap_shrink(void *context,void *region,usize region_size) {
+    const BOB64_KERNEL_BOOT_INFO *info=(const BOB64_KERNEL_BOOT_INFO *)context;
+    u64 expected;
+    if(!info||!region||!region_size||
+       (region_size&(usize)(EFI_PAGE_SIZE-1))||
+       region_size>kernel_heap_mapped||
+       region_size>~(u64)0-(u64)(uintptr_t)BOB64_KERNEL_HEAP_BASE)
+        return -1;
+    expected=BOB64_KERNEL_HEAP_BASE+kernel_heap_mapped-region_size;
+    if((u64)(uintptr_t)region!=expected)return -1;
+    for(usize offset=0;offset<region_size;offset+=(usize)EFI_PAGE_SIZE) {
+        u64 translated,flags;
+        if(bob64_page_translate(&bob64_bootstrap_space.PageTable,
+             expected+offset,&translated,&flags)!=1||
+           (translated&(EFI_PAGE_SIZE-1))||
+           (flags&(BOB64_PAGE_PRESENT|BOB64_PAGE_WRITE))!=
+             (BOB64_PAGE_PRESENT|BOB64_PAGE_WRITE))return -1;
+    }
+    for(usize offset=0;offset<region_size;offset+=(usize)EFI_PAGE_SIZE) {
+        u64 unmapped_physical;
+        if(bob64_page_unmap(&bob64_bootstrap_space.PageTable,expected+offset,
+                            &unmapped_physical,0))return -1;
+        __asm__ volatile("invlpg (%0)"::"r"((void *)(uintptr_t)(expected+offset)):
+                         "memory");
+        if(bob64_page_free(&bob64_boot_page_allocator,unmapped_physical,1))
+            return -1;
+    }
+    kernel_heap_mapped-=region_size;
+    return 0;
 }
 
 static int kernel_heap_smoke_test(const BOB64_KERNEL_BOOT_INFO *info) {
     char *first,*large,*zero;
     if(bob64_heap_init(&kernel_heap,(usize)BOB64_KERNEL_HEAP_LIMIT,
                        kernel_heap_grow,(void *)info))return -1;
+    bob64_heap_set_shrink(&kernel_heap,kernel_heap_shrink);
     first=(char *)bob64_heap_alloc(&kernel_heap,64);
     large=(char *)bob64_heap_alloc(&kernel_heap,5000);
     zero=(char *)bob64_heap_calloc(&kernel_heap,32,2);
@@ -669,7 +850,37 @@ static int kernel_heap_smoke_test(const BOB64_KERNEL_BOOT_INFO *info) {
     if(bob64_heap_free(&kernel_heap,large)||bob64_heap_free(&kernel_heap,first)||
        bob64_heap_free(&kernel_heap,zero)||bob64_heap_free(&kernel_heap,zero)!=-1)
         return -1;
+    if(bob64_heap_mapped_bytes(&kernel_heap)!=EFI_PAGE_SIZE||
+       kernel_heap_mapped!=EFI_PAGE_SIZE)return -1;
     return 0;
+}
+
+static int kernel_table_pool_smoke_test(const BOB64_KERNEL_BOOT_INFO *info) {
+    BOB64_PAGE_TABLE table;
+    u64 checkpoint,initial_pages,physical;
+    if(!info||!bob64_bootstrap_space.TablePoolPages)return -1;
+    checkpoint=bob64_bootstrap_space.TablePoolUsed;
+    initial_pages=bob64_bootstrap_space.TablePoolPages;
+    if(bob64_page_table_init(&table,info->PhysicalAddressBits,
+       bob64_bootstrap_space.PageTable.Allocate,
+       bob64_bootstrap_space.PageTable.Access,
+       bob64_bootstrap_space.PageTable.Context))return -1;
+    for(u64 i=0;i<140;i++) {
+        u64 virtual_address=0x0000001000000000ULL+i*(2ULL<<20);
+        u64 physical_address=0x0000000010000000ULL+i*BOB64_PAGE_SIZE;
+        if(bob64_page_map(&table,virtual_address,physical_address,
+                          BOB64_PAGE_WRITE|BOB64_PAGE_NX)) {
+            bob64_bootstrap_space.TablePoolUsed=checkpoint;
+            return -1;
+        }
+    }
+    int valid=bob64_bootstrap_space.TablePoolPages>initial_pages&&
+        bob64_bootstrap_space.TablePoolUsed>checkpoint&&
+        bob64_page_translate(&table,0x0000001000000000ULL+139*(2ULL<<20),
+                             &physical,0)==1&&
+        physical==0x0000000010000000ULL+139*BOB64_PAGE_SIZE;
+    bob64_bootstrap_space.TablePoolUsed=checkpoint;
+    return valid?0:-1;
 }
 
 static int kernel_privilege_stack_init(void) {
@@ -694,6 +905,36 @@ static void shell_clear(void *context) {
     bob64_early_console_write("\x1b[2J\x1b[H");
 }
 
+static EFI_RUNTIME_SERVICES *kernel_runtime_services(
+        const BOB64_KERNEL_BOOT_INFO *info) {
+    return info&&info->RuntimeServices?
+        (EFI_RUNTIME_SERVICES *)(uintptr_t)info->RuntimeServices:0;
+}
+
+static int kernel_snapshot_save(void *context,const void *snapshot,
+                                usize snapshot_size) {
+    const BOB64_KERNEL_BOOT_INFO *info=(const BOB64_KERNEL_BOOT_INFO *)context;
+    EFI_STATUS firmware_status=EFI_SUCCESS;
+    UINTN maximum_variable_size=0,remaining_storage_size=0;
+    int result=bob64_firmware_snapshot_save(kernel_runtime_services(info),
+        &kernel_heap,snapshot,snapshot_size,&firmware_status,
+        &maximum_variable_size,&remaining_storage_size);
+    if(result) {
+        kernel_write("firmware snapshot save failed (EFI 0x");
+        kernel_hex64(firmware_status);kernel_write(" max=0x");
+        kernel_hex64(maximum_variable_size);kernel_write(" free=0x");
+        kernel_hex64(remaining_storage_size);kernel_write(")\r\n");
+    }
+    return result;
+}
+
+static int kernel_snapshot_restore(void *context,BOB64_FILESYSTEM *filesystem) {
+    const BOB64_KERNEL_BOOT_INFO *info=(const BOB64_KERNEL_BOOT_INFO *)context;
+    EFI_RUNTIME_SERVICES *services=kernel_runtime_services(info);
+    return services?bob64_firmware_snapshot_restore(services,filesystem):
+                    BOB64_FIRMWARE_SNAPSHOT_NOT_FOUND;
+}
+
 __attribute__((noreturn)) void bob64_kernel_main(const BOB64_KERNEL_BOOT_INFO *info) {
     bob64_early_console_init();
     if(info&&info->HasFramebuffer&&bob64_framebuffer_init(info->FramebufferBase,
@@ -713,6 +954,11 @@ __attribute__((noreturn)) void bob64_kernel_main(const BOB64_KERNEL_BOOT_INFO *i
         kernel_write("bob64 kernel: heap initialization failed\r\n");
         kernel_halt();
     }
+    if(kernel_table_pool_smoke_test(info)) {
+        kernel_write("bob64 kernel: page-table pool growth failed\r\n");
+        kernel_halt();
+    }
+    kernel_write("bob64 kernel: dynamic page-table pool passed\r\n");
     if(kernel_privilege_stack_init()) {
         kernel_write("bob64 kernel: privilege stack initialization failed\r\n");
         kernel_halt();
@@ -732,8 +978,26 @@ __attribute__((noreturn)) void bob64_kernel_main(const BOB64_KERNEL_BOOT_INFO *i
         kernel_write("bob64 kernel: demo app install failed\r\n");
     if(info->NxSupported&&kernel_install_gui_application(&kernel_filesystem))
         kernel_write("bob64 kernel: desktop app install failed\r\n");
+    if(info->NxSupported&&kernel_install_nested_application(&kernel_filesystem))
+        kernel_write("bob64 kernel: nested smoke app install failed\r\n");
+    if(info->NxSupported&&kernel_install_echo_application(&kernel_filesystem))
+        kernel_write("bob64 kernel: echo app install failed\r\n");
     if(kernel_install_bob_source(&kernel_filesystem))
         kernel_write("bob64 kernel: C demo source install failed\r\n");
+    if(info->NxSupported&&kernel_install_cat_application(&kernel_filesystem))
+        kernel_write("bob64 kernel: cat app install failed\r\n");
+    if(info->NxSupported&&kernel_install_ls_application(&kernel_filesystem))
+        kernel_write("bob64 kernel: ls app install failed\r\n");
+    if(info->NxSupported&&kernel_install_notes_application(&kernel_filesystem))
+        kernel_write("bob64 kernel: notes app install failed\r\n");
+    if(info->NxSupported&&kernel_install_info_application(&kernel_filesystem))
+        kernel_write("bob64 kernel: info app install failed\r\n");
+    if(info->NxSupported&&kernel_install_mouse_smoke_application(&kernel_filesystem))
+        kernel_write("bob64 kernel: mouse smoke app install failed\r\n");
+    if(info->NxSupported&&kernel_install_launcher_application(&kernel_filesystem))
+        kernel_write("bob64 kernel: launcher app install failed\r\n");
+    if(info->NxSupported&&kernel_install_display_application(&kernel_filesystem))
+        kernel_write("bob64 kernel: graphics demo install failed\r\n");
     kernel_app_context.Filesystem=&kernel_filesystem;
     kernel_app_context.NxSupported=info->NxSupported;
     kernel_app_context.PhysicalAddressBits=info->PhysicalAddressBits;
@@ -749,6 +1013,16 @@ __attribute__((noreturn)) void bob64_kernel_main(const BOB64_KERNEL_BOOT_INFO *i
         kernel_halt();
     }
     kernel_write("bob64 kernel: timer IRQ enabled\r\n");
+    u64 initial_timer_ticks=bob64_timer_ticks();
+    for(volatile u32 timer_wait=0;
+        timer_wait<100000000u&&bob64_timer_ticks()==initial_timer_ticks;
+        timer_wait++)
+        __asm__ volatile("pause");
+    if(bob64_timer_ticks()==initial_timer_ticks) {
+        kernel_write("bob64 kernel: timer tick test failed\r\n");
+        kernel_halt();
+    }
+    kernel_write("bob64 kernel: timer tick passed\r\n");
     bob64_keyboard_reset();
     int keyboard_irq_enabled=bob64_interrupts_enable_keyboard()==0;
     if(!keyboard_irq_enabled)
@@ -762,7 +1036,159 @@ __attribute__((noreturn)) void bob64_kernel_main(const BOB64_KERNEL_BOOT_INFO *i
             kernel_halt();
         }
         kernel_write("bob64 kernel: native streaming app passed\r\n");
+        started=0;
+        status=kernel_run_application(&kernel_app_context,"nested.b64e",0,0,
+                                      &started);
+        if(!started||status||(keyboard_irq_enabled&&!kernel_interrupts_enabled())) {
+            kernel_write("bob64 kernel: nested app return test failed\r\n");
+            kernel_halt();
+        }
+        kernel_write("bob64 kernel: nested app return passed\r\n");
+        static const char *echo_arguments[]={"echo.b64e","bob!"};
+        started=0;
+        status=kernel_run_application(&kernel_app_context,"echo.b64e",2,
+                                      echo_arguments,&started);
+        if(!started||status||kernel_user_output_length!=5||
+           !kernel_bytes_equal(kernel_user_output,"bob!\n")||
+           (keyboard_irq_enabled&&!kernel_interrupts_enabled())) {
+            kernel_write("bob64 kernel: echo argument test failed\r\n");
+            kernel_halt();
+        }
+        kernel_write("bob64 kernel: native echo arguments passed\r\n");
+        static const char *cat_arguments[]={"cat.b64e","cat-smoke.txt"};
+        static const char cat_fixture[]="bob!";
+        if(bob64_fs_write(&kernel_filesystem,"cat-smoke.txt",cat_fixture,
+                          sizeof(cat_fixture)-1)) {
+            kernel_write("bob64 kernel: cat fixture setup failed\r\n");
+            kernel_halt();
+        }
+        started=0;
+        status=kernel_run_application(&kernel_app_context,"cat.b64e",2,
+                                      cat_arguments,&started);
+        int cat_output_ok=kernel_user_output_length==5&&
+                          kernel_bytes_equal(kernel_user_output,"bob!\n");
+        if(bob64_fs_delete(&kernel_filesystem,"cat-smoke.txt")) {
+            kernel_write("bob64 kernel: cat fixture cleanup failed\r\n");
+            kernel_halt();
+        }
+        if(!started||status||!cat_output_ok||
+           (keyboard_irq_enabled&&!kernel_interrupts_enabled())) {
+            kernel_write("bob64 kernel: native file-read app test failed\r\n");
+            kernel_halt();
+        }
+        kernel_write("bob64 kernel: native file-read app passed\r\n");
+        started=0;
+        status=kernel_run_application(&kernel_app_context,"ls.b64e",0,0,
+                                      &started);
+        if(!started||status||kernel_user_output_truncated||
+           !kernel_text_contains(kernel_user_output,"bob.b64e  ")||
+           (keyboard_irq_enabled&&!kernel_interrupts_enabled())) {
+            kernel_write("bob64 kernel: native file-list app test failed\r\n");
+            kernel_halt();
+        }
+        kernel_write("bob64 kernel: native file-list app passed\r\n");
+        static const char *notes_put_arguments[]={"notes.b64e","put",
+                                                   "notes-smoke.txt","bob!"};
+        static const char *notes_show_arguments[]={"notes.b64e","show",
+                                                    "notes-smoke.txt"};
+        static const char *notes_delete_arguments[]={"notes.b64e","delete",
+                                                      "notes-smoke.txt"};
+        static const char *notes_copy_arguments[]={"notes.b64e","copy",
+            "notes-large-source.txt","notes-large-copy.txt"};
+        static u8 note_fixture_check[4];
+        started=0;
+        status=kernel_run_application(&kernel_app_context,"notes.b64e",4,
+                                      notes_put_arguments,&started);
+        if(!started||status||kernel_app_read_file(&kernel_app_context,
+            "notes-smoke.txt",note_fixture_check,sizeof(note_fixture_check))!=4||
+           !kernel_bytes_equal((const char *)note_fixture_check,"bob!")||
+           (keyboard_irq_enabled&&!kernel_interrupts_enabled())) {
+            kernel_write("bob64 kernel: native notes write test failed\r\n");
+            kernel_halt();
+        }
+        started=0;
+        status=kernel_run_application(&kernel_app_context,"notes.b64e",3,
+                                      notes_show_arguments,&started);
+        if(!started||status||kernel_user_output_length!=5||
+           !kernel_bytes_equal(kernel_user_output,"bob!\n")||
+           (keyboard_irq_enabled&&!kernel_interrupts_enabled())) {
+            kernel_write("bob64 kernel: native notes show test failed\r\n");
+            kernel_halt();
+        }
+        started=0;
+        status=kernel_run_application(&kernel_app_context,"notes.b64e",3,
+                                      notes_delete_arguments,&started);
+        if(!started||status||kernel_app_read_file(&kernel_app_context,
+            "notes-smoke.txt",note_fixture_check,sizeof(note_fixture_check))!=-2||
+           (keyboard_irq_enabled&&!kernel_interrupts_enabled())) {
+            kernel_write("bob64 kernel: native notes delete test failed\r\n");
+            kernel_halt();
+        }
+        static char large_note_fixture[12288];
+        const char *large_note_copy=0;
+        usize large_note_copy_length=0;
+        for(usize i=0;i<sizeof(large_note_fixture);i++)
+            large_note_fixture[i]=(i%80==79)?'\n':(char)('a'+i%26);
+        if(bob64_fs_write(&kernel_filesystem,"notes-large-source.txt",
+                          large_note_fixture,sizeof(large_note_fixture))) {
+            kernel_write("bob64 kernel: large notes fixture setup failed\r\n");
+            kernel_halt();
+        }
+        started=0;
+        status=kernel_run_application(&kernel_app_context,"notes.b64e",4,
+                                      notes_copy_arguments,&started);
+        int large_note_match=!bob64_fs_read(&kernel_filesystem,
+            "notes-large-copy.txt",&large_note_copy,&large_note_copy_length)&&
+            large_note_copy_length==sizeof(large_note_fixture);
+        for(usize i=0;large_note_match&&i<sizeof(large_note_fixture);i++)
+            if(large_note_copy[i]!=large_note_fixture[i])large_note_match=0;
+        if(!started||status||kernel_user_output_length!=8||
+           !kernel_bytes_equal(kernel_user_output,"Copied.\n")||
+           kernel_user_output_truncated||!large_note_match||
+           (keyboard_irq_enabled&&!kernel_interrupts_enabled())) {
+            kernel_write("bob64 kernel: large notes streaming test failed\r\n");
+            kernel_halt();
+        }
+        kernel_write("bob64 kernel: large notes streaming copy passed\r\n");
+        if(bob64_fs_delete(&kernel_filesystem,"notes-large-source.txt")||
+           bob64_fs_delete(&kernel_filesystem,"notes-large-copy.txt")) {
+            kernel_write("bob64 kernel: large notes fixture cleanup failed\r\n");
+            kernel_halt();
+        }
+        kernel_write("bob64 kernel: native notes app passed\r\n");
+        started=0;
+        status=kernel_run_application(&kernel_app_context,"info.b64e",0,0,
+                                      &started);
+        if(!started||status||kernel_user_output_truncated||
+           !kernel_text_contains(kernel_user_output,
+                                 "bob64 system information\n")||
+           !kernel_text_contains(kernel_user_output,"System call ABI: 12\n")||
+           !kernel_text_contains(kernel_user_output,"Uptime: ")||
+           !kernel_text_contains(kernel_user_output,"RAM files: ")||
+           !kernel_text_contains(kernel_user_output,"RAM file data: ")||
+           kernel_user_output_length<5||
+           !kernel_bytes_equal(kernel_user_output+
+               kernel_user_output_length-5,"bob!\n")||
+           (keyboard_irq_enabled&&!kernel_interrupts_enabled())) {
+            kernel_write("bob64 kernel: native info app test failed\r\n");
+            kernel_halt();
+        }
+        kernel_write("bob64 kernel: native info app passed\r\n");
     }
+    EFI_RUNTIME_SERVICES *runtime_services=kernel_runtime_services(info);
+    int snapshot_restore=runtime_services?bob64_firmware_snapshot_restore(
+        runtime_services,&kernel_filesystem):
+        BOB64_FIRMWARE_SNAPSHOT_NOT_FOUND;
+    if(!snapshot_restore) {
+        kernel_write("bob64 kernel: persistent B64S snapshot restored\r\n");
+        const char *persisted_contents;
+        usize persisted_length;
+        if(!bob64_fs_read(&kernel_filesystem,"persist.txt",&persisted_contents,
+                          &persisted_length)&&persisted_length==8&&
+           kernel_bytes_equal(persisted_contents,"survived"))
+            kernel_write("bob64 kernel: persistent B64S smoke file passed\r\n");
+    } else if(snapshot_restore<0)
+        kernel_write("bob64 kernel: persistent B64S snapshot rejected\r\n");
     u32 display_width,display_height;
     if(!bob64_framebuffer_resolution(&display_width,&display_height)) {
         if(bob64_mouse_init(display_width,display_height))
@@ -779,6 +1205,8 @@ __attribute__((noreturn)) void bob64_kernel_main(const BOB64_KERNEL_BOOT_INFO *i
     }
     bob64_shell_set_runner(&kernel_shell,kernel_run_application);
     bob64_shell_set_compiler(&kernel_shell,kernel_compile_application);
+    bob64_shell_set_snapshot_storage(&kernel_shell,kernel_snapshot_save,
+                                     kernel_snapshot_restore,(void *)info);
     for(;;) {
         int character=bob64_keyboard_poll();
         if(character<0)character=bob64_early_console_try_read();

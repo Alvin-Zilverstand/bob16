@@ -21,11 +21,14 @@ typedef struct {
     u8 NxSupported;
     u8 HasFramebuffer;
     u8 Reserved[5];
+    u64 RuntimeServices;
 } BOB64_KERNEL_BOOT_INFO;
 
-_Static_assert(sizeof(BOB64_KERNEL_BOOT_INFO)==88,"bob64 kernel boot information ABI");
+_Static_assert(sizeof(BOB64_KERNEL_BOOT_INFO)==96,"bob64 kernel boot information ABI");
 _Static_assert(__builtin_offsetof(BOB64_KERNEL_BOOT_INFO,NxSupported)==81,
                "handoff assembly NX-support offset mismatch");
+_Static_assert(__builtin_offsetof(BOB64_KERNEL_BOOT_INFO,RuntimeServices)==88,
+               "UEFI runtime-service pointer ABI offset");
 
 __attribute__((noreturn)) void bob64_kernel_main(const BOB64_KERNEL_BOOT_INFO *info);
 __attribute__((noreturn)) void bob64_enter_kernel(

@@ -12,10 +12,21 @@ typedef void *EFI_HANDLE;
 #define EFI_SUCCESS 0ULL
 #define EFI_INVALID_PARAMETER 0x8000000000000002ULL
 #define EFI_BUFFER_TOO_SMALL 0x8000000000000005ULL
+#define EFI_NOT_FOUND 0x800000000000000eULL
+#define EFI_OUT_OF_RESOURCES 0x8000000000000009ULL
 #define EFI_UNSUPPORTED 0x8000000000000003ULL
 #define EFI_ERROR(status) (((EFI_STATUS)(status) >> 63) != 0)
 #define EFI_MEMORY_CONVENTIONAL 7u
 #define EFI_MEMORY_LOADER_DATA 2u
+#define EFI_RUNTIME_SERVICES_CODE 5u
+#define EFI_RUNTIME_SERVICES_DATA 6u
+#define EFI_MEMORY_MAPPED_IO 11u
+#define EFI_MEMORY_UC 0x0000000000000001ULL
+#define EFI_MEMORY_WT 0x0000000000000004ULL
+#define EFI_MEMORY_RUNTIME 0x8000000000000000ULL
+#define EFI_VARIABLE_NON_VOLATILE 0x00000001u
+#define EFI_VARIABLE_BOOTSERVICE_ACCESS 0x00000002u
+#define EFI_VARIABLE_RUNTIME_ACCESS 0x00000004u
 #define EFI_PAGE_SIZE 4096ULL
 
 typedef struct {
@@ -47,6 +58,30 @@ typedef struct {
 typedef EFI_STATUS (EFIAPI *EFI_HANDLE_PROTOCOL)(EFI_HANDLE,const EFI_GUID *,void **);
 typedef EFI_STATUS (EFIAPI *EFI_EXIT_BOOT_SERVICES)(EFI_HANDLE,UINTN);
 typedef EFI_STATUS (EFIAPI *EFI_LOCATE_PROTOCOL)(const EFI_GUID *,void *,void **);
+
+typedef EFI_STATUS (EFIAPI *EFI_GET_VARIABLE)(const CHAR16 *,const EFI_GUID *,
+        u32 *,UINTN *,void *);
+typedef EFI_STATUS (EFIAPI *EFI_SET_VARIABLE)(const CHAR16 *,const EFI_GUID *,
+        u32,UINTN,const void *);
+typedef EFI_STATUS (EFIAPI *EFI_QUERY_VARIABLE_INFO)(u32,UINTN *,UINTN *,UINTN *);
+
+typedef struct {
+    EFI_TABLE_HEADER Hdr;
+    void *GetTime;
+    void *SetTime;
+    void *GetWakeupTime;
+    void *SetWakeupTime;
+    void *SetVirtualAddressMap;
+    void *ConvertPointer;
+    EFI_GET_VARIABLE GetVariable;
+    void *GetNextVariableName;
+    EFI_SET_VARIABLE SetVariable;
+    void *GetNextHighMonotonicCount;
+    void *ResetSystem;
+    void *UpdateCapsule;
+    void *QueryCapsuleCapabilities;
+    EFI_QUERY_VARIABLE_INFO QueryVariableInfo;
+} EFI_RUNTIME_SERVICES;
 
 typedef struct {
     EFI_TABLE_HEADER Hdr;
@@ -170,6 +205,10 @@ _Static_assert(__builtin_offsetof(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL,OutputString)=
 _Static_assert(__builtin_offsetof(EFI_SYSTEM_TABLE,ConOut)==64,
                "UEFI x64 system table layout mismatch");
 _Static_assert(sizeof(EFI_SYSTEM_TABLE)==120,"UEFI x64 system table size mismatch");
+_Static_assert(__builtin_offsetof(EFI_RUNTIME_SERVICES,GetVariable)==72&&
+               __builtin_offsetof(EFI_RUNTIME_SERVICES,SetVariable)==88&&
+               sizeof(EFI_RUNTIME_SERVICES)==136,
+               "UEFI x64 runtime-services table layout mismatch");
 _Static_assert(sizeof(EFI_MEMORY_DESCRIPTOR)==40,"UEFI x64 memory descriptor layout mismatch");
 _Static_assert(__builtin_offsetof(EFI_BOOT_SERVICES,GetMemoryMap)==56,
                "UEFI x64 boot services layout mismatch");

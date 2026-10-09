@@ -22,6 +22,36 @@ static BOB64_DESCRIPTOR_TABLE_POINTER kernel_gdtr,kernel_idtr;
 #ifdef BOB64_ENABLE_HANDOFF
 static BOB64_KERNEL_BOOT_INFO kernel_boot_info;
 #endif
+
+static int boot_grow_table_pool(void *context,BOB64_BOOTSTRAP_SPACE *space,
+                                u64 *base,u64 *pages) {
+    BOB64_PAGE_ALLOCATOR *allocator=(BOB64_PAGE_ALLOCATOR *)context;
+    u64 physical,bytes;
+    const u64 count=BOB64_BOOTSTRAP_TABLE_GROW_PAGES;
+    if(!allocator||!space||!base||!pages||count>~(u64)0/BOB64_PAGE_SIZE)
+        return -1;
+    bytes=count*BOB64_PAGE_SIZE;
+    physical=bob64_page_alloc(allocator,count);
+    if(!physical)return -1;
+    if(physical>=0x0000800000000000ULL||
+       bytes>0x0000800000000000ULL-physical||
+       bob64_page_map_range(&space->PageTable,physical,physical,bytes,
+          BOB64_PAGE_WRITE|(space->NxSupported?BOB64_PAGE_NX:0))) {
+        for(u64 offset=0;offset<bytes;offset+=BOB64_PAGE_SIZE) {
+            u64 translated;
+            if(bob64_page_translate(&space->PageTable,physical+offset,
+                                   &translated,0)==1&&translated==physical+offset) {
+                (void)bob64_page_unmap(&space->PageTable,physical+offset,0,0);
+                __asm__ volatile("invlpg (%0)"::"r"((void *)(uintptr_t)(physical+offset)):
+                                 "memory");
+            }
+        }
+        (void)bob64_page_free(allocator,physical,count);
+        return -1;
+    }
+    *base=physical;*pages=count;
+    return 0;
+}
 static const EFI_GUID loaded_image_guid={0x5b1b31a1u,0x9562u,0x11d2u,
                                          {0x8e,0x3f,0x00,0xa0,0xc9,0x69,0x72,0x3b}};
 #ifdef BOB64_ENABLE_HANDOFF
@@ -151,6 +181,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *system) {
        (u64)(uintptr_t)loaded_image->ImageBase,loaded_image->ImageSize,
        stack_base,BOB64_BOOT_STACK_PAGES*EFI_PAGE_SIZE,cpu.NX)<0)
         return EFI_UNSUPPORTED;
+    bob64_bootstrap_space_set_table_growth(active_bootstrap_space,
+                                           boot_grow_table_pool,
+                                           active_page_allocator);
+#ifdef BOB64_ENABLE_HANDOFF
+    u64 runtime_services=(u64)(uintptr_t)system->RuntimeServices;
+    int runtime_services_mapped=!bob64_bootstrap_map_runtime_services(
+        active_bootstrap_space,map,(usize)map_size,(usize)descriptor_size,
+        runtime_services);
+#endif
     u64 image_base=(u64)(uintptr_t)loaded_image->ImageBase;
     u64 map_base=(u64)(uintptr_t)map;
     int map_is_in_image=map_base>=image_base&&map_base-image_base<=loaded_image->ImageSize&&
@@ -181,6 +220,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *system) {
     kernel_boot_info.StackSize=BOB64_BOOT_STACK_PAGES*EFI_PAGE_SIZE;
     kernel_boot_info.PhysicalAddressBits=cpu.PhysicalAddressBits;
     kernel_boot_info.NxSupported=cpu.NX;
+    kernel_boot_info.RuntimeServices=runtime_services_mapped?runtime_services:0;
     if(framebuffer_valid) {
         kernel_boot_info.FramebufferBase=graphics_mode->FrameBufferBase;
         kernel_boot_info.FramebufferSize=framebuffer_map_size;

@@ -17,8 +17,12 @@
 #include "../bob64/process.h"
 #include "../bob64/syscall.h"
 #include "../bob64/app.h"
+#include "../bob64/gfx.h"
+#include "../bob64/widgets.h"
 #include "../bob64/libc.h"
 #include "../bob64/compiler.h"
+#include "../bob64/lz4.h"
+#include "../bob64/firmware_store.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,16 +30,138 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
 
 typedef struct {
-    _Alignas(16) u8 Bytes[4*4096];
-    usize PagesUsed;
+    _Alignas(16) u8 Bytes[16*4096];
+    usize PagesUsed,PageLimit;
 } HEAP_TEST_ARENA;
 
+typedef struct {
+    _Alignas(16) u8 Bytes[256*4096];
+    usize PagesUsed;
+} HEAP_STRESS_ARENA;
+
+typedef struct {
+    BOB64_HEAP *Heap;
+    u32 Worker;
+    int Result;
+} HEAP_STRESS_WORKER;
+
 static int heap_test_grow(void *context,void **region,usize *region_size);
+static int heap_stress_grow(void *context,void **region,usize *region_size);
+static int heap_stress_shrink(void *context,void *region,usize region_size);
+
+#define FIRMWARE_TEST_VARIABLE_COUNT 16u
+#define FIRMWARE_TEST_VARIABLE_MAX_SIZE 33732u
+#define FIRMWARE_TEST_STORAGE_SIZE 243856u
+typedef struct {
+    CHAR16 Name[32];
+    u32 Attributes;
+    usize Size;
+    u8 Data[BOB64_FIRMWARE_SNAPSHOT_LIMIT];
+    int Used;
+} FIRMWARE_TEST_VARIABLE;
+static FIRMWARE_TEST_VARIABLE firmware_test_variables[FIRMWARE_TEST_VARIABLE_COUNT];
+static int firmware_test_query_unsupported;
+
+static int firmware_test_name_equal(const CHAR16 *left,const CHAR16 *right) {
+    for(usize i=0;i<32;i++) {
+        if(left[i]!=right[i])return 0;
+        if(!left[i])return 1;
+    }
+    return 0;
+}
+
+static int firmware_test_find(const CHAR16 *name) {
+    for(u32 i=0;i<FIRMWARE_TEST_VARIABLE_COUNT;i++)
+        if(firmware_test_variables[i].Used&&
+           firmware_test_name_equal(firmware_test_variables[i].Name,name))
+            return (int)i;
+    return -1;
+}
+
+static usize firmware_test_storage_used(void) {
+    usize used=0;
+    for(u32 i=0;i<FIRMWARE_TEST_VARIABLE_COUNT;i++)
+        if(firmware_test_variables[i].Used)used+=firmware_test_variables[i].Size;
+    return used;
+}
+
+static void firmware_test_write32(u8 *bytes,u32 value) {
+    for(u32 i=0;i<4;i++)bytes[i]=(u8)(value>>(i*8));
+}
+
+static void firmware_test_write64(u8 *bytes,u64 value) {
+    firmware_test_write32(bytes,(u32)value);
+    firmware_test_write32(bytes+4,(u32)(value>>32));
+}
+
+static EFI_STATUS EFIAPI firmware_test_get_variable(const CHAR16 *name,
+        const EFI_GUID *guid,u32 *attributes,UINTN *data_size,void *data) {
+    (void)guid;
+    if(!data_size)return EFI_INVALID_PARAMETER;
+    int index=firmware_test_find(name);
+    if(index<0)return EFI_NOT_FOUND;
+    FIRMWARE_TEST_VARIABLE *variable=&firmware_test_variables[index];
+    if(attributes)*attributes=variable->Attributes;
+    if(!data||*data_size<variable->Size) {
+        *data_size=variable->Size;
+        return EFI_BUFFER_TOO_SMALL;
+    }
+    memcpy(data,variable->Data,variable->Size);
+    *data_size=variable->Size;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI firmware_test_set_variable(const CHAR16 *name,
+        const EFI_GUID *guid,u32 attributes,UINTN data_size,const void *data) {
+    (void)guid;
+    int index=firmware_test_find(name);
+    if(!attributes&&!data_size&&!data) {
+        if(index<0)return EFI_NOT_FOUND;
+        firmware_test_variables[index].Used=0;
+        return EFI_SUCCESS;
+    }
+    if(attributes!=(EFI_VARIABLE_NON_VOLATILE|EFI_VARIABLE_BOOTSERVICE_ACCESS|
+                   EFI_VARIABLE_RUNTIME_ACCESS)||!data||
+       data_size>FIRMWARE_TEST_VARIABLE_MAX_SIZE||
+       data_size>sizeof(firmware_test_variables[0].Data))return EFI_INVALID_PARAMETER;
+    if(index<0) {
+        for(u32 i=0;i<FIRMWARE_TEST_VARIABLE_COUNT;i++)
+            if(!firmware_test_variables[i].Used){index=(int)i;break;}
+        if(index<0)return EFI_OUT_OF_RESOURCES;
+    }
+    usize used=firmware_test_storage_used();
+    if(firmware_test_variables[index].Used)
+        used-=firmware_test_variables[index].Size;
+    if(data_size>FIRMWARE_TEST_STORAGE_SIZE-used)return EFI_OUT_OF_RESOURCES;
+    FIRMWARE_TEST_VARIABLE *variable=&firmware_test_variables[index];
+    usize name_length=0;
+    while(name_length+1<32&&name[name_length])name_length++;
+    if(name_length+1>=32)return EFI_INVALID_PARAMETER;
+    memset(variable->Name,0,sizeof(variable->Name));
+    for(usize i=0;i<=name_length;i++)variable->Name[i]=name[i];
+    memcpy(variable->Data,data,data_size);
+    variable->Attributes=attributes;variable->Size=data_size;variable->Used=1;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI firmware_test_query_variable_info(u32 attributes,
+        UINTN *maximum_storage,UINTN *remaining_storage,UINTN *maximum_variable) {
+    (void)attributes;
+    if(firmware_test_query_unsupported)return EFI_UNSUPPORTED;
+    if(!maximum_storage||!remaining_storage||!maximum_variable)
+        return EFI_INVALID_PARAMETER;
+    *maximum_storage=FIRMWARE_TEST_STORAGE_SIZE;
+    *remaining_storage=FIRMWARE_TEST_STORAGE_SIZE-firmware_test_storage_used();
+    *maximum_variable=FIRMWARE_TEST_VARIABLE_MAX_SIZE;
+    return EFI_SUCCESS;
+}
 
 #define CHECK(expression,message) do { if(!(expression)){fprintf(stderr,"bob64 check failed: %s\n",message);return 1;} } while(0)
 
@@ -110,20 +236,26 @@ static int compiler_tests(void) {
           "compile the resident C smoke program into a B64E image");
     resident_compiler_image_length=length;
     CHECK(!bob64_exec_parse(resident_compiler_image,length,&image)&&image.EntryOffset==0&&
-          image.CodeSize==BOB64_PAGE_SIZE&&image.FileSize==2*BOB64_PAGE_SIZE&&
-          image.MemorySize==2*BOB64_PAGE_SIZE,
+          image.CodeSize==BOB64_COMPILER_CODE_CAPACITY&&
+          image.FileSize==BOB64_COMPILER_CODE_CAPACITY+
+                         BOB64_COMPILER_DATA_CAPACITY&&
+          image.MemorySize==BOB64_COMPILER_CODE_CAPACITY+
+                            BOB64_COMPILER_DATA_CAPACITY,
           "validate resident compiler output with the shared B64E loader parser");
     CHECK(image.Image[0]==0x48&&image.Image[1]==0x83&&image.Image[2]==0xec&&
           image.Image[3]==0x28&&image.Image[4]==0xe8&&
           image.Image[43]==0x48&&image.Image[44]==0x8d&&
-          image.Image[50]==0xba&&image.Image[51]==4&&image.Image[55]==0xb8&&
-          image.Image[60]==0xcd&&image.Image[61]==0x80&&
-          !memcmp(image.Image+BOB64_PAGE_SIZE,"bob!",4),
+          image.Image[50]==0x50&&image.Image[51]==0x48&&
+          image.Image[52]==0xb8&&image.Image[61]==0x48&&
+          image.Image[62]==0x89&&image.Image[63]==0xc2&&
+          image.Image[64]==0x59&&image.Image[65]==0xb8&&
+          image.Image[70]==0xcd&&image.Image[71]==0x80&&
+          !memcmp(image.Image+BOB64_COMPILER_CODE_CAPACITY,"bob!",4),
           "emit Microsoft x64 entry code and the bob! console syscall");
     CHECK(read32(image.Image+5)==23&&
-          (s32)read32(image.Image+46)==(s32)(BOB64_PAGE_SIZE-50)&&
-          image.Image[62]==0x48&&image.Image[63]==0xb8&&
-          read64(image.Image+64)==0&&image.Image[79]==0xc3,
+          (s32)read32(image.Image+46)==(s32)(BOB64_COMPILER_CODE_CAPACITY-50)&&
+          image.Image[72]==0x48&&image.Image[73]==0xb8&&
+          read64(image.Image+74)==0&&image.Image[89]==0xc3,
           "resolve the x64 entry call and RIP-relative string address");
     CHECK(bob64_compile_c(invalid,sizeof(invalid)-1,resident_compiler_image,
                           sizeof(resident_compiler_image),&length,
@@ -136,11 +268,135 @@ static int compiler_tests(void) {
     return 0;
 }
 
+static int compiler_typedef_tests(void) {
+    static const char source[]=
+        "typedef int count_t;"
+        "typedef char byte_t;"
+        "typedef int *int_ptr;"
+        "struct Pair { count_t left; long long wide; };"
+        "typedef struct Pair pair_t;"
+        "typedef struct Pair *pair_ptr;"
+        "int_ptr same_pointer(int_ptr value) { return value; }"
+        "pair_ptr same_pair(pair_ptr value) { return value; }"
+        "int main(void) { count_t count=40; byte_t text[4]=\"bob!\";"
+        "int values[2]={1,2}; int_ptr pointer=same_pointer(values);"
+        "pair_t pair; pair.left=count; pair.wide=3;"
+        "pair_ptr other=same_pair(&pair);"
+        "return pointer[1]+pair.left+other->wide+text[3]; }";
+    static const char duplicate_alias[]=
+        "typedef int value_t; typedef char value_t;"
+        "int main(void) { return 0; }";
+    static u8 image_bytes[BOB64_COMPILER_IMAGE_LIMIT];
+    usize length=0,error_offset=0;
+    BOB64_EXEC_IMAGE image;
+    s64 result=0;
+    CHECK(!bob64_compile_c(source,sizeof(source)-1,image_bytes,
+              sizeof(image_bytes),&length,&error_offset)&&
+          !bob64_exec_parse(image_bytes,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==78,
+          "compile and execute scalar, pointer, and named-struct typedefs");
+    CHECK(bob64_compile_c(duplicate_alias,sizeof(duplicate_alias)-1,
+              image_bytes,sizeof(image_bytes),&length,&error_offset)==-2,
+          "reject duplicate typedef names");
+    return 0;
+}
+
+static int compiler_capacity_tests(void) {
+    static char large_source[BOB64_COMPILER_SOURCE_LIMIT];
+    static u8 large_image[BOB64_COMPILER_IMAGE_LIMIT];
+    static const char prefix[]="int main(void) { int count=0;";
+    static const char statement[]="count=count+1;";
+    static const char suffix[]="return count;}";
+    static const char large_global_source[]=
+        "int values[2048]; int main(void) { values[2047]=42; "
+        "return values[2047]; }";
+    static const char large_local_array_source[]=
+        "int main(void) { int values[64]; values[63]=42; "
+        "return values[63]; }";
+    static const char large_char_array_source[]=
+        "int main(void) { char text[256]=\"bob!\"; text[255]='!'; "
+        "return text[255]; }";
+    usize source_length=0,length=0,error_offset=0;
+    BOB64_EXEC_IMAGE image;
+    s64 result=0;
+    int code_crosses_old_limit=0;
+    memcpy(large_source,prefix,sizeof(prefix)-1);source_length=sizeof(prefix)-1;
+    for(u32 i=0;i<350;i++) {
+        memcpy(large_source+source_length,statement,sizeof(statement)-1);
+        source_length+=sizeof(statement)-1;
+    }
+    memcpy(large_source+source_length,suffix,sizeof(suffix)-1);
+    source_length+=sizeof(suffix)-1;
+    CHECK(source_length>4096&&source_length<BOB64_COMPILER_SOURCE_LIMIT&&
+          !bob64_compile_c(large_source,source_length,large_image,
+              sizeof(large_image),&length,&error_offset)&&
+          !bob64_exec_parse(large_image,length,&image)&&
+          image.CodeSize==BOB64_COMPILER_CODE_CAPACITY&&
+          !execute_compiled_main(&image,&result)&&result==350,
+          "compile and execute a greater-than-4-KiB resident C translation unit");
+    for(usize i=BOB64_PAGE_SIZE;i<BOB64_COMPILER_CODE_CAPACITY;i++)
+        if(image.Image[i]!=0x90) {code_crosses_old_limit=1;break;}
+    CHECK(code_crosses_old_limit,
+          "emit and execute generated machine code beyond the old 4-KiB limit");
+    source_length=0;
+    static const char locals_prefix[]="int main(void) {";
+    static const char locals_suffix[]="return v0+v39;}";
+    memcpy(large_source,locals_prefix,sizeof(locals_prefix)-1);
+    source_length=sizeof(locals_prefix)-1;
+    for(u32 i=0;i<40;i++) {
+        char declaration[24];
+        int declaration_length=snprintf(declaration,sizeof(declaration),
+            "int v%u=%u;",i,i);
+        if(declaration_length<=0||(usize)declaration_length>=sizeof(declaration))return -1;
+        memcpy(large_source+source_length,declaration,(usize)declaration_length);
+        source_length+=(usize)declaration_length;
+    }
+    memcpy(large_source+source_length,locals_suffix,sizeof(locals_suffix)-1);
+    source_length+=sizeof(locals_suffix)-1;
+    CHECK(!bob64_compile_c(large_source,source_length,large_image,
+              sizeof(large_image),&length,&error_offset)&&
+          !bob64_exec_parse(large_image,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==39,
+          "compile and execute forty locals across signed 8-bit and 32-bit frame offsets");
+    CHECK(!bob64_compile_c(large_local_array_source,
+              sizeof(large_local_array_source)-1,large_image,sizeof(large_image),
+              &length,&error_offset)&&!bob64_exec_parse(large_image,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==42,
+          "index a 64-element local int array using a 32-bit stack displacement");
+    CHECK(!bob64_compile_c(large_char_array_source,
+              sizeof(large_char_array_source)-1,large_image,sizeof(large_image),
+              &length,&error_offset)&&!bob64_exec_parse(large_image,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result=='!',
+          "initialize and update a 256-byte local char array");
+    CHECK(!bob64_compile_c(large_global_source,sizeof(large_global_source)-1,
+              large_image,sizeof(large_image),&length,
+              &error_offset)&&!bob64_exec_parse(large_image,length,&image)&&
+          image.MemorySize==BOB64_COMPILER_CODE_CAPACITY+
+                            BOB64_COMPILER_DATA_CAPACITY&&
+          !execute_compiled_main(&image,&result)&&result==42,
+          "compile and execute a global array larger than the former 4-KiB data page");
+    return 0;
+}
+
 static int compiler_arithmetic_tests(void) {
     static const char source[]=
         "long long main(void) { return (0x100000001ULL + 2) * 3; }";
     static const char bad_suffix[]="long long main(void) { return 1LUL; }";
     static const char signed_source[]="int main(void) { return -1; }";
+    static const char signed_division_source[]=
+        "long long main(void) { long long left=-100; long long right=-7; "
+        "return left / right * 100 + left % right; }";
+    static const char unsigned_division_source[]=
+        "usize main(void) { usize value=0x100000001ULL; "
+        "return value / 10 + value % 10; }";
+    static const char bitwise_source[]=
+        "int main(void) { usize value=0x100000001ULL; "
+        "if ((value >> 32) != 1 || (value & 15) != 1 || "
+        "(1 | 2 ^ 3 & 1) != 3 || ((1 << 4) + 2) != 18 || "
+        "((~0ULL >> 1) != 0x7fffffffffffffffULL) || "
+        "((-8 >> 2) != -2) || (2 == 1 < 3) || "
+        "!(value >= 0x100000001ULL && value <= 0x100000001ULL)) "
+        "return -1; return 1; }";
     u8 file[BOB64_COMPILER_IMAGE_LIMIT];usize length,error_offset;
     BOB64_EXEC_IMAGE image;
     CHECK(!bob64_compile_c(source,sizeof(source)-1,file,sizeof(file),&length,
@@ -165,6 +421,21 @@ static int compiler_arithmetic_tests(void) {
           !bob64_exec_parse(file,length,&image)&&
           !execute_compiled_main(&image,&result)&&result==-1,
           "sign-extend a 32-bit int return through the 64-bit app ABI");
+    int signed_division_status=bob64_compile_c(signed_division_source,
+              sizeof(signed_division_source)-1,file,sizeof(file),&length,
+              &error_offset);
+    CHECK(!signed_division_status&&!bob64_exec_parse(file,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==1398,
+          "execute signed 64-bit division and remainder with truncation toward zero");
+    CHECK(!bob64_compile_c(unsigned_division_source,
+              sizeof(unsigned_division_source)-1,file,sizeof(file),&length,
+              &error_offset)&&!bob64_exec_parse(file,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==429496736LL,
+          "execute unsigned division and remainder without truncating high bits");
+    CHECK(!bob64_compile_c(bitwise_source,sizeof(bitwise_source)-1,file,
+          sizeof(file),&length,&error_offset)&&!bob64_exec_parse(file,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==1,
+          "execute C bitwise precedence, 64-bit shifts, and signed right shift");
     return 0;
 }
 
@@ -206,6 +477,15 @@ static int compiler_local_tests(void) {
           "compile initialized local char arrays and array parameters");
     CHECK(!execute_compiled_main(&image,&result)&&result==4+'O',
           "execute byte-array initialization, mutation, decay, and traversal");
+    static const char array_write_source[]=
+        "int main(void) { char text[5] = \"bob!\"; "
+        "bob64_app_write(text, 4); return 0; }";
+    CHECK(!bob64_compile_c(array_write_source,sizeof(array_write_source)-1,file,
+                           sizeof(file),&length,&error_offset)&&
+          !bob64_exec_parse(file,length,&image)&&
+          contains_bytes(image.Image,(usize)image.CodeSize,
+                         "\x48\x89\xc2\x59\xb8\x02\x00\x00\x00\xcd\x80",11),
+          "emit the write-buffer syscall for a local char-array pointer");
     static const char char_brace_array_source[]=
         "int main(void) { char text[4] = {'b','o','b','!'}; return text[3]; }";
     CHECK(!bob64_compile_c(char_brace_array_source,
@@ -443,9 +723,17 @@ static int compiler_local_tests(void) {
     CHECK(!bob64_compile_c(long_type_source,sizeof(long_type_source)-1,
                            file,sizeof(file),&length,&error_offset)&&
           !bob64_exec_parse(file,length,&image),
-          "compile 64-bit long globals, locals, prototypes, and returns");
+          "compile LLP64 long globals, locals, prototypes, and returns");
     CHECK(!execute_compiled_main(&image,&result)&&result==0x100000051LL,
           "execute LLP64 long and long-long values at their declared widths");
+    static const char long_width_source[]=
+        "long shared=0x100000001ULL; "
+        "long main(void) { long local=0x100000001ULL; return local+shared; }";
+    CHECK(!bob64_compile_c(long_width_source,sizeof(long_width_source)-1,
+                           file,sizeof(file),&length,&error_offset)&&
+          !bob64_exec_parse(file,length,&image)&&
+          !execute_compiled_main(&image,&result)&&result==2,
+          "truncate long globals and locals to their LLP64 32-bit width");
     static const char short_global_source[]=
         "short shared=64302; int main(void) { return shared; }";
     CHECK(!bob64_compile_c(short_global_source,sizeof(short_global_source)-1,
@@ -913,6 +1201,18 @@ static u64 *test_table_access(void *context,u64 physical) {
     return tables->Entries[index];
 }
 
+static int test_bootstrap_table_pool_grow(void *context,
+        BOB64_BOOTSTRAP_SPACE *space,u64 *base,u64 *pages) {
+    TEST_PAGE_TABLES *tables=(TEST_PAGE_TABLES *)context;
+    const usize count=16;
+    if(!tables||!space||!base||!pages||count>tables->Capacity-tables->Used)
+        return -1;
+    *base=tables->Base+tables->Used*BOB64_PAGE_SIZE;
+    *pages=count;
+    tables->Used+=count;
+    return 0;
+}
+
 static int paging_tests(void) {
     TEST_PAGE_TABLES storage={0x100000000ULL,0,16,{{0}}};
     BOB64_PAGE_TABLE table;
@@ -1032,8 +1332,9 @@ static int process_address_space_tests(void) {
 }
 
 static int bootstrap_tests(void) {
-    TEST_PAGE_TABLES storage={0x100000000ULL,16,16,{{0}}};
+    TEST_PAGE_TABLES storage={0x100000000ULL,16,128,{{0}}};
     BOB64_BOOTSTRAP_SPACE space;
+    EFI_MEMORY_DESCRIPTOR runtime_map[2]={{0}};
     u64 physical,flags;
     CHECK(!bob64_bootstrap_space_init(&space,48,test_table_access,&storage,
           storage.Base,16,0x200000,0x5000,0x800000,0x8000,1),
@@ -1049,6 +1350,36 @@ static int bootstrap_tests(void) {
     CHECK(bob64_page_translate(&space.PageTable,storage.Base+0x9000,&physical,&flags)==1&&
           physical==storage.Base+0x9000&&(flags&BOB64_PAGE_NX),
           "identity-map table pages needed after loading the new CR3");
+    bob64_bootstrap_space_set_table_growth(&space,
+        test_bootstrap_table_pool_grow,&storage);
+    for(u64 i=0;i<32;i++)
+        CHECK(!bob64_page_map(&space.PageTable,0x10000000ULL+i*(2ULL<<20),
+              0x60000000ULL+i*BOB64_PAGE_SIZE,BOB64_PAGE_WRITE|BOB64_PAGE_NX),
+              "grow the bootstrap table pool while mapping a larger address space");
+    CHECK(space.TablePoolChunkCount>=1&&space.TablePoolPages>16&&
+          space.TablePoolUsed>16&&space.TablePoolUsed<=space.TablePoolPages&&
+          bob64_page_translate(&space.PageTable,0x10000000ULL+31*(2ULL<<20),
+                              &physical,&flags)==1&&
+          physical==0x60000000ULL+31*BOB64_PAGE_SIZE,
+          "allocate and access dynamically grown page-table chunks");
+    runtime_map[0].Type=EFI_RUNTIME_SERVICES_CODE;
+    runtime_map[0].PhysicalStart=0xa00000;
+    runtime_map[0].NumberOfPages=1;
+    runtime_map[0].Attribute=EFI_MEMORY_RUNTIME;
+    runtime_map[1].Type=EFI_RUNTIME_SERVICES_DATA;
+    runtime_map[1].PhysicalStart=0xa01000;
+    runtime_map[1].NumberOfPages=1;
+    runtime_map[1].Attribute=EFI_MEMORY_RUNTIME;
+    CHECK(!bob64_bootstrap_map_runtime_services(&space,runtime_map,
+          sizeof(runtime_map),sizeof(runtime_map[0]),0xa01080)&&
+          bob64_page_translate(&space.PageTable,0xa00000,&physical,&flags)==1&&
+          physical==0xa00000&&!(flags&BOB64_PAGE_WRITE)&&!(flags&BOB64_PAGE_NX)&&
+          bob64_page_translate(&space.PageTable,0xa01080,&physical,&flags)==1&&
+          physical==0xa01080&&(flags&BOB64_PAGE_WRITE)&&(flags&BOB64_PAGE_NX),
+          "identity-map UEFI runtime code and data with executable and NX protections");
+    CHECK(bob64_bootstrap_map_runtime_services(&space,runtime_map,
+          sizeof(runtime_map),sizeof(runtime_map[0]),0xa02000)<0,
+          "reject runtime-service tables outside runtime data descriptors");
     CHECK(bob64_bootstrap_space_init(&space,48,test_table_access,&storage,
           storage.Base,1,0x200000,0x5000,0x800000,0x8000,1)==BOB64_PAGING_NO_MEMORY,
           "fail cleanly when the reserved table pool cannot cover all mappings");
@@ -1168,6 +1499,7 @@ static usize syscall_test_user_output_length;
 static u32 syscall_test_surface[6*8];
 static u32 syscall_test_display_pixels[6*8];
 static u32 syscall_context_test_counts[2];
+static u32 syscall_test_app_runs;
 static BOB64_EVENT syscall_test_event={.Type=BOB64_EVENT_KEY_DOWN,.Key=0x01,
     .Character=0x1b};
 static void syscall_test_write(void *context,u8 character) {
@@ -1212,14 +1544,30 @@ static int syscall_context_tests(void) {
     if(bob64_syscall_context_push()!=-1)return -1;
     for(u32 i=0;i<BOB64_SYSCALL_CONTEXT_MAX_DEPTH;i++)
         if(bob64_syscall_context_pop())return -1;
-    return bob64_syscall_context_pop()?0:-1;
+    if(!bob64_syscall_context_pop())return -1;
+    bob64_user_depth=2;bob64_user_active=1;
+    bob64_user_return_frames[1].ReturnValue=0;
+    bob64_user_request_return(-77);
+    if(bob64_user_active||bob64_user_return_value!=-77||
+       bob64_user_return_frames[1].ReturnValue!=-77)return -1;
+    bob64_user_depth=0;bob64_user_return_value=0;
+    return 0;
 }
 static int syscall_test_read_user(void *context,u64 address,void *destination,
                                   usize length) {
     static const char text[]="abc",name[]="note",data[]="data";
     const char *source=0;usize source_length=0;
     (void)context;
-    if(address==syscall_test_user_base){source=text;source_length=sizeof(text)-1;}
+    if(address==syscall_test_user_base+80&&length==sizeof(u64)) {
+        *(u64 *)destination=syscall_test_user_base;
+        return 0;
+    }
+    if(address>=syscall_test_user_base&&
+       address-syscall_test_user_base<sizeof(text)) {
+        if(length>sizeof(text)-(usize)(address-syscall_test_user_base))return -1;
+        memcpy(destination,text+(usize)(address-syscall_test_user_base),length);
+        return 0;
+    }
     else if(address==syscall_test_user_base+16){source=name;source_length=sizeof(name)-1;}
     else if(address==syscall_test_user_base+32){source=data;source_length=sizeof(data)-1;}
     else if(address==syscall_test_user_base+3*BOB64_PAGE_SIZE&&
@@ -1270,6 +1618,19 @@ static s64 syscall_test_file_write(void *context,const char *name,const u8 *buff
         return -28;
     strcpy(syscall_test_file_name,name);memcpy(syscall_test_file_data,buffer,length);
     syscall_test_file_length=length;return (s64)length;
+}
+
+static int syscall_test_run_application(void *context,const char *name,
+                                        usize argument_count,
+                                        const char *const *arguments,
+                                        s64 *exit_status) {
+    (void)context;
+    if(!name||strcmp(name,"note")||argument_count!=1||!arguments||
+       strcmp(arguments[0],"abc")||!exit_status)
+        return -2;
+    syscall_test_app_runs++;
+    *exit_status=-27;
+    return 0;
 }
 static s64 syscall_test_stream_open(void *context,const char *name,u32 flags) {
     (void)context;(void)flags;
@@ -1360,11 +1721,29 @@ static int syscall_tests(void) {
     bob64_syscall_set_file_manager(syscall_test_file_list,
                                    syscall_test_file_delete,0);
     bob64_syscall_set_wait_event(syscall_test_wait_event,0);
+    bob64_syscall_set_app_runner(syscall_test_run_application,0);
     bob64_syscall_set_window_server(&window_server,window_owner);
     bob64_user_active=1;
     syscall_test_output_length=0;syscall_test_user_base=first+16;
+    syscall_test_app_runs=0;
     frame.CS=0x23;frame.RAX=BOB64_SYSCALL_QUERY_ABI;
     if(bob64_syscall_dispatch(&frame)!=0||frame.RAX!=BOB64_SYSCALL_ABI_VERSION)return -1;
+    frame.RAX=BOB64_SYSCALL_RUN_APPLICATION;
+    frame.RCX=syscall_test_user_base+16;frame.RDX=4;
+    frame.R8=syscall_test_user_base+48;frame.RSI=1;
+    frame.R9=syscall_test_user_base+80;
+    if(bob64_syscall_dispatch(&frame)||frame.RAX||syscall_test_app_runs!=1||
+       syscall_test_user_output_length!=sizeof(s64)||
+       *(s64 *)syscall_test_user_output!=-27) {
+        fprintf(stderr,"run app debug: rax=%lld runs=%u output=%zu status=%lld\n",
+            (long long)frame.RAX,syscall_test_app_runs,
+            syscall_test_user_output_length,
+            (long long)*(s64 *)syscall_test_user_output);return -1;
+    }
+    frame.RAX=BOB64_SYSCALL_RUN_APPLICATION;frame.RCX=syscall_test_user_base+16;
+    frame.RDX=4;frame.R8=first+BOB64_PAGE_SIZE;
+    if(bob64_syscall_dispatch(&frame)||(s64)frame.RAX!=-14||
+       syscall_test_app_runs!=1)return -1;
     timer_before=bob64_timer_ticks();bob64_timer_irq_tick();
     frame.RAX=BOB64_SYSCALL_GET_TICKS;
     if(bob64_syscall_dispatch(&frame)!=0||frame.RAX!=timer_before+1)return -1;
@@ -1523,6 +1902,7 @@ static int syscall_tests(void) {
     bob64_syscall_set_file_stream(0,0,0,0);
     bob64_syscall_set_file_manager(0,0,0);
     bob64_syscall_set_wait_event(0,0);
+    bob64_syscall_set_app_runner(0,0);
     bob64_syscall_set_window_server(0,0);
     bob64_syscall_set_address_space(0);
     bob64_window_server_close(&window_server);
@@ -1641,13 +2021,199 @@ static int console_tests(void) {
     return 0;
 }
 
+static int compression_tests(void) {
+    static u32 workspace[65536];
+    static u8 source[131072];
+    static u8 compressed[131072+131072/255+16];
+    static u8 restored[sizeof(source)];
+    usize compressed_size=0;
+    for(usize i=0;i<sizeof(source);i++) {
+        if(i<65536)source[i]=0;
+        else source[i]=(u8)((i*37u+i/7u)^((i>>9)&0xffu));
+    }
+    CHECK(!bob64_lz4_compress(source,sizeof(source),compressed,
+          sizeof(compressed),&compressed_size,workspace,sizeof(workspace))&&
+          compressed_size>0&&compressed_size<sizeof(source)&&
+          !bob64_lz4_decompress(compressed,compressed_size,restored,
+                                sizeof(restored),sizeof(source))&&
+          !memcmp(source,restored,sizeof(source)),
+          "compress and restore long zero runs and mixed binary data");
+    CHECK(bob64_lz4_decompress(compressed,compressed_size-1,restored,
+          sizeof(restored),sizeof(source))<0,
+          "reject a truncated LZ4 block");
+    static const u8 invalid_offset[]={0,1,0};
+    CHECK(bob64_lz4_decompress(invalid_offset,sizeof(invalid_offset),restored,
+          sizeof(restored),4)<0,
+          "reject an LZ4 match that points before the output buffer");
+    return 0;
+}
+
+static int firmware_bundle_capacity_tests(int argc,char **argv) {
+    const char *paths[10];
+    const char *source_path="apps/bob64_demo.c";
+    usize total=0,offset=0,compressed_size=0;
+    u8 *source=0,*compressed=0,*restored=0,*workspace=0;
+    FILE *file;
+    if(argc<12)return 0;
+    paths[0]=argv[2];paths[1]=argv[4];paths[2]=argv[5];paths[3]=argv[6];
+    paths[4]=argv[7];paths[5]=argv[8];paths[6]=argv[9];paths[7]=argv[10];
+    paths[8]=argv[11];paths[9]=source_path;
+    for(usize i=0;i<10;i++) {
+        long size;
+        file=fopen(paths[i],"rb");
+        CHECK(file,"open default file for firmware capacity estimate");
+        CHECK(!fseek(file,0,SEEK_END)&&(size=ftell(file))>=0&&
+              !fseek(file,0,SEEK_SET)&&!fclose(file),
+              "measure a default app for firmware capacity estimate");
+        CHECK((usize)size<=~(usize)0-total,
+              "bound default embedded app bundle size");
+        total+=(usize)size;
+    }
+    source=(u8 *)malloc(total);
+    CHECK(source,"allocate embedded firmware capacity input");
+    for(usize i=0;i<10;i++) {
+        long size;
+        file=fopen(paths[i],"rb");
+        CHECK(file,"reopen default app for firmware capacity input");
+        CHECK(!fseek(file,0,SEEK_END)&&(size=ftell(file))>=0&&
+              !fseek(file,0,SEEK_SET)&&
+              fread(source+offset,1,(usize)size,file)==(usize)size&&
+              !fclose(file),"read default app for firmware capacity input");
+        offset+=(usize)size;
+    }
+    usize bound=bob64_lz4_compress_bound(total);
+    compressed=(u8 *)malloc(bound);restored=(u8 *)malloc(total);
+    workspace=(u8 *)malloc(BOB64_LZ4_WORKSPACE_SIZE);
+    CHECK(compressed&&restored&&workspace&&
+          !bob64_lz4_compress(source,total,compressed,bound,&compressed_size,
+                              workspace,BOB64_LZ4_WORKSPACE_SIZE)&&
+          compressed_size+BOB64_FIRMWARE_SNAPSHOT_HEADER_SIZE+1024<
+              BOB64_FIRMWARE_SNAPSHOT_LIMIT&&
+          !bob64_lz4_decompress(compressed,compressed_size,restored,total,total)&&
+          !memcmp(source,restored,total),
+          "compress default embedded apps within the UEFI snapshot variable limit");
+    free(workspace);free(restored);free(compressed);free(source);
+    return 0;
+}
+
 static int heap_test_grow(void *context,void **region,usize *region_size) {
     HEAP_TEST_ARENA *arena=(HEAP_TEST_ARENA *)context;
-    if(arena->PagesUsed>=4)return 0;
+    usize page_limit=arena->PageLimit?arena->PageLimit:4;
+    if(arena->PagesUsed>=page_limit)return 0;
     *region=arena->Bytes+arena->PagesUsed*4096;
     *region_size=4096;
     arena->PagesUsed++;
     return 1;
+}
+
+static int heap_test_shrink(void *context,void *region,usize region_size) {
+    HEAP_TEST_ARENA *arena=(HEAP_TEST_ARENA *)context;
+    usize pages=region_size/4096;
+    if(!pages||pages>arena->PagesUsed||
+       region!=arena->Bytes+(arena->PagesUsed-pages)*4096)return -1;
+    arena->PagesUsed-=pages;
+    return 0;
+}
+
+static int heap_stress_grow(void *context,void **region,usize *region_size) {
+    HEAP_STRESS_ARENA *arena=(HEAP_STRESS_ARENA *)context;
+    if(arena->PagesUsed>=128)return 0;
+    *region=arena->Bytes+arena->PagesUsed*4096;
+    *region_size=4096;
+    arena->PagesUsed++;
+    return 1;
+}
+
+static int heap_stress_shrink(void *context,void *region,usize region_size) {
+    HEAP_STRESS_ARENA *arena=(HEAP_STRESS_ARENA *)context;
+    usize pages=region_size/4096;
+    if(!pages||pages>arena->PagesUsed||
+       region!=arena->Bytes+(arena->PagesUsed-pages)*4096)return -1;
+    arena->PagesUsed-=pages;
+    return 0;
+}
+
+static int heap_stress_worker_run(HEAP_STRESS_WORKER *worker) {
+    for(u32 iteration=0;iteration<600;iteration++) {
+        usize size=17+(iteration*73+worker->Worker*251)%2048;
+        u8 marker=(u8)(worker->Worker*29+iteration);
+        u8 *allocation=(u8 *)bob64_heap_alloc(worker->Heap,size);
+        if(!allocation)return -1;
+        memset(allocation,marker,size);
+        for(usize i=0;i<size;i++)if(allocation[i]!=marker)return -1;
+        if(bob64_heap_free(worker->Heap,allocation))return -1;
+        if((iteration&7)==0) {
+#ifdef _WIN32
+            SwitchToThread();
+#else
+            sched_yield();
+#endif
+        }
+    }
+    return 0;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI heap_stress_thread(void *context) {
+    HEAP_STRESS_WORKER *worker=(HEAP_STRESS_WORKER *)context;
+    worker->Result=heap_stress_worker_run(worker);
+    return 0;
+}
+#else
+static void *heap_stress_thread(void *context) {
+    HEAP_STRESS_WORKER *worker=(HEAP_STRESS_WORKER *)context;
+    worker->Result=heap_stress_worker_run(worker);
+    return 0;
+}
+#endif
+
+static int heap_lock_concurrency_test(void) {
+    static HEAP_STRESS_ARENA arena;
+    BOB64_HEAP heap;
+    HEAP_STRESS_WORKER workers[4]={{0}};
+#ifdef _WIN32
+    HANDLE threads[4]={0};
+    DWORD thread_id;
+    usize started=0;
+#else
+    pthread_t threads[4];
+    usize started=0;
+#endif
+    if(bob64_heap_init(&heap,sizeof(arena.Bytes),heap_stress_grow,&arena))
+        return 0;
+    bob64_heap_set_shrink(&heap,heap_stress_shrink);
+    for(u32 i=0;i<4;i++) {
+        workers[i].Heap=&heap;workers[i].Worker=i;workers[i].Result=-1;
+#ifdef _WIN32
+        threads[i]=CreateThread(0,0,heap_stress_thread,&workers[i],0,&thread_id);
+        if(!threads[i])break;
+#else
+        if(pthread_create(&threads[i],0,heap_stress_thread,&workers[i]))break;
+#endif
+        started++;
+    }
+    if(started!=4) {
+#ifdef _WIN32
+        for(usize i=0;i<started;i++) {
+            WaitForSingleObject(threads[i],INFINITE);
+            CloseHandle(threads[i]);
+        }
+#else
+        for(usize i=0;i<started;i++)pthread_join(threads[i],0);
+#endif
+        return 0;
+    }
+#ifdef _WIN32
+    if(WaitForMultipleObjects(4,threads,TRUE,INFINITE)!=WAIT_OBJECT_0) {
+        for(usize i=0;i<4;i++)CloseHandle(threads[i]);
+        return 0;
+    }
+    for(usize i=0;i<4;i++)CloseHandle(threads[i]);
+#else
+    for(usize i=0;i<4;i++)if(pthread_join(threads[i],0))return 0;
+#endif
+    for(usize i=0;i<4;i++)if(workers[i].Result)return 0;
+    return arena.PagesUsed==1&&bob64_heap_mapped_bytes(&heap)==4096;
 }
 
 static int heap_tests(void) {
@@ -1656,6 +2222,7 @@ static int heap_tests(void) {
     u8 *small,*large,*zero,*coalesced;
     CHECK(!bob64_heap_init(&heap,sizeof(arena.Bytes),heap_test_grow,&arena),
           "initialize a bounded 64-bit heap");
+    bob64_heap_set_shrink(&heap,heap_test_shrink);
     small=(u8 *)bob64_heap_alloc(&heap,65);
     large=(u8 *)bob64_heap_alloc(&heap,9000);
     zero=(u8 *)bob64_heap_calloc(&heap,32,2);
@@ -1671,11 +2238,17 @@ static int heap_tests(void) {
           !bob64_heap_free(&heap,zero)&&bob64_heap_free(&heap,zero)<0&&
           bob64_heap_free(&heap,arena.Bytes)<0,
           "free blocks, reject double free, and reject non-allocation pointers");
+    CHECK(arena.PagesUsed==1&&bob64_heap_mapped_bytes(&heap)==4096,
+          "reclaim trailing empty pages while retaining the initial heap page");
     coalesced=(u8 *)bob64_heap_alloc(&heap,9000);
     CHECK(coalesced&&((uintptr_t)coalesced&15)==0,
-          "coalesce adjacent free blocks for a larger allocation");
-    CHECK(!bob64_heap_free(&heap,coalesced),"free the coalesced allocation");
+          "regrow and coalesce heap pages for a larger allocation");
+    CHECK(!bob64_heap_free(&heap,coalesced)&&arena.PagesUsed==1&&
+          bob64_heap_mapped_bytes(&heap)==4096,
+          "reclaim pages after freeing a regrown heap allocation");
     CHECK(!bob64_heap_calloc(&heap,(usize)-1,2),"reject calloc multiplication overflow");
+    CHECK(heap_lock_concurrency_test(),
+          "serialize concurrent heap growth, allocation, coalescing, and shrinking");
     return 0;
 }
 
@@ -1716,6 +2289,140 @@ static int snapshot_tests(void) {
     snapshot[4]=2;
     CHECK(bob64_fs_snapshot_restore(&target,snapshot,size)<0&&target.FileCount==3,
           "reject unsupported B64S versions");
+    return 0;
+}
+
+static int firmware_store_tests(void) {
+    static HEAP_STRESS_ARENA arena;
+    static u8 large_payload[40000];
+    BOB64_HEAP heap;
+    BOB64_FILESYSTEM source,target;
+    EFI_RUNTIME_SERVICES services={0};
+    const char *contents;
+    usize length,snapshot_size,written,large_snapshot_size;
+    void *snapshot,*large_snapshot;
+    EFI_STATUS firmware_status=EFI_INVALID_PARAMETER;
+    UINTN maximum_variable_size=0,remaining_storage_size=0;
+    static const CHAR16 manifest_a[]={'B','o','b','6','4','S','l','o','t','A',0};
+    static const CHAR16 manifest_b[]={'B','o','b','6','4','S','l','o','t','B',0};
+    static const CHAR16 chunk_a0[]={'B','o','b','6','4','D','a','t','a','A','0',0};
+    static const CHAR16 chunk_b0[]={'B','o','b','6','4','D','a','t','a','B','0',0};
+    memset(firmware_test_variables,0,sizeof(firmware_test_variables));
+    firmware_test_query_unsupported=0;
+    services.GetVariable=firmware_test_get_variable;
+    services.SetVariable=firmware_test_set_variable;
+    services.QueryVariableInfo=firmware_test_query_variable_info;
+    CHECK(bob64_firmware_snapshot_restore(0,0)==
+          BOB64_FIRMWARE_SNAPSHOT_NOT_FOUND,
+          "treat absent firmware runtime services as a RAM-checkpoint fallback");
+    CHECK(!bob64_heap_init(&heap,sizeof(arena.Bytes),heap_stress_grow,&arena)&&
+          !bob64_fs_init(&source,&heap)&&!bob64_fs_init(&target,&heap),
+          "initialize firmware-backed B64S test filesystems");
+    CHECK(!bob64_fs_write(&source,"notes.txt","bob! durable",12)&&
+          !bob64_fs_write(&source,"compiled.b64e","B64E",4),
+          "seed persistent snapshot with user data and a compiled application");
+    CHECK(!bob64_fs_snapshot_size(&source,&snapshot_size)&&
+          (snapshot=bob64_heap_alloc(&heap,snapshot_size))!=0&&
+          !bob64_fs_snapshot_write(&source,snapshot,snapshot_size,&written)&&
+          written==snapshot_size&&
+          !bob64_firmware_snapshot_save(&services,&heap,snapshot,snapshot_size,
+               &firmware_status,&maximum_variable_size,&remaining_storage_size)&&
+          firmware_status==EFI_SUCCESS&&
+          maximum_variable_size==FIRMWARE_TEST_VARIABLE_MAX_SIZE&&
+          remaining_storage_size==FIRMWARE_TEST_STORAGE_SIZE&&
+          firmware_test_find(manifest_a)>=0&&firmware_test_find(chunk_a0)>=0,
+          "compress B64S and commit a versioned first firmware snapshot slot");
+    firmware_test_query_unsupported=1;
+    CHECK(!bob64_firmware_snapshot_save(&services,&heap,snapshot,snapshot_size,
+                                        0,0,0),
+          "save the snapshot when firmware does not support variable-capacity queries");
+    firmware_test_query_unsupported=0;
+    CHECK(firmware_test_find(manifest_b)>=0&&firmware_test_find(chunk_b0)>=0,
+          "commit a second slot without replacing the active first snapshot");
+    CHECK(!bob64_fs_write(&target,"keep.txt","old",3)&&
+          !bob64_firmware_snapshot_restore(&services,&target)&&
+          !bob64_fs_read(&target,"notes.txt",&contents,&length)&&
+          length==12&&!memcmp(contents,"bob! durable",12)&&
+          !bob64_fs_read(&target,"compiled.b64e",&contents,&length)&&
+          length==4&&!memcmp(contents,"B64E",4)&&
+          bob64_fs_read(&target,"keep.txt",&contents,&length)<0,
+          "restore compressed firmware B64S into the live filesystem");
+    u32 random=0x91e10da5u;
+    for(usize i=0;i<sizeof(large_payload);i++) {
+        random=random*1664525u+1013904223u;
+        large_payload[i]=(u8)(random>>24);
+    }
+    CHECK(!bob64_fs_write(&source,"large.bin",large_payload,sizeof(large_payload))&&
+          !bob64_fs_snapshot_size(&source,&large_snapshot_size)&&
+          (large_snapshot=bob64_heap_alloc(&heap,large_snapshot_size))!=0&&
+          !bob64_fs_snapshot_write(&source,large_snapshot,large_snapshot_size,
+                                   &written)&&written==large_snapshot_size&&
+          !bob64_firmware_snapshot_save(&services,&heap,large_snapshot,
+              large_snapshot_size,&firmware_status,&maximum_variable_size,
+              &remaining_storage_size)&&firmware_status==EFI_SUCCESS&&
+          firmware_test_find(manifest_a)>=0&&firmware_test_find(chunk_a0)>=0&&
+          !bob64_firmware_snapshot_restore(&services,&target)&&
+          !bob64_fs_read(&target,"large.bin",&contents,&length)&&
+          length==sizeof(large_payload)&&!memcmp(contents,large_payload,length),
+          "split a large snapshot across EFI variables and restore every chunk");
+    bob64_heap_free(&heap,large_snapshot);
+    CHECK(!bob64_fs_write(&target,"keep.txt","still here",10),
+          "seed live state before testing active-slot fallback");
+    int active_chunk=firmware_test_find(chunk_a0);
+    CHECK(active_chunk>=0,"find the committed active snapshot chunk");
+    firmware_test_variables[active_chunk].Data[0]^=1;
+    CHECK(!bob64_firmware_snapshot_restore(&services,&target)&&
+          bob64_fs_read(&target,"keep.txt",&contents,&length)<0&&
+          bob64_fs_read(&target,"large.bin",&contents,&length)<0&&
+          !bob64_fs_read(&target,"notes.txt",&contents,&length)&&
+          length==12&&!memcmp(contents,"bob! durable",12),
+          "fall back to the previous committed slot when the active chunk is corrupt");
+    int manifest_a_index=firmware_test_find(manifest_a);
+    int manifest_b_index=firmware_test_find(manifest_b);
+    CHECK(manifest_a_index>=0&&manifest_b_index>=0,
+          "find both snapshot commit manifests");
+    firmware_test_variables[manifest_a_index].Data[0]='X';
+    firmware_test_variables[manifest_b_index].Data[0]='X';
+    CHECK(!bob64_fs_write(&target,"keep.txt","still here",10),
+          "seed live state before rejecting damaged snapshot slots");
+    CHECK(bob64_firmware_snapshot_restore(&services,&target)<0&&
+          !bob64_fs_read(&target,"keep.txt",&contents,&length)&&
+          length==10&&!memcmp(contents,"still here",10),
+          "reject damaged firmware slots without changing live files");
+    memset(firmware_test_variables,0,sizeof(firmware_test_variables));
+    CHECK(bob64_firmware_snapshot_restore(&services,&target)==
+          BOB64_FIRMWARE_SNAPSHOT_NOT_FOUND,
+          "distinguish missing persistent B64S from corrupt storage");
+    static const CHAR16 legacy_name[]={
+        'B','o','b','6','4','S','n','a','p','s','h','o','t',0
+    };
+    u8 legacy_blob[1024];
+    usize compressed_capacity=bob64_lz4_compress_bound(snapshot_size);
+    usize compressed_size=0;
+    u8 *legacy_compressed=(u8 *)bob64_heap_alloc(&heap,compressed_capacity);
+    u8 *workspace=(u8 *)bob64_heap_alloc(&heap,BOB64_LZ4_WORKSPACE_SIZE);
+    CHECK(legacy_compressed&&workspace&&
+          compressed_capacity+24<=sizeof(legacy_blob)&&
+          !bob64_lz4_compress(snapshot,snapshot_size,legacy_compressed,
+              compressed_capacity,&compressed_size,workspace,
+              BOB64_LZ4_WORKSPACE_SIZE),
+          "prepare a legacy single-variable compressed snapshot fixture");
+    legacy_blob[0]='B';legacy_blob[1]='6';legacy_blob[2]='4';legacy_blob[3]='C';
+    firmware_test_write32(legacy_blob+4,1);
+    firmware_test_write64(legacy_blob+8,snapshot_size);
+    firmware_test_write64(legacy_blob+16,compressed_size);
+    memcpy(legacy_blob+24,legacy_compressed,compressed_size);
+    CHECK(firmware_test_set_variable(legacy_name,0,
+          EFI_VARIABLE_NON_VOLATILE|EFI_VARIABLE_BOOTSERVICE_ACCESS|
+          EFI_VARIABLE_RUNTIME_ACCESS,24+compressed_size,legacy_blob)==EFI_SUCCESS&&
+          !bob64_firmware_snapshot_restore(&services,&target)&&
+          !bob64_fs_read(&target,"notes.txt",&contents,&length)&&
+          length==12&&!memcmp(contents,"bob! durable",12)&&
+          bob64_fs_read(&target,"large.bin",&contents,&length)<0,
+          "restore a legacy B64C v1 single-variable snapshot");
+    bob64_heap_free(&heap,workspace);
+    bob64_heap_free(&heap,legacy_compressed);
+    bob64_heap_free(&heap,snapshot);
     return 0;
 }
 
@@ -1923,18 +2630,23 @@ static int compiler_process_tests(const void *file,usize file_size) {
           !bob64_process_load(&process,file,file_size,1,arguments),
           "load the resident compiler's B64E output into a 64-bit process");
     TEST_APP_FRAME *code=app_test_find(&memory,BOB64_PROCESS_IMAGE_BASE);
-    TEST_APP_FRAME *data=app_test_find(&memory,BOB64_PROCESS_IMAGE_BASE+BOB64_PAGE_SIZE);
+    TEST_APP_FRAME *data=app_test_find(&memory,BOB64_PROCESS_IMAGE_BASE+
+                                              BOB64_COMPILER_CODE_CAPACITY);
     u64 string_address=BOB64_PROCESS_IMAGE_BASE+50+
                        (s64)(s32)read32(code?code->Bytes+46:(const u8 *)"\0\0\0\0");
-    CHECK(process.EntryAddress==BOB64_PROCESS_IMAGE_BASE&&process.PageCount==18&&
-          code&&data&&code->PhysicalAddress>0xffffffffULL&&
-          !(code->Flags&BOB64_PAGE_WRITE)&&!(code->Flags&BOB64_PAGE_NX)&&
-          (data->Flags&BOB64_PAGE_WRITE)&&(data->Flags&BOB64_PAGE_NX)&&
-          !memcmp(code->Bytes,"\x48\x83\xec\x28",4)&&
-          !memcmp(data->Bytes,"bob!",4)&&
-          string_address==BOB64_PROCESS_IMAGE_BASE+BOB64_PAGE_SIZE&&
+    CHECK(process.EntryAddress==BOB64_PROCESS_IMAGE_BASE&&process.PageCount==24&&
+          code&&data&&code->PhysicalAddress>0xffffffffULL,
+          "map expanded compiler image and stack above 4 GiB");
+    CHECK(!(code->Flags&BOB64_PAGE_WRITE)&&!(code->Flags&BOB64_PAGE_NX)&&
+          (data->Flags&BOB64_PAGE_WRITE)&&(data->Flags&BOB64_PAGE_NX),
+          "keep expanded compiler code RX and data RW/NX");
+    CHECK(!memcmp(code->Bytes,"\x48\x83\xec\x28",4),
+          "load the compiler-generated entry code");
+    CHECK(!memcmp(data->Bytes,"bob!",4),
+          "load compiler-generated string data after the expanded code region");
+    CHECK(string_address==BOB64_PROCESS_IMAGE_BASE+BOB64_COMPILER_CODE_CAPACITY&&
           string_address>0xffffffffULL,
-          "map compiler-generated machine code RX and string data RW/NX above 4 GiB");
+          "resolve the expanded RIP-relative string address above 4 GiB");
     CHECK(!bob64_process_unload(&process)&&memory.AllocationCount==memory.FreeCount&&
           memory.MapCount==memory.UnmapCount,
           "release every page after unloading the compiler-produced app");
@@ -2049,6 +2761,11 @@ static int keyboard_tests(void) {
           !bob64_keyboard_decode_event(&state,0x48,&event)&&
           event.Key==(BOB64_EVENT_KEY_EXTENDED|0x48)&&!event.Character,
           "preserve extended arrow-key identity for GUI navigation");
+    CHECK(bob64_keyboard_event_input(&event)==BOB64_KEYBOARD_INPUT_UP&&
+          bob64_keyboard_decode_event(&state,0xe0,&event)<0&&
+          !bob64_keyboard_decode_event(&state,0x50,&event)&&
+          bob64_keyboard_event_input(&event)==BOB64_KEYBOARD_INPUT_DOWN,
+          "translate arrow keys into shell history navigation input");
     state=(BOB64_KEYBOARD_STATE){0};
     CHECK(bob64_keyboard_decode(&state,0x1e)=='a',"decode unshifted set-1 letters");
     CHECK(bob64_keyboard_decode(&state,0x2a)<0&&
@@ -2221,6 +2938,93 @@ static int window_manager_tests(void) {
     return 0;
 }
 
+static int gui_widget_tests(void) {
+    u32 pixels[24*20]={0};
+    BOB64_GFX graphics={pixels,24,20,24*20};
+    BOB64_RECT rect={2,2,20,14};
+    BOB64_BUTTON_STATE state={0};
+    BOB64_EVENT event={0};
+    CHECK(bob64_rect_contains(&rect,2,2)&&bob64_rect_contains(&rect,21,15)&&
+          !bob64_rect_contains(&rect,22,15)&&
+          bob64_rect_contains(&(BOB64_RECT){0x7ffffff0,0,64,8},
+                              0x7ffffff0,1),
+          "hit-test 64-bit GUI widget rectangles without signed endpoint overflow");
+    event.Type=BOB64_EVENT_MOUSE_MOVE;event.X=4;event.Y=5;
+    CHECK(!bob64_button_event(&rect,&state,&event)&&state.Hovered&&!state.Pressed&&
+          !bob64_button_draw(&graphics,&rect,"OK",&state)&&
+          pixels[2*24+2]==0x00d6ecffu,
+          "draw a reusable button with its hover state");
+    event.Type=BOB64_EVENT_MOUSE_BUTTON;event.Buttons=BOB64_BUTTON_LEFT;
+    CHECK(!bob64_button_event(&rect,&state,&event)&&state.Pressed&&
+          !bob64_button_draw(&graphics,&rect,"OK",&state)&&
+          pixels[3*24+3]==0x001f4067u,
+          "show the pressed state while the left button is held");
+    event.Buttons=0;
+    CHECK(bob64_button_event(&rect,&state,&event)&&!state.Pressed,
+          "activate a button only when released inside it");
+    event.Type=BOB64_EVENT_MOUSE_BUTTON;event.Buttons=BOB64_BUTTON_LEFT;
+    event.X=4;event.Y=5;
+    bob64_button_event(&rect,&state,&event);
+    event.Buttons=0;event.X=30;event.Y=5;
+    CHECK(!bob64_button_event(&rect,&state,&event)&&!state.Pressed,
+          "cancel a button press released outside its bounds");
+    CHECK(bob64_button_draw(&graphics,&(BOB64_RECT){0,0,6,8},"X",&state)<0,
+          "reject undersized GUI buttons");
+    CHECK(bob64_button_draw(&graphics,
+          &(BOB64_RECT){0x7fffffff,0,64,16},"X",&state)<0&&
+          bob64_button_draw(&graphics,&rect,
+              "THIS LABEL DOES NOT FIT",&state)<0,
+          "reject overflowing or unclipped native GUI button geometry");
+    u32 field_pixels[96*24]={0};
+    char text[16]="notes.txt";
+    BOB64_GFX field_graphics={field_pixels,96,24,96*24};
+    BOB64_RECT field_rect={2,2,72,16};
+    BOB64_TEXT_FIELD field;
+    CHECK(!bob64_text_field_init(&field,text,sizeof(text))&&
+          field.Length==9&&field.Cursor==9,
+          "initialize a bounded native filename text field");
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_MOUSE_BUTTON;
+    event.Buttons=BOB64_BUTTON_LEFT;event.X=field_rect.X+3+5*6;
+    event.Y=field_rect.Y+6;
+    CHECK(!bob64_text_field_event(&field,&field_rect,&event)&&field.Focused&&
+          field.Cursor==5,
+          "focus a text field and position the caret from a mouse click");
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_KEY_DOWN;event.Character='X';
+    CHECK(bob64_text_field_event(&field,&field_rect,&event)&&
+          !strcmp(text,"notesX.txt")&&field.Cursor==6,
+          "insert text at the native text-field caret");
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_KEY_DOWN;
+    event.Key=BOB64_EVENT_KEY_EXTENDED|0x47;
+    bob64_text_field_event(&field,&field_rect,&event);
+    event.Key=BOB64_EVENT_KEY_EXTENDED|0x53;
+    CHECK(bob64_text_field_event(&field,&field_rect,&event)&&
+          !strcmp(text,"otesX.txt"),
+          "navigate and delete within the filename text field");
+    event.Key=0;event.Character='n';
+    CHECK(bob64_text_field_event(&field,&field_rect,&event)&&
+          !strcmp(text,"notesX.txt")&&
+          !bob64_text_field_draw(&field_graphics,&field_rect,&field)&&
+          field_pixels[field_rect.Y*96+field_rect.X]==0x00d6ecffu,
+          "redraw the focused text field with its caret and bounded text");
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_MOUSE_BUTTON;
+    event.Buttons=BOB64_BUTTON_LEFT;event.X=field_rect.X+4;event.Y=5;
+    bob64_text_field_event(&field,&field_rect,&event);
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_KEY_DOWN;
+    event.Key=BOB64_EVENT_KEY_EXTENDED|0x4f;
+    bob64_text_field_event(&field,&field_rect,&event);
+    event.Key=0;
+    event.Character='a';bob64_text_field_event(&field,&field_rect,&event);
+    event.Character='b';bob64_text_field_event(&field,&field_rect,&event);
+    event.Character='c';bob64_text_field_event(&field,&field_rect,&event);
+    event.Character='d';bob64_text_field_event(&field,&field_rect,&event);
+    event.Character='e';bob64_text_field_event(&field,&field_rect,&event);
+    event.Character='f';
+    CHECK(!bob64_text_field_event(&field,&field_rect,&event)&&
+          field.Length==15&&field.Scroll>0,
+          "keep long text-field input visible and reject buffer overflow");
+    return 0;
+}
+
 static int window_server_tests(void) {
     HEAP_TEST_ARENA arena={0};
     BOB64_HEAP heap;
@@ -2271,6 +3075,13 @@ static int window_server_tests(void) {
 static int editor_tests(void) {
     BOB64_EDITOR editor;
     BOB64_EVENT event={0};
+    static const char plain_text[]="bob!\nline\twith tab\r\n";
+    static const char binary_text[]={'b','o','b',0,'!'};
+    static const char escape_text[]={'a',27,'b'};
+    CHECK(!bob64_editor_is_binary_text(plain_text,sizeof(plain_text)-1)&&
+          bob64_editor_is_binary_text(binary_text,sizeof(binary_text))&&
+          bob64_editor_is_binary_text(escape_text,sizeof(escape_text)),
+          "allow text line controls and reject binary control bytes");
     bob64_editor_init(&editor,"abc",3);
     bob64_editor_move(&editor,-1);
     event.Type=BOB64_EVENT_KEY_DOWN;event.Character='!';
@@ -2294,6 +3105,14 @@ static int editor_tests(void) {
     CHECK(editor.Cursor==3,"move vertically while preserving the text column");
     bob64_editor_move_vertical(&editor,1);
     CHECK(editor.Cursor==7,"move vertically back to the next line");
+    bob64_editor_init(&editor,"ab\ncdef\ngh",10);
+    editor.Cursor=5;event.Character=0;event.Key=BOB64_EVENT_KEY_EXTENDED|0x47;
+    bob64_editor_handle_key(&editor,&event);
+    CHECK(editor.Cursor==3,"Home moves to the start of the current line");
+    event.Key=BOB64_EVENT_KEY_EXTENDED|0x4f;
+    bob64_editor_handle_key(&editor,&event);
+    CHECK(editor.Cursor==7,"End moves to the end of the current line");
+    bob64_editor_init(&editor,"abc\ndef",7);
     editor.Cursor=1;
     CHECK(!bob64_editor_delete(&editor)&&editor.Length==6&&
           !memcmp(editor.Text,"ac\ndef",6),"delete the character at the cursor");
@@ -2309,8 +3128,9 @@ static int editor_tests(void) {
     for(u32 i=0;i<BOB64_EDITOR_CAPACITY;i++)
         if(bob64_editor_insert(&editor,'b'))return -1;
     CHECK(editor.Length==BOB64_EDITOR_CAPACITY&&
-          bob64_editor_insert(&editor,'!')<0,
-          "accept a full 4 KiB editor buffer and reject overflow");
+          bob64_editor_insert(&editor,'!')<0&&
+          BOB64_EDITOR_CAPACITY==16384u,
+          "accept 16 KiB of editor text and reject overflow");
     return 0;
 }
 
@@ -2391,6 +3211,7 @@ static int shell_tests(void) {
     BOB64_FILESYSTEM filesystem;
     const char *file_data;
     usize file_length;
+    arena.PageLimit=16;
     allocator.Count=1;allocator.Capacity=1;allocator.Extents=&extent;
     allocator.AllocatedCount=1;allocator.Allocated[0].Pages=2;
     CHECK(!bob64_heap_init(&heap,sizeof(arena.Bytes),heap_test_grow,&arena)&&
@@ -2428,6 +3249,22 @@ static int shell_tests(void) {
     shell_test_command(&shell,"eCho Bob!");
     CHECK(strstr(output.Text,"Bob!\r\n")!=0&&shell.Length==0,
           "shell edits and executes case-insensitive commands");
+    bob64_shell_input(&shell,'e');bob64_shell_input(&shell,'c');
+    bob64_shell_input(&shell,BOB64_SHELL_INPUT_UP);
+    CHECK(!strcmp(shell.Line,"eCho Bob!"),"shell recalls the previous command with Up");
+    bob64_shell_input(&shell,BOB64_SHELL_INPUT_DOWN);
+    CHECK(!strcmp(shell.Line,"ec"),"shell Down restores the unfinished command draft");
+    bob64_shell_input(&shell,'\b');bob64_shell_input(&shell,'\b');
+    for(const char *key="hel";*key;key++)bob64_shell_input(&shell,(u8)*key);
+    bob64_shell_input(&shell,'\t');
+    CHECK(!strcmp(shell.Line,"help")&&output.Text[output.Length-1]=='p',
+          "Tab completes a unique built-in command");
+    bob64_shell_input(&shell,'\n');
+    for(const char *key="cat seed";*key;key++)bob64_shell_input(&shell,(u8)*key);
+    bob64_shell_input(&shell,'\t');
+    CHECK(!strcmp(shell.Line,"cat seed.txt"),
+          "Tab completes a unique RAM filesystem filename");
+    bob64_shell_input(&shell,'\n');
     shell_test_command(&shell,"mem");
     CHECK(strstr(output.Text,"free pages=0x0000000000000003")!=0&&
           strstr(output.Text,"allocated pages=0x0000000000000002")!=0&&
@@ -2470,9 +3307,10 @@ static int shell_tests(void) {
           "clear command resets the display");
     shell_test_command(&shell,"help");
     CHECK(strstr(output.Text,"version show kernel version")!=0&&
-          strstr(output.Text,"restore  restore RAM checkpoint")!=0&&
+          strstr(output.Text,"restore  restore firmware or RAM checkpoint")!=0&&
           strstr(output.Text,"cc SOURCE [OUTPUT]")!=0&&
-          strstr(output.Text,"desktop.b64e [FILE]")!=0,
+          strstr(output.Text,"desktop.b64e [FILE]")!=0&&
+          strstr(output.Text,"Up/Down command history")!=0,
           "help lists available commands");
     bob64_shell_set_runner(&shell,shell_test_run);
     bob64_shell_set_compiler(&shell,shell_test_compile);
@@ -2484,7 +3322,7 @@ static int shell_tests(void) {
     const char *compiled_file;usize compiled_file_length;BOB64_EXEC_IMAGE compiled_image;
     CHECK(!bob64_fs_read(&filesystem,"demo.b64e",&compiled_file,&compiled_file_length)&&
           !bob64_exec_parse(compiled_file,compiled_file_length,&compiled_image)&&
-          !memcmp(compiled_image.Image+BOB64_PAGE_SIZE,"bob!",4),
+          !memcmp(compiled_image.Image+BOB64_COMPILER_CODE_CAPACITY,"bob!",4),
           "save the resident compiler's validated B64E output in the filesystem");
     output.RunStarted=1;
     shell_test_command(&shell,"run demo.b64e first second");
@@ -2529,19 +3367,28 @@ int main(int argc,char **argv) {
     int found_rdmsr=0;
     uintptr_t synthetic=(uintptr_t)0x1234567887654321ULL;
 
-    CHECK(argc>=2&&argc<=5,"expected BOOTX64.EFI and optional B64E app paths");
+    CHECK(argc>=2&&argc<=13,"expected BOOTX64.EFI and optional B64E app paths");
     CHECK(sizeof(void *)==8&&sizeof(uintptr_t)==8&&sizeof(usize)==8,
           "the test and target use 64-bit pointers and sizes");
-    CHECK(sizeof(char)==1&&sizeof(short)==2&&sizeof(int)==4&&sizeof(long long)==8,
+    CHECK(sizeof(char)==1&&sizeof(short)==2&&sizeof(int)==4&&sizeof(long)==4&&
+          sizeof(long long)==8,
           "bob64 fixed-width scalar model");
     CHECK(libc_tests()==0,"bob64 C runtime tests");
     CHECK(compiler_tests()==0,"resident x86-64 C compiler tests");
+    CHECK(compiler_typedef_tests()==0,"resident C typedef tests");
+    CHECK(compiler_capacity_tests()==0,
+          "expanded resident compiler source, code and global data capacity tests");
     CHECK(compiler_arithmetic_tests()==0,"64-bit resident compiler arithmetic tests");
     CHECK(compiler_local_tests()==0,"resident compiler local-variable tests");
     CHECK(memory_tests()==0,"physical page allocator regression tests");
     CHECK(console_tests()==0,"GOP framebuffer console regression tests");
+    CHECK(compression_tests()==0,"bounded LZ4 snapshot compression regression tests");
     CHECK(heap_tests()==0,"64-bit heap allocator regression tests");
     CHECK(snapshot_tests()==0,"versioned B64S snapshot regression tests");
+    CHECK(firmware_store_tests()==0,
+          "compressed UEFI firmware snapshot persistence regression tests");
+    CHECK(firmware_bundle_capacity_tests(argc,argv)==0,
+          "default Bob64 apps fit the compressed UEFI snapshot variable bound");
     CHECK(executable_tests()==0,"versioned 64-bit native executable regression tests");
     CHECK(compiler_process_tests(resident_compiler_image,
           resident_compiler_image_length)==0,
@@ -2549,6 +3396,7 @@ int main(int argc,char **argv) {
     CHECK(keyboard_tests()==0,"PS/2 keyboard scan-code regression tests");
     CHECK(mouse_tests()==0,"PS/2 mouse packet and pointer regression tests");
     CHECK(window_manager_tests()==0,"64-bit GUI window-manager regression tests");
+    CHECK(gui_widget_tests()==0,"64-bit native GUI widget regression tests");
     CHECK(window_server_tests()==0,"64-bit kernel window-server regression tests");
     CHECK(editor_tests()==0,"native GUI text-editor buffer regression tests");
     CHECK(shell_tests()==0,"interactive shell command regression tests");
@@ -2639,13 +3487,13 @@ int main(int argc,char **argv) {
               !fclose(app_stream),"read graphics surface application");
         CHECK(!bob64_exec_parse(app_file,(usize)app_file_size,&app)&&
               app.AbiVersion==BOB64_APP_ABI_VERSION&&app.EntryOffset>0&&
-              app.MemorySize>1024u*768u*sizeof(u32)&&
+              app.MemorySize>=640u*400u*sizeof(u32)&&
               contains_bytes(app.Image,(usize)app.FileSize,"bob!",4),
-              "package a native graphics app with a full-screen frame and bob! output");
+              "package a native windowed graphics app with a frame and bob! output");
         free(app_file);
     }
 
-    if(argc==5) {
+    if(argc>=5) {
         BOB64_EXEC_IMAGE app;
         unsigned char *app_file;
         long app_file_size;
@@ -2660,12 +3508,220 @@ int main(int argc,char **argv) {
         CHECK(!bob64_exec_parse(app_file,(usize)app_file_size,&app)&&
               app.AbiVersion==BOB64_APP_ABI_VERSION&&app.EntryOffset>0&&
               app.MemorySize>1024u*768u*sizeof(u32)&&
+             app.MemorySize-app.FileSize>1024u*768u*sizeof(u32)&&
               contains_bytes(app.Image,(usize)app.FileSize,"BOB64 DESKTOP",13)&&
               contains_bytes(app.Image,(usize)app.FileSize,"CTRL S SAVE",11)&&
               contains_bytes(app.Image,(usize)app.FileSize,"ESC AGAIN TO QUI",16)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"RUN APP",7)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"APP EXIT",8)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"Applications",12)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"NAME",4)&&
+              contains_bytes(app.Image,(usize)app.FileSize,
+                             "UP DOWN WHEEL ENTER RUN",23)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"WHEEL MOVE",10)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"APPS",4)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"X CLOSE",7)&&
+              contains_bytes(app.Image,(usize)app.FileSize,
+                             "DELETE THIS FILE?",sizeof("DELETE THIS FILE?")-1)&&
+              contains_bytes(app.Image,(usize)app.FileSize,
+                             "YES, DELETE",sizeof("YES, DELETE")-1)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"CANCEL",
+                             sizeof("CANCEL")-1)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"DELETE CANCELLED",
+                             sizeof("DELETE CANCELLED")-1)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"Desktop help",
+                             sizeof("Desktop help")-1)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"FILES: ARROWS/WHEEL SELECT",
+                             sizeof("FILES: ARROWS/WHEEL SELECT")-1)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"CTRL S SAVES; TAB SWITCHES",
+                             sizeof("CTRL S SAVES; TAB SWITCHES")-1)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"PREVIEW (ON DISK)",
+                             sizeof("PREVIEW (ON DISK)")-1)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"APP - PRESS A TO RUN",
+                             sizeof("APP - PRESS A TO RUN")-1)&&
               contains_bytes(app.Image,(usize)app.FileSize,"notes.txt",9)&&
               contains_bytes(app.Image,(usize)app.FileSize,"bob!",4),
               "package a multi-window editor desktop with save support and bob! output");
+        free(app_file);
+    }
+
+    if(argc>=6) {
+        BOB64_EXEC_IMAGE app;
+        unsigned char *app_file;
+        long app_file_size;
+        FILE *app_stream=fopen(argv[5],"rb");
+        CHECK(app_stream,"open nested-app smoke B64E application");
+        CHECK(!fseek(app_stream,0,SEEK_END)&&(app_file_size=ftell(app_stream))>0&&
+              !fseek(app_stream,0,SEEK_SET),"measure nested-app smoke application");
+        app_file=(unsigned char *)malloc((usize)app_file_size);
+        CHECK(app_file,"allocate nested-app smoke application buffer");
+        CHECK(fread(app_file,1,(usize)app_file_size,app_stream)==(usize)app_file_size&&
+              !fclose(app_stream),"read nested-app smoke application");
+        CHECK(!bob64_exec_parse(app_file,(usize)app_file_size,&app)&&
+              app.AbiVersion==BOB64_APP_ABI_VERSION&&app.EntryOffset>0&&
+              contains_bytes(app.Image,(usize)app.FileSize,"bob!",4),
+              "package the nested-app smoke app with its expected bob! output");
+        free(app_file);
+    }
+
+    if(argc>=7) {
+        BOB64_EXEC_IMAGE app;
+        unsigned char *app_file;
+        long app_file_size;
+        FILE *app_stream=fopen(argv[6],"rb");
+        CHECK(app_stream,"open native echo B64E application");
+        CHECK(!fseek(app_stream,0,SEEK_END)&&(app_file_size=ftell(app_stream))>0&&
+              !fseek(app_stream,0,SEEK_SET),"measure native echo application");
+        app_file=(unsigned char *)malloc((usize)app_file_size);
+        CHECK(app_file,"allocate native echo application buffer");
+        CHECK(fread(app_file,1,(usize)app_file_size,app_stream)==
+              (usize)app_file_size&&!fclose(app_stream),
+              "read native echo application");
+        CHECK(!bob64_exec_parse(app_file,(usize)app_file_size,&app)&&
+              app.AbiVersion==BOB64_APP_ABI_VERSION&&app.EntryOffset>0&&
+              app.MemorySize>=app.FileSize&&app.CodeSize>0,
+              "package native echo with the 64-bit startup ABI");
+        free(app_file);
+    }
+
+    if(argc>=8) {
+        BOB64_EXEC_IMAGE app;
+        unsigned char *app_file;
+        long app_file_size;
+        FILE *app_stream=fopen(argv[7],"rb");
+        CHECK(app_stream,"open native file-list B64E application");
+        CHECK(!fseek(app_stream,0,SEEK_END)&&(app_file_size=ftell(app_stream))>0&&
+              !fseek(app_stream,0,SEEK_SET),"measure native file-list app");
+        app_file=(unsigned char *)malloc((usize)app_file_size);
+        CHECK(app_file,"allocate native file-list app buffer");
+        CHECK(fread(app_file,1,(usize)app_file_size,app_stream)==
+              (usize)app_file_size&&!fclose(app_stream),
+              "read native file-list app");
+        CHECK(!bob64_exec_parse(app_file,(usize)app_file_size,&app)&&
+              app.AbiVersion==BOB64_APP_ABI_VERSION&&app.EntryOffset>0&&
+              app.MemorySize>=app.FileSize&&app.CodeSize>0,
+              "package native file-list app with 64-bit file records");
+        free(app_file);
+    }
+
+    if(argc>=9) {
+        BOB64_EXEC_IMAGE app;
+        unsigned char *app_file;
+        long app_file_size;
+        FILE *app_stream=fopen(argv[8],"rb");
+        CHECK(app_stream,"open native file-read B64E application");
+        CHECK(!fseek(app_stream,0,SEEK_END)&&(app_file_size=ftell(app_stream))>0&&
+              !fseek(app_stream,0,SEEK_SET),"measure native file-read app");
+        app_file=(unsigned char *)malloc((usize)app_file_size);
+        CHECK(app_file,"allocate native file-read app buffer");
+        CHECK(fread(app_file,1,(usize)app_file_size,app_stream)==
+              (usize)app_file_size&&!fclose(app_stream),
+              "read native file-read app");
+        CHECK(!bob64_exec_parse(app_file,(usize)app_file_size,&app)&&
+              app.AbiVersion==BOB64_APP_ABI_VERSION&&app.EntryOffset>0&&
+              app.MemorySize>=app.FileSize&&app.CodeSize>0,
+              "package native streaming file reader with B64E metadata");
+        free(app_file);
+    }
+
+    if(argc>=10) {
+        BOB64_EXEC_IMAGE app;
+        unsigned char *app_file;
+        long app_file_size;
+        FILE *app_stream=fopen(argv[9],"rb");
+        CHECK(app_stream,"open native notes B64E application");
+        CHECK(!fseek(app_stream,0,SEEK_END)&&(app_file_size=ftell(app_stream))>0&&
+              !fseek(app_stream,0,SEEK_SET),"measure native notes application");
+        app_file=(unsigned char *)malloc((usize)app_file_size);
+        CHECK(app_file,"allocate native notes app buffer");
+        CHECK(fread(app_file,1,(usize)app_file_size,app_stream)==
+              (usize)app_file_size&&!fclose(app_stream),
+              "read native notes app");
+        CHECK(!bob64_exec_parse(app_file,(usize)app_file_size,&app)&&
+              app.AbiVersion==BOB64_APP_ABI_VERSION&&app.EntryOffset>0&&
+              app.MemorySize>=app.FileSize&&app.CodeSize>0&&
+              contains_bytes(app.Image,(usize)app.FileSize,"usage: notes",12)&&
+             contains_bytes(app.Image,(usize)app.FileSize,"copy SOURCE DEST",16)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"NOTES",5)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"CTRL S SAVE",11)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"ESC CLOSE",9)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"notes.txt",9)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"SAVE FAILED",11),
+              "package native graphical notes and command mode with B64E metadata");
+        free(app_file);
+    }
+
+    if(argc>=11) {
+        BOB64_EXEC_IMAGE app;
+        unsigned char *app_file;
+        long app_file_size;
+        FILE *app_stream=fopen(argv[10],"rb");
+        CHECK(app_stream,"open native system-information B64E application");
+        CHECK(!fseek(app_stream,0,SEEK_END)&&(app_file_size=ftell(app_stream))>0&&
+              !fseek(app_stream,0,SEEK_SET),"measure system-information app");
+        app_file=(unsigned char *)malloc((usize)app_file_size);
+        CHECK(app_file,"allocate system-information app buffer");
+        CHECK(fread(app_file,1,(usize)app_file_size,app_stream)==
+              (usize)app_file_size&&!fclose(app_stream),
+              "read system-information app");
+        CHECK(!bob64_exec_parse(app_file,(usize)app_file_size,&app)&&
+              app.AbiVersion==BOB64_APP_ABI_VERSION&&app.EntryOffset>0&&
+              app.MemorySize>=app.FileSize&&app.CodeSize>0&&
+              contains_bytes(app.Image,(usize)app.FileSize,
+                             "bob64 system information",24)&&
+              contains_bytes(app.Image,(usize)app.FileSize,
+                             "RAM file data",13)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"bob!",4),
+              "package system information app with 64-bit file-size reporting");
+        free(app_file);
+    }
+
+    if(argc>=12) {
+        BOB64_EXEC_IMAGE app;
+        unsigned char *app_file;
+        long app_file_size;
+        FILE *app_stream=fopen(argv[11],"rb");
+        CHECK(app_stream,"open native mouse IRQ smoke app");
+        CHECK(!fseek(app_stream,0,SEEK_END)&&(app_file_size=ftell(app_stream))>0&&
+              !fseek(app_stream,0,SEEK_SET),"measure native mouse IRQ app");
+        app_file=(unsigned char *)malloc((usize)app_file_size);
+        CHECK(app_file,"allocate native mouse IRQ app buffer");
+        CHECK(fread(app_file,1,(usize)app_file_size,app_stream)==
+              (usize)app_file_size&&!fclose(app_stream),
+              "read native mouse IRQ smoke app");
+        CHECK(!bob64_exec_parse(app_file,(usize)app_file_size,&app)&&
+              app.AbiVersion==BOB64_APP_ABI_VERSION&&app.EntryOffset>0&&
+              app.MemorySize>=app.FileSize&&app.CodeSize>0&&
+              contains_bytes(app.Image,(usize)app.FileSize,
+                             "bob64 live mouse event passed",29),
+              "package the live mouse IRQ test as a valid B64E app");
+        free(app_file);
+    }
+
+    if(argc>=13) {
+        BOB64_EXEC_IMAGE app;
+        unsigned char *app_file;
+        long app_file_size;
+        FILE *app_stream=fopen(argv[12],"rb");
+        CHECK(app_stream,"open native windowed launcher B64E application");
+        CHECK(!fseek(app_stream,0,SEEK_END)&&(app_file_size=ftell(app_stream))>0&&
+              !fseek(app_stream,0,SEEK_SET),"measure native windowed launcher");
+        app_file=(unsigned char *)malloc((usize)app_file_size);
+        CHECK(app_file,"allocate native windowed launcher buffer");
+        CHECK(fread(app_file,1,(usize)app_file_size,app_stream)==
+              (usize)app_file_size&&!fclose(app_stream),
+              "read native windowed launcher");
+        CHECK(!bob64_exec_parse(app_file,(usize)app_file_size,&app)&&
+              app.AbiVersion==BOB64_APP_ABI_VERSION&&app.EntryOffset>0&&
+              app.MemorySize>=app.FileSize&&app.CodeSize>0&&
+              contains_bytes(app.Image,(usize)app.FileSize,
+                             "APPLICATION LAUNCHER",20)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"RUN APP",7)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"CLOSE",5)&&
+              contains_bytes(app.Image,(usize)app.FileSize,
+                             "NO APPS INSTALLED",17)&&
+              contains_bytes(app.Image,(usize)app.FileSize,"bob!",4),
+              "package the standalone native 64-bit application launcher");
         free(app_file);
     }
 

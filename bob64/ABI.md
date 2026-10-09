@@ -1,4 +1,4 @@
-# bob64 application ABI v1 / syscall ABI v10
+# bob64 application ABI v1 / syscall ABI v12
 
 The kernel and first native applications use the Microsoft x64 ABI, matching
 the x64 UEFI toolchain. `bob64/abi.h` is the source for the version and the
@@ -49,7 +49,7 @@ function is not supported: apps must use the exit system call.
 
 ## System calls
 
-System-call ABI v10 uses interrupt vector `0x80`. Put the service number in
+System-call ABI v12 uses interrupt vector `0x80`. Put the service number in
 `RAX`; a returning call writes its result to `RAX`. The available services are:
 
 | Number | Name | Argument | Result |
@@ -75,6 +75,7 @@ System-call ABI v10 uses interrupt vector `0x80`. Put the service number in
 | 18 | Seek handle | handle in `RCX`, nonnegative signed 64-bit absolute offset in `RDX` | new offset or negative error |
 | 19 | Close handle | handle in `RCX` | `0` or negative error |
 | 20 | Get timer ticks | ignored | 64-bit count of 100 Hz PIT ticks since kernel initialization |
+| 21 | Run application | name pointer in `RCX`, name length in `RDX`, writable signed 64-bit exit-status pointer in `R8`, argc in `RSI`, argv pointer-vector in `R9` | `0` after child exit, or negative error |
 
 The first kernel smoke app queries the ABI, prints `bob!` one character at a
 time, and exits through this path. Console and per-call file buffers are
@@ -86,7 +87,9 @@ belong to the active foreground app and are invalidated when it exits or the
 file is deleted. Reads and writes advance a per-handle 64-bit position; seek
 sets a nonnegative signed 64-bit absolute position. Append-mode writes target
 the current end of file. Reads can be short at EOF, writes past the end
-zero-fill the gap, and each transfer is bounded to 4096 bytes. File enumeration accepts
+zero-fill the gap, and each transfer is bounded to 4096 bytes. The app header also
+provides whole-file read/write helpers that loop over these bounded calls; the
+desktop editor uses a 16 KiB text limit across four transfers. File enumeration accepts
 capacity 1 through 32 and returns fixed 72-byte `BOB64_FILE_INFO` records
 containing a 64-byte zero-terminated name and a 64-bit size; if the complete
 directory does not fit, it returns `-28` without copying a partial result.
@@ -106,9 +109,15 @@ and five. `bob64_app_wait_event` blocks while the kernel polls PS/2 devices and
 copies the event to writable app memory.
 The current flat volatile filesystem stores arbitrary bytes, while names reject
 path separators and characters outside its documented safe set.
-`bob64/app.h` provides matching
-C wrappers. A CPU exception from active user code returns an error status to the
-kernel instead of halting the system. `bob64/window.h` provides a reusable
+`bob64/app.h` provides matching C wrappers, including `bob64_app_run` for
+synchronous child launches. Syscall 21 accepts at most 16 argv strings and
+4096 total bytes; `RSI` is argc and `R9` points to the caller-owned pointer
+vector. The kernel validates and copies every pointer and string before it
+starts the child. The caller supplies the full argv, including argv[0]. The child
+exit status is copied to a validated app-owned pointer, and parent syscall and
+window state is restored on return. User-entry state supports up to eight
+nested app entries. A CPU exception from active user code returns an error
+status to the kernel instead of halting the system. `bob64/window.h` provides a reusable
 app-owned window manager using 64-bit handles and pointers; it routes the
 versioned keyboard/mouse event records without kernel pointers. Syscalls 11-13
 create, destroy, and present kernel-owned windows for the foreground app. Each
