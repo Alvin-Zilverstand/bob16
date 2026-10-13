@@ -4229,6 +4229,12 @@ static int gui_widget_tests(void) {
     event.Buttons=0;event.X=30;event.Y=5;
     CHECK(!bob64_button_event(&rect,&state,&event)&&!state.Pressed,
           "cancel a button press released outside its bounds");
+    event.Buttons=BOB64_BUTTON_LEFT;
+    CHECK(!bob64_button_event(&rect,&state,&event)&&!state.Pressed,
+          "ignore a button press that starts outside its bounds");
+    event.Buttons=0;event.X=4;event.Y=5;
+    CHECK(!bob64_button_event(&rect,&state,&event)&&!state.Pressed,
+          "do not activate a button when an outside press is released inside");
     CHECK(bob64_button_draw(&graphics,&(BOB64_RECT){0,0,6,8},"X",&state)<0,
           "reject undersized GUI buttons");
     CHECK(bob64_button_draw(&graphics,
@@ -4273,6 +4279,22 @@ static int gui_widget_tests(void) {
     CHECK(bob64_menu_event(&menu_rect,menu_items,2,18,&menu_state,&event)==-2&&
           !menu_state.Open,
           "dismiss a popup menu with Escape");
+    menu_state=(BOB64_MENU_STATE){0,-1,1};
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_MOUSE_BUTTON;
+    event.Buttons=BOB64_BUTTON_LEFT;event.X=12;event.Y=8;
+    CHECK(bob64_menu_event(&menu_rect,menu_items,2,18,&menu_state,&event)==-1&&
+          menu_state.Pressed==0,
+          "arm the first popup row before dragging to another row");
+    event.Buttons=0;event.Y=26;
+    CHECK(bob64_menu_event(&menu_rect,menu_items,2,18,&menu_state,&event)==-1&&
+          menu_state.Open&&menu_state.Pressed==-1,
+          "cancel popup activation when release lands on a different row");
+    event.Buttons=BOB64_BUTTON_LEFT;event.X=12;event.Y=8;
+    bob64_menu_event(&menu_rect,menu_items,2,18,&menu_state,&event);
+    event.Buttons=0;event.X=100;event.Y=45;
+    CHECK(bob64_menu_event(&menu_rect,menu_items,2,18,&menu_state,&event)==-2&&
+          !menu_state.Open,
+          "dismiss a popup when a pressed action is released outside its bounds");
     menu_state=(BOB64_MENU_STATE){0,-1,1};
     menu_rect=(BOB64_RECT){0,-2147483647-1,1,0xffffffffu};
     event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_MOUSE_MOVE;
@@ -4335,6 +4357,28 @@ static int gui_widget_tests(void) {
     CHECK(!bob64_text_field_event(&field,&field_rect,&event)&&
           field.Length==15&&field.Scroll>0,
           "keep long text-field input visible and reject buffer overflow");
+    char backspace_text[8]="abc";
+    CHECK(!bob64_text_field_init(&field,backspace_text,sizeof(backspace_text)),
+          "initialize a text field for backspace and focus transitions");
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_MOUSE_BUTTON;
+    event.Buttons=BOB64_BUTTON_LEFT;event.X=field_rect.X+3+2*6;
+    event.Y=field_rect.Y+6;
+    bob64_text_field_event(&field,&field_rect,&event);
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_KEY_DOWN;
+    event.Key=BOB64_EVENT_KEY_EXTENDED|0x4b;
+    bob64_text_field_event(&field,&field_rect,&event);
+    event.Key=0;event.Character='\b';
+    CHECK(bob64_text_field_event(&field,&field_rect,&event)&&
+          !strcmp(backspace_text,"ac")&&field.Cursor==1,
+          "move the caret and backspace the character before it");
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_MOUSE_BUTTON;
+    event.Buttons=BOB64_BUTTON_LEFT;event.X=100;event.Y=100;
+    bob64_text_field_event(&field,&field_rect,&event);
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_KEY_DOWN;
+    event.Character='X';
+    CHECK(!bob64_text_field_event(&field,&field_rect,&event)&&
+          !field.Focused&&!strcmp(backspace_text,"ac"),
+          "stop text-field edits after a click moves focus outside");
     return 0;
 }
 

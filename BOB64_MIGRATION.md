@@ -764,6 +764,9 @@ the existing emulator/build outputs stay separate.
   windows, move exposure, and idle motion; the full QEMU/OVMF desktop regression
   passes. Further widget input combinations and additional USB classes remain
   to be ported and tested.
+  - [x] Host regressions verify a button ignores an outside press followed by
+    an inside release, and a popup cancels a drag released on another row or
+    dismisses when release occurs outside its bounds.
 - [x] Verify bob64 boots in x64 UEFI emulation and performs its own kernel
   initialization without executing 32-bit kernel or app code. The broader
   migration remains active: the resident C subset and USB/device support still
