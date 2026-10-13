@@ -10,7 +10,7 @@ typedef struct {
     u32 Length;
     u32 Cursor;
     u32 ScrollRow;
-    u8 Dirty;
+    u8 Dirty,ScrollLocked;
 } BOB64_EDITOR;
 
 static inline int bob64_editor_is_binary_text(const char *text,usize length) {
@@ -27,7 +27,7 @@ static inline void bob64_editor_init(BOB64_EDITOR *editor,const char *text,u32 l
     if(length>BOB64_EDITOR_CAPACITY)length=BOB64_EDITOR_CAPACITY;
     for(u32 i=0;i<length;i++)editor->Text[i]=text?text[i]:0;
     editor->Text[length]=0;editor->Length=length;editor->Cursor=length;
-    editor->ScrollRow=0;editor->Dirty=0;
+    editor->ScrollRow=0;editor->Dirty=0;editor->ScrollLocked=0;
 }
 
 static inline int bob64_editor_insert(BOB64_EDITOR *editor,char character) {
@@ -97,8 +97,36 @@ static inline void bob64_editor_visual_position(const BOB64_EDITOR *editor,
     *row_out=row;*column_out=column;
 }
 
+static inline u32 bob64_editor_visual_rows(const BOB64_EDITOR *editor,
+                                           u32 columns) {
+    u32 row=0,column=0;
+    if(!editor)return 0;
+    if(!columns)columns=1;
+    for(u32 i=0;i<editor->Length;i++) {
+        if(column>=columns&&editor->Text[i]!='\n') {row++;column=0;}
+        if(editor->Text[i]=='\n') {row++;column=0;}
+        else column++;
+    }
+    if(column>=columns)row++;
+    return row+1;
+}
+
+/* Positive wheel motion scrolls toward the start; negative toward the end. */
+static inline void bob64_editor_scroll(BOB64_EDITOR *editor,s32 wheel,
+        u32 columns,u32 visible_rows) {
+    if(!editor||!wheel||!visible_rows)return;
+    u32 total_rows=bob64_editor_visual_rows(editor,columns);
+    u32 maximum_scroll=total_rows>visible_rows?
+                       total_rows-visible_rows:0;
+    u32 old_scroll=editor->ScrollRow;
+    if(wheel>0&&editor->ScrollRow)editor->ScrollRow--;
+    else if(wheel<0&&editor->ScrollRow<maximum_scroll)editor->ScrollRow++;
+    if(editor->ScrollRow!=old_scroll)editor->ScrollLocked=1;
+}
+
 static inline void bob64_editor_handle_key(BOB64_EDITOR *editor,const BOB64_EVENT *event) {
     if(!editor||!event||event->Type!=BOB64_EVENT_KEY_DOWN)return;
+    editor->ScrollLocked=0;
     if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x4b))bob64_editor_move(editor,-1);
     else if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x4d))bob64_editor_move(editor,1);
     else if(event->Key==(BOB64_EVENT_KEY_EXTENDED|0x48))bob64_editor_move_vertical(editor,-1);

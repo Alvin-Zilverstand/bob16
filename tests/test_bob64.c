@@ -4560,11 +4560,33 @@ static int editor_tests(void) {
     bob64_editor_init(&editor,"abcdefghij",10);
     u32 row,column;
     bob64_editor_visual_position(&editor,4,&row,&column);
-    CHECK(row==2&&column==2,"track the visual row and column across wrapped lines");
+    CHECK(row==2&&column==2&&bob64_editor_visual_rows(&editor,4)==3,
+          "count wrapped editor rows consistently with caret positioning");
     bob64_editor_init(&editor,"abcd\nx",6);
     editor.Cursor=5;
     bob64_editor_visual_position(&editor,4,&row,&column);
     CHECK(row==1&&column==0,"do not double-wrap a newline after a full visual line");
+    static const char scroll_text[]="one\ntwo\nthree\nfour";
+    bob64_editor_init(&editor,scroll_text,sizeof(scroll_text)-1);
+    CHECK(bob64_editor_visual_rows(&editor,80)==4,
+          "count logical editor rows for bounded viewport scrolling");
+    bob64_editor_scroll(&editor,-1,80,2);
+    bob64_editor_scroll(&editor,-1,80,2);
+    bob64_editor_scroll(&editor,-1,80,2);
+    CHECK(editor.ScrollRow==2&&editor.ScrollLocked&&
+          editor.Cursor==sizeof(scroll_text)-1,
+          "scroll down without moving the caret and clamp at the final page");
+    bob64_editor_scroll(&editor,1,80,2);
+    bob64_editor_scroll(&editor,1,80,2);
+    bob64_editor_scroll(&editor,1,80,2);
+    CHECK(!editor.ScrollRow&&editor.ScrollLocked,
+          "scroll up and clamp the editor viewport at the first page");
+    bob64_editor_scroll(&editor,-1,80,2);
+    event=(BOB64_EVENT){0};event.Type=BOB64_EVENT_KEY_DOWN;
+    event.Key=BOB64_EVENT_KEY_EXTENDED|0x4b;
+    bob64_editor_handle_key(&editor,&event);
+    CHECK(!editor.ScrollLocked&&editor.Cursor==sizeof(scroll_text)-2,
+          "resume caret-follow scrolling after keyboard navigation");
     bob64_editor_init(&editor,0,0);
     for(u32 i=0;i<BOB64_EDITOR_CAPACITY;i++)
         if(bob64_editor_insert(&editor,'b'))return -1;

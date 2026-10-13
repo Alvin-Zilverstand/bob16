@@ -255,7 +255,9 @@ cancel. Press `M` from the Files window to open a popup menu with Open, Run,
 Delete, and Close actions; use Up/Down and Enter or click an item, and press
 Escape or click outside to dismiss it. Type into the editor, use arrow keys to move, Home/End to jump to the current line edges, Backspace to delete,
 click in the text to place the cursor, Enter for a new line, and Ctrl+S to save.
-The editor scrolls to keep the caret visible. Click the **NAME** field above
+The editor scrolls to keep the caret visible during keyboard editing; use the
+mouse wheel over the text to scroll without moving the caret. Typing, navigation,
+or a click brings the caret back into view. Click the **NAME** field above
 the editor to place its caret and edit the destination; Enter or Tab leaves the
 field, and Ctrl+S saves the document under that name. Names accept letters,
 digits, period, underscore or hyphen; executable names are protected. Escape

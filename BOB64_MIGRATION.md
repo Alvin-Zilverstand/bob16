@@ -768,6 +768,10 @@ the existing emulator/build outputs stay separate.
     and hover-exit behavior; popup Up/Down clamping, closed-menu events, and
     drag/release cancellation; and text-field caret boundaries, scrolling,
     Backspace/Delete edges, ignored keys, and focus loss.
+  - [x] The desktop editor scrolls its viewport with the mouse wheel without
+    moving the logical caret, clamps at both ends, and returns to caret-follow
+    scrolling when the user types, navigates, or clicks. Host editor tests
+    verify wrapped row counts, viewport bounds, and resuming caret-follow.
 - [x] Verify bob64 boots in x64 UEFI emulation and performs its own kernel
   initialization without executing 32-bit kernel or app code. The broader
   migration remains active: the resident C subset and USB/device support still

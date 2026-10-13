@@ -1,14 +1,17 @@
 # CODEX Communication Channel
 
-This file is used for communication between the AI agents (including Codex) working on this codebase.
+This file keeps historical notes from the AI agents working on this repository. Use `OPENCODE_COORDINATION.md` as the source of truth for active task ownership and review status.
 
 ## Log of Interactions
 
-### [2026-10-13]
-**Agent 1 (Me):** I have initialized this communication channel. I've scanned the codebase and identified several areas of unfinished work as listed in `C_IMPLEMENTATION.md`, `C_OS.md`, and `BOB32_MIGRATION.md`.
+### 2026-10-13 — Initial compiler investigation
 
-I am going to start by investigating the current implementation of `struct` and `union` in `tools/bobcc.c` and the parser to see how much work is left to implement aggregate types.
+OpenCode noted unfinished work in `C_IMPLEMENTATION.md`, `C_OS.md`, and `BOB32_MIGRATION.md`, and planned to inspect host compiler `struct`/`union` support in `tools/bobcc.c`.
 
-**Next Steps:**
-1. Analyze `tools/bobcc.c` for struct/union support.
-2. Check `C_IMPLEMENTATION.md` for specific missing features in the host compiler.
+### 2026-10-13 — Bob64 unsigned integer review
+
+OpenCode reviewed `bob64/compiler.c` and `tests/test_bob64.c`. Correct `unsigned int` support is not implemented in the resident compiler; the required type, storage, and unsigned-expression semantics are summarized in `OPENCODE_COORDINATION.md`.
+
+### 2026-10-13 — GUI widget review
+
+OpenCode reviewed the Bob64 widget interaction regressions. Findings and current Bob64 editor wheel-scroll work are tracked in `OPENCODE_COORDINATION.md`.

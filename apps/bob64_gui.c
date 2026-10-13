@@ -386,6 +386,13 @@ static void gui_scroll_application_selection(s32 wheel) {
     gui_reveal_selected_application();
 }
 
+static void gui_scroll_editor(s32 wheel) {
+    BOB64_WINDOW *window=bob64_wm_find(&manager,editor_window);
+    if(!window||window->Width<=24||window->Height<=76)return;
+    bob64_editor_scroll(&editor,wheel,(window->Width-24)/6,
+                        (window->Height-76)/10);
+}
+
 static int gui_name_equal(const char *left,const char *right) {
     while(*left&&*right&&*left==*right){left++;right++;}
     return !*left&&!*right;
@@ -564,9 +571,11 @@ static void gui_draw_window(const BOB64_WINDOW *window,int focused) {
         if(columns==0)columns=1;
         bob64_editor_visual_position(&editor,columns,&cursor_row,&cursor_column);
         (void)cursor_column;
-        if(cursor_row<editor.ScrollRow)editor.ScrollRow=cursor_row;
-        else if(rows&&cursor_row>=editor.ScrollRow+rows)
-            editor.ScrollRow=cursor_row-rows+1;
+        if(!editor.ScrollLocked) {
+            if(cursor_row<editor.ScrollRow)editor.ScrollRow=cursor_row;
+            else if(rows&&cursor_row>=editor.ScrollRow+rows)
+                editor.ScrollRow=cursor_row-rows+1;
+        }
         BOB64_RECT filename_rect={40,28,window->Width-48,16};
         bob64_gfx_text(graphics,window->X+8,window->Y+32,"NAME",
                        0x009eb3c7u,1);
@@ -787,6 +796,7 @@ static void gui_editor_place_cursor(u32 target_row,u32 target_column,u32 columns
     u32 row=0,column=0;
     if(!columns)columns=1;
     target_row+=editor.ScrollRow;
+    editor.ScrollLocked=0;
     for(u32 i=0;i<=editor.Length;i++) {
         if(column>=columns&&(i==editor.Length||editor.Text[i]!='\n')) {
             row++;column=0;
@@ -985,10 +995,16 @@ s64 bob64_app_main(const BOB64_APP_STARTUP *startup) {
             gui_update_button_hover(help_window,event.ScreenX,event.ScreenY);
         }
         if(event.Type==BOB64_EVENT_MOUSE_WHEEL) {
-            if(manager.Focused==files_window&&routed.Y>=70)
+            if(event_target==(s64)files_window&&routed.Y>=70)
                 gui_scroll_file_selection(event.Wheel);
-            else if(manager.Focused==applications_window&&routed.Y>=72)
+            else if(event_target==(s64)applications_window&&routed.Y>=72)
                 gui_scroll_application_selection(event.Wheel);
+            else if(event_target==(s64)editor_window&&routed.Y>=46) {
+                BOB64_WINDOW *window=bob64_wm_find(&manager,editor_window);
+                if(window&&window->Height>22u&&
+                   (u32)routed.Y<window->Height-22u)
+                    gui_scroll_editor(event.Wheel);
+            }
         }
         if(event.Type==BOB64_EVENT_MOUSE_BUTTON&&
            event_target==(s64)files_window) {
