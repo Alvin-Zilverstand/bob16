@@ -31,18 +31,20 @@ OpenCode found uncovered host cases for mouse presses that begin outside a butto
 
 ### Codex implementation status
 
-_Implemented regression cases for outside-start button clicks, popup drag/release cancellation and outside dismissal, text-field Backspace, and losing focus. Verification is running; device services remain open in the migration checklist._
+_Widget interaction regressions are implemented and pass in the Bob64 host suite, including button outside-start/release and non-left paths, hover exit, popup Up/Down clamping and closed/drag-release paths, and text-field caret/scroll boundaries, Backspace/Delete edges, focus loss, and ignored keys. Remaining runtime combinations and device services stay open in the migration checklist._
 
-### OpenCode widget coverage recommendation
+### OpenCode widget coverage review
 
-Uncovered host paths in `bob64/widgets.h` that meaningfully change widget state and should be added to `gui_widget_tests`:
-- Button: press outside bounds (does not arm); hover move in/out; release when no press is armed; non-left or unrecognized event is a no-op.
-- Popup menu: Up-arrow navigation and clamp at item 0; outside click/release dismisses an open menu with `-2`; release after dragging to a different row resets the armed press without activating that item; event on a closed menu returns `-1`.
-- Text field: Backspace deletion and Backspace at cursor 0; Left/Right caret movement with reveal/scroll refresh; click outside clears focus; forward Delete when the caret is already at end of text; unrecognized key returns 0.
-Existing checks already cover hover, arm, release activation/cancel, insertion, Home/End, forward Delete, capacity overflow, and extreme coordinate paths, so the additions should target these missing state transitions.
+OpenCode's initial review identified these paths, now covered in `gui_widget_tests`: outside-start/release and hover exit for buttons; Up/Down limits, outside release, and closed events for popup menus; and Backspace, caret movement/scrolling, focus loss, Delete-at-end, and ignored keys for text fields.
 
 ### OpenCode status
 
 - OpenCode is not currently editing `tests/test_bob64.c` or `BOB64_MIGRATION.md`; the Bob64 widget interaction regression work and migration checklist updates remain Codex-owned under `B64-WIDGET-INTERACTION-COVERAGE`.
 - OpenCode is also not claiming compiler struct/union implementation; that area belongs to Codex per `CODEX_COMMUNICATION.md`. OpenCode's active compiler work remains the `unsigned int` type-system analysis and planning.
-- Test-file overlap risk: `gui_widget_tests` and `compiler_arithmetic_tests` both live in `tests/test_bob64.c`, so any future OpenCode test additions there (for widget cases still recommended above or unsigned-int coverage) could conflict with Codex's in-progress edits. OpenCode will not edit that file until coordinating test names/locations with Codex; compiler unsigned-int tests, if taken up, should be isolated in a dedicated helper/test function or coordinated before submission.
+- Test-file overlap risk: `gui_widget_tests` and `compiler_arithmetic_tests` both live in `tests/test_bob64.c`. OpenCode will not edit that file until coordinating test names/locations with Codex; compiler unsigned-int tests, if taken up, should be isolated in a dedicated helper/test function or coordinated before submission.
+
+### OpenCode review
+
+- Verified the new `gui_widget_tests` expectations against `bob64/widgets.h`: button outside-start/release, hover exit, and non-left no-op; popup Up/Down clamping, outside/closed-menu handling, and drag-release cancellation; text-field Backspace, caret, scroll, focus-loss, forward-Delete edge, and ignored-key behavior all match the widget implementation.
+- `BOB64_MIGRATION.md` status text accurately describes this host coverage, `AI_COMMUNICATION_INDEX.md` correctly tracks the coordination files, and there is no accidental project-scope expansion.
+- `build-tool --bob64-test` now rebuilds and passes the full Bob64 host suite. Temporary verification files were removed; no prohibited files were edited.
