@@ -6,6 +6,7 @@
 #include "../bob64/interrupts.h"
 #include "../bob64/bootstrap.h"
 #include "../bob64/console.h"
+#include "../bob64/font8x16.h"
 #include "../bob64/heap.h"
 #include "../bob64/keyboard.h"
 #include "../bob64/mouse.h"
@@ -2625,24 +2626,96 @@ static int memory_tests(void) {
     return 0;
 }
 
+static int console_cell_has_ink(const u32 *pixels,u32 stride,u32 x,u32 y,
+                                u32 foreground) {
+    for(u32 row=0;row<FONT_HEIGHT;row++)for(u32 column=0;column<FONT_WIDTH;column++)
+        if(pixels[(y+row)*stride+x+column]==foreground)return 1;
+    return 0;
+}
+
+static int console_cells_differ(const u32 *pixels,u32 stride,u32 first_x,
+                                u32 second_x,u32 y) {
+    for(u32 row=0;row<FONT_HEIGHT;row++)for(u32 column=0;column<FONT_WIDTH;column++)
+        if(pixels[(y+row)*stride+first_x+column]!=
+           pixels[(y+row)*stride+second_x+column])return 1;
+    return 0;
+}
+
+static int console_cell_matches_glyph(const u32 *pixels,u32 stride,u32 x,u32 y,
+        u8 character,u32 foreground,u32 background) {
+    u32 glyph=(u32)(character-' ');
+    for(u32 row=0;row<FONT_HEIGHT;row++)for(u32 column=0;column<FONT_WIDTH;column++) {
+        u32 expected=bob64_font_sample(&bob64_font8x16,glyph,column,row)?
+                     foreground:background;
+        if(pixels[(y+row)*stride+x+column]!=expected)return 0;
+    }
+    return 1;
+}
+
 static int console_tests(void) {
-    u32 pixels[16*16];
-    CHECK(!bob64_framebuffer_init((u64)(uintptr_t)pixels,sizeof(pixels),16,16,16,0)&&
-          bob64_framebuffer_available(),"initialize a valid GOP framebuffer");
-    CHECK(pixels[0]==0x001c120cu&&pixels[5]==0x001c120cu,
-          "clear framebuffer and encode GOP RGB-reserved pixels");
-    bob64_framebuffer_write("B");
-    CHECK(pixels[0]==0x00f8eee4u&&pixels[5]==0x001c120cu,
-          "render a 5x7 glyph into the framebuffer");
-    CHECK(!bob64_framebuffer_init((u64)(uintptr_t)pixels,sizeof(pixels),16,16,16,1)&&
-          pixels[0]==0x000c121cu,
+    static u32 pixels[1024*20];
+    static u32 layout_pixels[18*36];
+    char printable[96];
+    u32 foreground=0x00f8eee4u,background=0x001c120cu;
+    CHECK(FONT_WIDTH==8&&FONT_HEIGHT==16&&LINE_HEIGHT==18&&CHAR_SPACING==1&&
+          FONT_CELL_WIDTH==9,
+          "define 8x16 terminal glyphs on consistent 9x18 text cells");
+    CHECK(!bob64_framebuffer_init((u64)(uintptr_t)pixels,sizeof(pixels),1024,20,
+          1024,0)&&bob64_framebuffer_available(),
+          "initialize a GOP framebuffer for a full printable ASCII row");
+    CHECK(pixels[0]==background&&pixels[1023]==background,
+          "clear the framebuffer and encode GOP RGB-reserved pixels");
+    for(u32 i=0;i<95;i++)printable[i]=(char)(' '+i);
+    printable[95]=0;bob64_framebuffer_write(printable);
+    int all_glyphs_present=1;
+    for(u32 i=1;i<95;i++)
+        if(!console_cell_has_ink(pixels,1024,(i%113)*FONT_CELL_WIDTH,
+             (i/113)*LINE_HEIGHT+(LINE_HEIGHT-FONT_HEIGHT)/2,foreground)) {
+            all_glyphs_present=0;break;
+        }
+    CHECK(all_glyphs_present,
+          "render every printable ASCII glyph with the 8x16 bitmap font");
+    CHECK(!bob64_framebuffer_init((u64)(uintptr_t)pixels,sizeof(pixels),1024,20,
+          1024,0),"reset the framebuffer before glyph distinction checks");
+    bob64_framebuffer_write("0O1lI5S8B");
+    CHECK(console_cells_differ(pixels,1024,0,9,1)&&
+          console_cells_differ(pixels,1024,18,27,1)&&
+          console_cells_differ(pixels,1024,27,36,1)&&
+          console_cells_differ(pixels,1024,45,54,1)&&
+          console_cells_differ(pixels,1024,63,72,1),
+          "distinguish 0/O, 1/l/I, 5/S, and 8/B glyphs");
+    CHECK(!bob64_framebuffer_init((u64)(uintptr_t)layout_pixels,
+          sizeof(layout_pixels),18,36,18,0),
+          "initialize a two-column, two-row terminal layout");
+    bob64_framebuffer_write("ABC");
+    CHECK(console_cell_matches_glyph(layout_pixels,18,0,1,'A',foreground,background)&&
+          console_cell_matches_glyph(layout_pixels,18,9,1,'B',foreground,background)&&
+          console_cell_matches_glyph(layout_pixels,18,0,19,'C',foreground,background)&&
+          layout_pixels[34*18+9]==0x00e8c294u,
+          "wrap at font-derived columns and align the shell cursor to its cell");
+    bob64_framebuffer_write("\nD");
+    CHECK(console_cell_matches_glyph(layout_pixels,18,0,1,'C',foreground,background)&&
+          console_cell_matches_glyph(layout_pixels,18,0,19,'D',foreground,background),
+          "scroll by one complete font-derived line without clipping glyphs");
+    bob64_framebuffer_write("\bE");
+    CHECK(console_cell_matches_glyph(layout_pixels,18,0,19,'E',foreground,background)&&
+          !console_cell_matches_glyph(layout_pixels,18,0,19,'D',foreground,background),
+          "erase and replace the previous glyph across wrapped shell output");
+    bob64_framebuffer_write("\rZ");
+    CHECK(console_cell_matches_glyph(layout_pixels,18,0,19,'Z',foreground,background),
+          "return carriage to the first cell without disturbing line alignment");
+    CHECK(!bob64_framebuffer_init((u64)(uintptr_t)pixels,sizeof(pixels),1024,20,
+          1024,1)&&pixels[0]==0x000c121cu,
           "clear framebuffer in GOP BGR-reserved pixel format");
     bob64_framebuffer_write("B");
-    CHECK(pixels[0]==0x00e4eef8u,"render BGR-reserved foreground pixels");
-    CHECK(bob64_framebuffer_init((u64)(uintptr_t)pixels,sizeof(pixels)-1,16,16,16,1)<0&&
+    CHECK(console_cell_has_ink(pixels,1024,0,1,0x00e4eef8u),
+          "render glyph pixels with the GOP BGR channel order");
+    CHECK(bob64_framebuffer_init((u64)(uintptr_t)pixels,sizeof(pixels)-1,
+          1024,20,1024,1)<0&&
           bob64_framebuffer_init((u64)(uintptr_t)pixels,sizeof(pixels),16,16,16,3)<0&&
-          bob64_framebuffer_init((u64)(uintptr_t)pixels,sizeof(pixels),4,16,16,0)<0,
-          "reject undersized, blit-only, and too-small framebuffers");
+          bob64_framebuffer_init((u64)(uintptr_t)pixels,sizeof(pixels),0,16,16,0)<0&&
+          bob64_framebuffer_init((u64)(uintptr_t)pixels,sizeof(pixels),16,0,16,0)<0,
+          "reject undersized, unsupported, and zero-dimension framebuffers");
     return 0;
 }
 
@@ -4567,8 +4640,20 @@ static int shell_tests(void) {
           strstr(output.Text,"restore  restore persistent or RAM checkpoint")!=0&&
           strstr(output.Text,"cc SOURCE [OUTPUT]")!=0&&
           strstr(output.Text,"desktop.b64e [FILE]")!=0&&
+          strstr(output.Text,"fonttest show the printable ASCII font sample")!=0&&
           strstr(output.Text,"Up/Down command history")!=0,
           "help lists available commands");
+    shell_test_command(&shell,"fonttest");
+    CHECK(output.ClearCount==2&&
+          strstr(output.Text,"ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n")!=0&&
+          strstr(output.Text,"abcdefghijklmnopqrstuvwxyz\r\n")!=0&&
+          strstr(output.Text,"0123456789\r\n\r\n")!=0&&
+          strstr(output.Text,"0 O\r\n1 l I\r\n5 S\r\n8 B\r\n\r\n")!=0&&
+          strstr(output.Text,"[] {} () <> / \\ | _ - + = : ; , . ! ?\r\n")!=0&&
+          strstr(output.Text,"bob64 kernel shell\r\n")!=0&&
+          strstr(output.Text,"The quick brown fox jumps over the lazy dog.\r\n")!=0&&
+          strstr(output.Text,"bob!\r\n")!=0,
+          "fonttest clears the display and prints the full readability sample");
     bob64_shell_set_runner(&shell,shell_test_run);
     bob64_shell_set_compiler(&shell,shell_test_compile);
     shell_test_command(&shell,"cc bob.c demo.b64e");

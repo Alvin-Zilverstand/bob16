@@ -28,6 +28,17 @@ handoff has been booted under QEMU with x64 OVMF firmware; the kernel reaches it
 shell after switching to its own page tables, and the GOP framebuffer has been
 visually checked at 1280x800.
 
+The kernel console and GUI text helper share `bob64/font.h`'s bitmap-glyph
+renderer. The shell uses a clear 8x16 printable-ASCII font from
+`bob64/font8x16.h` on 9x18 cells (`FONT_WIDTH`, `FONT_HEIGHT`, `LINE_HEIGHT`,
+and `CHAR_SPACING`); lowercase and command punctuation have their own glyphs.
+The compact 5x7 font remains available for existing small GUI labels. Run
+`fonttest` in the shell to clear the display and show the alphabet, digits,
+commonly confused characters, punctuation, and a pangram. Host checks cover
+every printable glyph, cell wrapping, backspace, cursor position and scrolling;
+the QEMU/OVMF regression checks the full font sample on the live GOP display.
+The 8x16 bitmap's MIT license is included in `bob64/FONT_LICENSE.md`.
+
 Kernel entry also adopts the seeded physical-page allocator and maps pages into
 a small coalescing heap in the high canonical address range. Its boot smoke test
 checks aligned allocation, zeroing, multi-page growth, writes, and freeing. The

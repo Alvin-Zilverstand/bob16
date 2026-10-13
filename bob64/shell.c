@@ -90,6 +90,7 @@ static void show_font_test(BOB64_SHELL *shell) {
     output(shell,"[] {} () <> / \\ | _ - + = : ; , . ! ?\r\n");
     output(shell,"bob64 kernel shell\r\n");
     output(shell,"The quick brown fox jumps over the lazy dog.\r\n");
+    output(shell,"bob!\r\n");
 }
 
 static void compile_file_command(BOB64_SHELL *shell,char *arguments) {

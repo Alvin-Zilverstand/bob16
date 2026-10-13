@@ -149,7 +149,7 @@ static inline void bob64_gfx_text(BOB64_GFX *graphics,s32 x,s32 y,
     if(!graphics||!text||!scale)return;
     while(*text) {
         u32 glyph=bob64_gfx_glyph((u8)*text++);
-        bob64_font_draw_glyph(&bob64_font5x7,glyph,cursor_x,origin_y,scale,
+        bob64_font_draw_glyph(&bob64_font_compact5x7,glyph,cursor_x,origin_y,scale,
                               bob64_gfx_font_plot_pixel,&context,color);
         cursor_x+=(s64)6*scale;
     }

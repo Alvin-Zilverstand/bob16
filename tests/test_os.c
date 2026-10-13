@@ -1297,10 +1297,12 @@ static void persistence(void) {
     storage_path("");
 }
 static void shell_editing(void) {
-    char *output=shell("echo bob!\n\033[A\n\033[A\033[Becho bob!\ncle\t\nrea\t bo\t\nwrite backup bob!\nread ba\t\nread b\t\necho bb!\033[D\033[Do\nxxecho bob!\033[H\033[3~\033[3~\nwrong\025echo bob!\nabc\001\033[3~\033[3~\033[3~echo bob!\005\nhalt\n");
+    char *output=shell("echo bob!\n\033[A\n\033[A\033[Becho bob!\ncle\t\nrea\t bo\t\nwrite backup bob!\nwrite note bo\t\nread note\necho ba\t\nread ba\t\nread b\t\necho bb!\033[D\033[Do\nxxecho bob!\033[H\033[3~\033[3~\nwrong\025echo bob!\nabc\001\033[3~\033[3~\033[3~echo bob!\005\nhalt\n");
     contains(output,"\033[2J\033[H");
     contains(output,"int main(void) { println(\"bob!\"); return 0; }");
     contains(output,"File not found."); /* read b is ambiguous: no completion */
+    contains(output,"bob> ba\n"); /* echo arguments are never file-completed */
+    contains(output,"bob> bo\n"); /* write text is not filename-completed */
     int markers=0;for(char *p=output;(p=strstr(p,"bob> bob!\n"))!=NULL;p+=10)markers++;
     check(markers==8,"history, insertion, delete, home/end and clear line");free(output);
     /* History keeps four commands and does not mutate recalled entries. */

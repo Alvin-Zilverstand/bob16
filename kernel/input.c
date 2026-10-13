@@ -51,6 +51,9 @@ void input_complete(void) {
     int start; int count; int matches; int i; int length; char *words; char candidate[24]; char selected[24];
     start = input_cursor;
     while (start && command_line[start - 1] != ' ') start--;
+    if (input_cursor == input_length && input_length &&
+        command_line[input_length - 1] == ' ')
+        start = input_cursor;
     count = input_cursor - start; matches = 0;
     if (input_cursor != input_length) return;
     if (!start) {
@@ -69,6 +72,35 @@ void input_complete(void) {
             }
         }
     } else {
+        int command_end = 0, command, word_start = 0, word_end;
+        int argument = 1, in_word = 0;
+        char *file_commands = " read write edit load run "
+#ifdef BOBC_WIDE
+                              "run32 "
+#endif
+                              "cc go copy rename delete";
+        while (command_end < input_length && command_line[command_end] != ' ')
+            command_end++;
+        command = 0;
+        while (file_commands[word_start]) {
+            while (file_commands[word_start] == ' ') word_start++;
+            word_end = word_start;
+            while (file_commands[word_end] && file_commands[word_end] != ' ')
+                word_end++;
+            if (word_end - word_start == command_end) {
+                for (i = 0; i < command_end &&
+                     command_line[i] == file_commands[word_start + i]; i++);
+                if (i == command_end) command = 1;
+            }
+            word_start = word_end;
+        }
+        for (i = command_end; i < start; i++) {
+            if (command_line[i] == ' ') in_word = 0;
+            else if (!in_word) { argument++; in_word = 1; }
+        }
+        if (!command || (argument > 1 &&
+            !(command_end == 2 && command_line[0] == 'c' &&
+              command_line[1] == 'c' && argument == 2))) return;
         for (i = 0; i < FILE_COUNT; i++) {
             if (file_used[i] && input_matches(file_name(i), start, count)) {
                 matches++; memcpy(selected, file_name(i), strlen(file_name(i)) + 1);

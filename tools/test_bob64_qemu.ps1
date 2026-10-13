@@ -273,6 +273,76 @@ function Assert-FramebufferRendered([string]$path) {
     Write-Output "  framebuffer: $width x $height, $($colors.Count) sampled colors"
 }
 
+function Assert-FontTestFramebuffer([string]$path) {
+    $qemuPath = $path.Replace('\', '/')
+    [void](Send-MonitorCommand "screendump $qemuPath" -Capture)
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw 'QEMU did not produce the font-test framebuffer screenshot.'
+    }
+    $bytes = [IO.File]::ReadAllBytes($path)
+    $headerLength = [Math]::Min($bytes.Length,128)
+    $headerText = [Text.Encoding]::ASCII.GetString($bytes,0,$headerLength)
+    $header = [regex]::Match($headerText,'^P6\s+(\d+)\s+(\d+)\s+(\d+)\s')
+    if (-not $header.Success) { throw 'Font-test screenshot has an invalid PPM header.' }
+    $width = [int]$header.Groups[1].Value
+    $height = [int]$header.Groups[2].Value
+    $dataOffset = $header.Length
+    if ($width -lt 640 -or $height -lt 240 -or
+        $bytes.Length-$dataOffset -ne $width*$height*3) {
+        throw "Font-test screenshot has invalid dimensions or pixel data ($width x $height)."
+    }
+    $lines = @(
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+        'abcdefghijklmnopqrstuvwxyz',
+        '0123456789',
+        '',
+        '0 O',
+        '1 l I',
+        '5 S',
+        '8 B',
+        '',
+        '[] {} () <> / \ | _ - + = : ; , . ! ?',
+        'bob64 kernel shell',
+        'The quick brown fox jumps over the lazy dog.',
+        'bob!'
+    )
+    $background = @(12,18,28)
+    for ($row=0; $row -lt $lines.Count; $row++) {
+        $line = $lines[$row]
+        for ($column=0; $column -lt $line.Length; $column++) {
+            if ([char]::IsWhiteSpace($line[$column])) { continue }
+            $foundInk = $false
+            $left = $column*9
+            $top = $row*18+1
+            for ($y=$top; $y -lt $top+16 -and -not $foundInk; $y++) {
+                for ($x=$left; $x -lt $left+8; $x++) {
+                    $offset = $dataOffset+($y*$width+$x)*3
+                    if ($bytes[$offset] -ne $background[0] -or
+                        $bytes[$offset+1] -ne $background[1] -or
+                        $bytes[$offset+2] -ne $background[2]) {
+                        $foundInk = $true
+                        break
+                    }
+                }
+            }
+            if (-not $foundInk) {
+                throw "Font-test glyph '$($line[$column])' has no visible pixels at row $row, column $column."
+            }
+        }
+        if ($row -lt 12) {
+            $spacingY = $row*18+17
+            for ($x=0; $x -lt $width; $x++) {
+                $offset=$dataOffset+($spacingY*$width+$x)*3
+                if ($bytes[$offset] -ne $background[0] -or
+                    $bytes[$offset+1] -ne $background[1] -or
+                    $bytes[$offset+2] -ne $background[2]) {
+                    throw "Font-test line spacing is not clear after row $row."
+                }
+            }
+        }
+    }
+}
+
 $machine = 'q35'
 if ($ProbeOnly) { $machine = 'q35,i8042=off' }
 $xhciDevice = 'qemu-xhci,id=usb-controller'
@@ -810,6 +880,7 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds($overallTimeout)
     $serialText = ''
     $mouseSmokeStarted = $false
+    $fontTestStarted = $false
     $graphicsSmokeStarted = $false
     $nativeLauncherSmokeStarted = $false
     $compilerSmokeStarted = $false
@@ -829,7 +900,25 @@ try {
                     break
                 }
             }
-            if ($allPresent -and -not $mouseSmokeStarted) {
+            if ($allPresent -and -not $fontTestStarted) {
+                Send-GuestText 'fonttest'
+                $fontTestDeadline = [DateTime]::UtcNow.AddSeconds(10)
+                do {
+                    Start-Sleep -Milliseconds 100
+                    $serialText = [string](Get-Content -LiteralPath $serialPath -Raw)
+                } while ([DateTime]::UtcNow -lt $fontTestDeadline -and
+                         -not $serialText.Contains(
+                             'The quick brown fox jumps over the lazy dog.'))
+                if (-not $serialText.Contains(
+                        'The quick brown fox jumps over the lazy dog.')) {
+                    throw "The shell font-test screen did not print its final sample line.`n$serialText"
+                }
+                Start-Sleep -Milliseconds 200
+                Assert-FontTestFramebuffer $framebufferPath
+                Write-Output '  shell font test: printable ASCII glyphs and 9x18 line spacing passed on the GOP framebuffer'
+                $fontTestStarted = $true
+            }
+            if ($allPresent -and $fontTestStarted -and -not $mouseSmokeStarted) {
                 $shellMarkerCountBeforeMouse = [regex]::Matches($serialText,
                     [regex]::Escape($shellPromptMarker)).Count
                 $exitMarkerCountBeforeMouse = [regex]::Matches($serialText,

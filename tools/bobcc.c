@@ -83,7 +83,7 @@ static int decay_type(int type);
 static int global_address(Node *n,const char **name,int *offset);
 static void binary_typed(int op,int left,int right);
 static Node *top, **top_tail=&top;
-static uint32_t code[65536];
+static uint32_t code[131072];
 static int ncode, legacy, wide, serial, return_label;
 static uint32_t origin=0x300;
 static int wide_app;
@@ -748,7 +748,7 @@ static void parse(void) {
     }
     parsing_types=0;
 }
-static void emit(int value) { if(ncode>=65536)error("code too large");code[ncode++]=(uint32_t)value; }
+static void emit(int value) { if(ncode>=131072)error("code too large");code[ncode++]=(uint32_t)value; }
 static void emit_relocation(const char *name,int offset) {
     if(ncode>=65536 || nfixups>=65536)error("code/relocation limit exceeded");
     fixups[nfixups++]=(Fixup){ncode,copy(name),offset};emit(0);

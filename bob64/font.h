@@ -41,7 +41,7 @@ typedef struct {
     u8 BytesPerGlyph,ColumnMajor,MostSignificantBitFirst;
 } BOB64_BITMAP_FONT;
 
-static const BOB64_BITMAP_FONT bob64_font5x7={
+static const BOB64_BITMAP_FONT bob64_font_compact5x7={
     &bob64_font5x7[0][0],5,7,44,5,1,0
 };
 

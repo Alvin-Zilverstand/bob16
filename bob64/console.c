@@ -123,7 +123,7 @@ static void erase_previous_character(void) {
 int bob64_framebuffer_init(u64 base,u64 size,u32 width,u32 height,
                            u32 pixels_per_scan_line,u32 pixel_format) {
     u64 pixels,required;
-    if(!base||!size||width<FONT_CELL_WIDTH||height<FONT_HEIGHT||
+    if(!base||!size||!width||!height||
        pixels_per_scan_line<width||
        (pixel_format!=0&&pixel_format!=1)||
        (u64)pixels_per_scan_line>~(u64)0/height)return -1;
@@ -136,6 +136,7 @@ int bob64_framebuffer_init(u64 base,u64 size,u32 width,u32 height,
     framebuffer.Width=width;framebuffer.Height=height;
     framebuffer.Stride=pixels_per_scan_line;framebuffer.Format=pixel_format;
     framebuffer.Column=0;framebuffer.Row=0;framebuffer.Ready=1;
+    framebuffer.CursorDrawn=0;
     for(u32 y=0;y<height;y++)clear_row(y);
     return 0;
 }
@@ -153,9 +154,9 @@ int bob64_framebuffer_resolution(u32 *width,u32 *height) {
 int bob64_framebuffer_write_pixels(u64 first_pixel,const u32 *pixels,u32 count) {
     u64 total;
     if(!framebuffer.Ready||(!pixels&&count))return -1;
-    if(count&&framebuffer.CursorDrawn)erase_cursor();
     total=(u64)framebuffer.Width*framebuffer.Height;
     if(first_pixel>total||(u64)count>total-first_pixel)return -1;
+    if(count&&framebuffer.CursorDrawn)erase_cursor();
     for(u32 i=0;i<count;i++) {
         u64 index=first_pixel+i;
         u32 red=(pixels[i]>>16)&0xff,green=(pixels[i]>>8)&0xff,blue=pixels[i]&0xff;
