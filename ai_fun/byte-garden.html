@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bob's Byte Garden</title>
+<style>
+  :root { color-scheme: dark; --ink:#d9f3c7; --muted:#91ad83; --lime:#b7f36b; --gold:#ffd166; }
+  * { box-sizing:border-box }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; padding:24px; color:var(--ink); background:radial-gradient(ellipse at 50% 20%,#18342a,#09120f 65%); font:15px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace }
+  main { width:min(100%,620px); text-align:center }
+  h1 { margin:0; color:var(--lime); font-size:clamp(25px,6vw,38px); letter-spacing:.05em; text-shadow:0 0 22px #9be65d55 }
+  .subtitle { margin:5px 0 18px; color:var(--muted) }
+  .cabinet { padding:12px; border:1px solid #456849; border-radius:12px; background:#101b15; box-shadow:0 18px 70px #0008,inset 0 0 22px #89c35c0d }
+  canvas { display:block; width:100%; height:auto; image-rendering:pixelated; border-radius:5px; background:#10251c; touch-action:none }
+  .hud { display:flex; justify-content:space-between; gap:10px; padding:10px 3px 2px; color:var(--muted) }
+  .hud strong { color:var(--gold); font-weight:700 }
+  .help { margin:13px 0 0; color:var(--muted); font-size:13px }
+  button { margin-top:15px; padding:10px 17px; border:1px solid #6d9c54; border-radius:6px; color:#14200f; background:var(--lime); font:700 14px inherit; cursor:pointer }
+  button:hover { background:#d1ff9a }
+  button:focus-visible { outline:3px solid var(--gold); outline-offset:3px }
+</style>
+</head>
+<body>
+<main>
+  <h1>BOB'S BYTE GARDEN</h1>
+  <p class="subtitle">A tiny garden growing inside a very small computer.</p>
+  <section class="cabinet" aria-label="Byte Garden game">
+    <canvas id="game" width="480" height="320" aria-label="Move Bob around the garden and collect glowing bytes"></canvas>
+    <div class="hud"><span>BYTES <strong id="score">00</strong> / 08</span><span id="status">READY</span><span>BEST <strong id="best">00</strong></span></div>
+  </section>
+  <p class="help">Move with <strong>W A S D</strong> or the arrow keys. Collect the eight glowing bytes. Click/tap a direction on the garden to nudge Bob.</p>
+  <button id="restart" type="button">Plant a new garden</button>
+</main>
+<script>
+(() => {
+  const canvas = document.querySelector('#game'), ctx = canvas.getContext('2d');
+  const scoreEl = document.querySelector('#score'), bestEl = document.querySelector('#best'), statusEl = document.querySelector('#status');
+  const W = canvas.width, H = canvas.height, cell = 32, cols = W / cell, rows = H / cell;
+  let bob, byte, score, collected, particles, tick, best = Number(localStorage.getItem('byteGardenBest') || 0);
+  bestEl.textContent = String(best).padStart(2, '0');
+  const keyDirs = { arrowup:[0,-1], w:[0,-1], arrowdown:[0,1], s:[0,1], arrowleft:[-1,0], a:[-1,0], arrowright:[1,0], d:[1,0] };
+  function plantByte() {
+    let p; do { p = {x:Math.floor(Math.random()*cols), y:Math.floor(Math.random()*rows)}; }
+    while ((p.x===bob.x && p.y===bob.y) || collected.some(q=>q.x===p.x&&q.y===p.y));
+    return p;
+  }
+  function reset() { bob={x:2,y:Math.floor(rows/2)}; score=0; collected=[]; particles=[]; tick=0; byte=plantByte(); scoreEl.textContent='00'; statusEl.textContent='GROWING'; }
+  function move(dx,dy) {
+    if (statusEl.textContent==='GARDEN FULL') return;
+    bob.x=(bob.x+dx+cols)%cols; bob.y=(bob.y+dy+rows)%rows;
+    if (bob.x===byte.x&&bob.y===byte.y) {
+      collected.push(byte); score++; scoreEl.textContent=String(score).padStart(2,'0');
+      particles.push({x:byte.x*cell+16,y:byte.y*cell+16,life:28});
+      if(score>best){best=score;bestEl.textContent=String(best).padStart(2,'0');localStorage.setItem('byteGardenBest',best);}
+      if(score===8) statusEl.textContent='GARDEN FULL'; else byte=plantByte();
+    }
+  }
+  function roundedRect(x,y,w,h,r,color){ctx.fillStyle=color;ctx.beginPath();ctx.roundRect(x,y,w,h,r);ctx.fill();}
+  function draw() {
+    tick++; ctx.clearRect(0,0,W,H);
+    for(let y=0;y<rows;y++) for(let x=0;x<cols;x++) {
+      const n=(x*17+y*31)%5;
+      if(n===0){ctx.fillStyle='#b9df7b18';ctx.fillRect(x*cell+7,y*cell+10,2,2);}
+      if(n===1){ctx.fillStyle='#b9df7b14';ctx.fillRect(x*cell+23,y*cell+23,2,2);}
+    }
+    // A few tiny sprouts make the empty spaces feel like a garden.
+    for(const p of collected){
+      const x=p.x*cell+16,y=p.y*cell+18;
+      ctx.fillStyle='#639b4d';ctx.fillRect(x-1,y,2,8);ctx.fillRect(x-5,y+3,4,2);ctx.fillRect(x+1,y+1,4,2);
+      ctx.fillStyle='#a9dc69';ctx.fillRect(x-6,y+2,3,3);ctx.fillRect(x+3,y,3,3);
+    }
+    if(statusEl.textContent!=='GARDEN FULL'){
+      const pulse=1+Math.sin(tick*.12)*.12, x=byte.x*cell+16,y=byte.y*cell+16;
+      ctx.save();ctx.translate(x,y);ctx.scale(pulse,pulse);ctx.shadowColor='#ffd166';ctx.shadowBlur=18;
+      ctx.fillStyle='#fff0a8';ctx.fillRect(-5,-5,10,10);ctx.fillStyle='#ffd166';ctx.fillRect(-3,-8,6,16);ctx.fillRect(-8,-3,16,6);ctx.restore();
+    }
+    // Bob: a pocket-sized green rover with a friendly amber eye.
+    const bx=bob.x*cell,by=bob.y*cell;
+    roundedRect(bx+5,by+7,22,20,5,'#7fb85b');roundedRect(bx+8,by+4,16,16,4,'#b7f36b');
+    ctx.fillStyle='#24432b';ctx.fillRect(bx+12,by+10,3,4);ctx.fillRect(bx+19,by+10,3,4);
+    ctx.fillStyle='#ffd166';ctx.fillRect(bx+14,by+17,6,2);
+    ctx.fillStyle='#536d49';ctx.fillRect(bx+8,by+26,5,3);ctx.fillRect(bx+19,by+26,5,3);
+    particles=particles.filter(p=>p.life-->0);
+    for(const p of particles){ctx.globalAlpha=p.life/28;ctx.fillStyle='#ffe58b';ctx.fillRect(p.x+(Math.random()-.5)*p.life,p.y-p.life,3,3);}
+    ctx.globalAlpha=1; requestAnimationFrame(draw);
+  }
+  window.addEventListener('keydown',e=>{const d=keyDirs[e.key.toLowerCase()];if(d){e.preventDefault();move(...d);}});
+  canvas.addEventListener('pointerdown',e=>{const r=canvas.getBoundingClientRect(),dx=(e.clientX-r.left)/r.width-.5,dy=(e.clientY-r.top)/r.height-.5;if(Math.abs(dx)>Math.abs(dy))move(Math.sign(dx),0);else move(0,Math.sign(dy));});
+  document.querySelector('#restart').addEventListener('click',reset);
+  reset(); draw();
+})();
+</script>
+</body>
+</html>
